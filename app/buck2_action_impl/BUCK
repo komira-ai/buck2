@@ -19,7 +19,6 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
-        "fbsource//third-party/rust:tokio",
         "//buck2/app/buck2_certs:buck2_certs",
         "//buck2/dice/dice_futures:dice_futures",
     ],
@@ -36,6 +35,7 @@ rust_library(
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:sha1",
         "fbsource//third-party/rust:sorted_vector_map",
+        "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
         "//buck2/allocative/allocative:allocative",
         "//buck2/app/buck2_action_metadata_proto:buck2_action_metadata_proto",
