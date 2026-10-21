@@ -443,6 +443,32 @@ impl RemoteExecutionClient {
             .await
     }
 
+    /// Remote Asset `FetchBlob` by Subresource Integrity token. `Ok(None)` is a miss; the server
+    /// is only asked to look the asset up, never to download anything.
+    pub async fn fetch_blob_by_sri(
+        &self,
+        uri: &str,
+        sri: &str,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        self.data.client.fetch_blob_by_sri(uri, sri, metadata).await
+    }
+
+    /// Remote Asset `PushBlob`: records that the blob `digest`, which must already be in the CAS,
+    /// is the content behind `sri` at `uri`.
+    pub async fn push_blob_by_sri(
+        &self,
+        uri: &str,
+        sri: &str,
+        digest: &TDigest,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<()> {
+        self.data
+            .client
+            .push_blob_by_sri(uri, sri, digest, metadata)
+            .await
+    }
+
     pub async fn get_digests_ttl(
         &self,
         digests: Vec<TDigest>,
@@ -1946,6 +1972,52 @@ impl RemoteExecutionClientImpl {
             .client()
             .upload_blob_with_digest(blob.blob, blob.digest, metadata);
         with_error_handler("upload_blob", self.get_session_id(), upload.await)
+    }
+
+    async fn fetch_blob_by_sri(
+        &self,
+        uri: &str,
+        sri: &str,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        // Only the OSS client speaks Remote Asset.
+        #[cfg(not(fbcode_build))]
+        {
+            with_error_handler(
+                "fetch_blob_by_sri",
+                self.get_session_id(),
+                self.client().fetch_blob_by_sri(metadata, uri, sri).await,
+            )
+        }
+        #[cfg(fbcode_build)]
+        {
+            let _ = (uri, sri, metadata);
+            Ok(None)
+        }
+    }
+
+    async fn push_blob_by_sri(
+        &self,
+        uri: &str,
+        sri: &str,
+        digest: &TDigest,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<()> {
+        #[cfg(not(fbcode_build))]
+        {
+            with_error_handler(
+                "push_blob_by_sri",
+                self.get_session_id(),
+                self.client()
+                    .push_blob_by_sri(metadata, uri, sri, digest)
+                    .await,
+            )
+        }
+        #[cfg(fbcode_build)]
+        {
+            let _ = (uri, sri, digest, metadata);
+            Ok(())
+        }
     }
 
     async fn materialize_files(
