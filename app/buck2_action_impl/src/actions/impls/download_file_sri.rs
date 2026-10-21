@@ -48,6 +48,7 @@ pub(crate) fn aliases_usable(cas_configured: bool, digest_config: CasDigestConfi
     cas_configured && digest_config.preferred_algorithm() == DigestAlgorithm::Sha256
 }
 
+#[derive(Debug)]
 pub(crate) enum Resolved<T> {
     /// A Remote Asset server named the content and the CAS has it; nothing was downloaded.
     FromCas(T),
