@@ -472,17 +472,22 @@ mod tests {
         let root = ProjectRootTemp::new().unwrap();
         let asked = Mutex::new(None);
         let remote = aliases.map(FakeAliases::remote);
-        let outcome = resolve(
-            remote.as_ref(),
-            &http.url,
-            &Sri::parse(SRI).unwrap(),
-            |digest| {
-                *asked.lock().unwrap() = Some(digest);
-                async { Ok(Some(())) }
-            },
-            || download(&client, &root, &http.url, sri),
+        // A `resolve` that waits on a step forever must fail this test, not hang it.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            resolve(
+                remote.as_ref(),
+                &http.url,
+                &Sri::parse(SRI).unwrap(),
+                |digest| {
+                    *asked.lock().unwrap() = Some(digest);
+                    async { Ok(Some(())) }
+                },
+                || download(&client, &root, &http.url, sri),
+            ),
         )
-        .await;
+        .await
+        .expect("resolve did not return: a Remote Asset step has no deadline");
         let asked = asked.lock().unwrap().clone();
         (outcome, asked)
     }
