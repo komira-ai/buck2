@@ -111,7 +111,7 @@ impl Sri {
             }
         };
         let decoded = STANDARD
-            .decode(digest)
+            .decode(digest.split([' ', '?']).next().unwrap_or(digest))
             .map_err(|_| DownloadFileError::InvalidSri {
                 sri: sri.to_owned(),
                 reason: "the digest is not padded standard base64",

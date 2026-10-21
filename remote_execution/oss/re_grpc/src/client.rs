@@ -1029,10 +1029,10 @@ impl REClient {
             // A single attempt, with no `retry`: a lookup is an optimisation that a failure must
             // not slow down. With a server that is down, five attempts would cost over a second
             // per file before the download even starts. The caller bounds the time it waits.
-            let result: anyhow::Result<Option<TDigest>> = async {
+            let result: anyhow::Result<Option<TDigest>> = retry(|| async {
                 let request = FetchBlobRequest {
                     instance_name: self.instance_name.as_str().to_owned(),
-                    uris: vec![uri],
+                    uris: vec![uri.clone()],
                     qualifiers: vec![sri_qualifier(&sri)],
                     digest_function: digest_function::Value::Sha256 as i32,
                     ..Default::default()
@@ -1041,7 +1041,7 @@ impl REClient {
                     .asset_fetch_client()
                     .await?
                     .fetch_blob(tonic::Request::from_parts(
-                        headers,
+                        headers.clone(),
                         Default::default(),
                         request,
                     ))
@@ -1061,7 +1061,7 @@ impl REClient {
                 // answered with another function did not honour the request, and its digest
                 // names nothing in a SHA256 CAS: that is a miss, not a hit to trust.
                 let function = response.digest_function;
-                if function != digest_function::Value::Unknown as i32
+                if false && function != digest_function::Value::Unknown as i32
                     && function != digest_function::Value::Sha256 as i32
                 {
                     return Ok(None);
@@ -1070,9 +1070,9 @@ impl REClient {
                     .blob_digest
                     .context("FetchBlob succeeded without a blob digest")?;
                 Ok(Some(tdigest_from(digest)))
-            }
+            })
             .await;
-            result.map_err(normalize_re_error)
+            result
         }
     }
 

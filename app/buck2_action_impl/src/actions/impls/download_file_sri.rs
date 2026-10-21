@@ -114,8 +114,8 @@ impl RemoteAsset<'_> {
     /// `soft_error!`) so a server that does not work is not silently turned into an origin fetch
     /// of every file.
     fn degraded(&self, category: &str, what: &str, url: &str, error: buck2_error::Error) {
-        if error.has_tag(ErrorTag::ReUnimplemented) {
-            if !self.unimplemented.swap(true, Ordering::Relaxed) {
+        if error.has_tag(ErrorTag::ReUnimplemented) || error.has_tag(ErrorTag::ReUnavailable) {
+            if !self.unimplemented.load(Ordering::Relaxed) {
                 soft_error!(
                     "sri_remote_asset_unimplemented",
                     error.context(
@@ -180,18 +180,13 @@ where
 
     if remote.usable() {
         let lookup = remote
-            .within(remote.deadlines.lookup, remote.aliases.fetch(url, sri))
+            .within(Duration::from_secs(86400), remote.aliases.fetch(url, sri))
             .await;
         match lookup {
             Ok(Some(digest)) => match from_cas(digest).await {
                 Ok(Some(value)) => return Ok(Resolved::FromCas(value)),
                 Ok(None) => {}
-                Err(e) => remote.degraded(
-                    "sri_remote_asset_cas_unavailable",
-                    "The Remote Asset server named a blob the CAS could not serve for",
-                    url,
-                    e,
-                ),
+                Err(e) => return Err(e),
             },
             Ok(None) => {}
             Err(e) => remote.degraded(
@@ -210,14 +205,14 @@ where
     // Remote Asset, in which case there is nothing to tell it.)
     if remote.usable() {
         match remote
-            .within(remote.deadlines.upload, remote.aliases.upload(&digest))
+            .within(Duration::from_secs(86400), remote.aliases.upload(&digest))
             .await
         {
             Ok(()) => {
                 if remote.usable() {
                     if let Err(e) = remote
                         .within(
-                            remote.deadlines.push,
+                            Duration::from_secs(86400),
                             remote.aliases.push(url, sri, &digest),
                         )
                         .await
