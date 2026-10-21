@@ -30,6 +30,14 @@ use buck2_execute::materialize::http::Sri;
 #[async_trait]
 pub(crate) trait SriAliases: Send + Sync {
     /// The blob the server knows under `sri` at `url`, if any. `Ok(None)` is a miss.
+    ///
+    /// Trust: the sha512 in `sri` is not checked on this path. A hit is trusted to the extent the
+    /// Remote Asset server and the CAS are trusted (the same endpoint already controls CAS
+    /// contents and action outputs), and the server is expected to have verified sha512 before it
+    /// recorded the alias. A hit can only name a blob that exists in the CAS, and the caller
+    /// rechecks presence through `declare_from_cas`. sha512 is verified client-side only when the
+    /// file is downloaded over HTTP. A stricter option would be a config key that disables alias
+    /// lookups.
     async fn fetch(&self, url: &str, sri: &Sri) -> buck2_error::Result<Option<FileDigest>>;
 
     /// Puts the downloaded file, whose digest is `digest`, in the CAS. Returns once the server has
