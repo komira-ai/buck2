@@ -1,0 +1,46 @@
+name: Fork CI
+on:
+  pull_request:
+    branches:
+      - komira/base
+  workflow_dispatch: # allows manual triggering
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v6
+    - name: Free disk space
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+    - name: Install the Rust toolchain from rust-toolchain.toml
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        rustup toolchain install "$channel" --profile minimal --component llvm-tools-preview --component rust-src
+        rustup default "$channel"
+        rustc --version
+    - name: Install system packages
+      run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: fork-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+        restore-keys: |
+          fork-ci-${{ runner.os }}-
+    - name: Build the buck2 binary
+      run: cargo build --bin=buck2
+    - name: Test the touched crates
+      run: cargo test -p remote_execution -p re_grpc_proto -p buck2_execute -p buck2_action_impl
+    - name: Cargo.lock is up to date
+      run: git diff --exit-code Cargo.lock
