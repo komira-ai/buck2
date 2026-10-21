@@ -52,7 +52,10 @@ strong_hash.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+assert_matches.workspace = true
+buck2_certs.workspace = true
 dice_futures.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

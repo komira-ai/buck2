@@ -44,7 +44,12 @@ enum CasArtifactError {
 #[starlark_module]
 pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// Downloads a URL to an output (filename as string or output artifact). The file at the URL
-    /// must have the given sha1 or the command will fail. The optional parameter is_executable
+    /// must have the given sha1 or sha256, or the given `sri`, or the command will fail. `sri` is a
+    /// [Subresource Integrity](https://www.w3.org/TR/SRI/) token, `sha512-<base64 digest>` (or
+    /// `sha256-<base64 digest>`), and cannot be combined with `sha1` or `sha256`. The digest of
+    /// a file declared only by `sri` is not known until it is downloaded, so it cannot be taken
+    /// from the CAS directly; when remote execution is configured, a Remote Asset server is first
+    /// asked for the file by its `sri`, and told about it after a download. The optional parameter is_executable
     /// indicates whether the resulting file should be marked with executable permissions.
     /// (Meta-internal) The optional parameter vpnless_url indicates a url from which this resource
     /// can be downloaded off VPN; this has the same restrictions as `url` above.
@@ -55,6 +60,7 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] vpnless_url: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha1: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha256: NoneOr<&str>,
+        #[starlark(require = named, default = NoneOr::None)] sri: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] size_bytes: NoneOr<u64>,
         #[starlark(require = named, default = false)] is_executable: bool,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
@@ -68,7 +74,7 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
             has_content_based_path.into_option(),
         )?;
 
-        let checksum = Checksum::new(sha1.into_option(), sha256.into_option())?;
+        let checksum = Checksum::new(sha1.into_option(), sha256.into_option(), sri.into_option())?;
 
         this.register_action(
             buck_indexset![output_artifact],

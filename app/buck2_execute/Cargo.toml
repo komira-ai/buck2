@@ -12,6 +12,7 @@ allocative.workspace = true
 anyhow.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 buck2_action_metadata_proto.workspace = true
 buck2_artifact.workspace = true
 buck2_build_info.workspace = true
