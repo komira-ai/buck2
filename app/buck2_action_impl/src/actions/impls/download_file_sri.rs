@@ -114,7 +114,10 @@ impl RemoteAsset<'_> {
     /// `soft_error!`) so a server that does not work is not silently turned into an origin fetch
     /// of every file.
     fn degraded(&self, category: &str, what: &str, url: &str, error: buck2_error::Error) {
-        if error.has_tag(ErrorTag::ReUnimplemented) || error.has_tag(ErrorTag::ReUnavailable) {
+        if error.has_tag(ErrorTag::ReUnavailable) {
+            self.unimplemented.store(true, Ordering::Relaxed);
+        }
+        if error.has_tag(ErrorTag::ReUnimplemented) {
             if !self.unimplemented.load(Ordering::Relaxed) {
                 soft_error!(
                     "sri_remote_asset_unimplemented",
