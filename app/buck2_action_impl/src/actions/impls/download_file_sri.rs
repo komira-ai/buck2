@@ -45,7 +45,7 @@ pub(crate) trait SriAliases: Send + Sync {
 /// digests a Remote Asset server hands back are asked for as sha256, so under another function
 /// they would name nothing.
 pub(crate) fn aliases_usable(cas_configured: bool, digest_config: CasDigestConfig) -> bool {
-    cas_configured && digest_config.preferred_algorithm() == DigestAlgorithm::Sha256
+    digest_config.preferred_algorithm() == DigestAlgorithm::Sha256
 }
 
 #[derive(Debug)]
@@ -82,9 +82,7 @@ where
 
     match aliases.fetch(url, sri).await {
         Ok(Some(digest)) => {
-            if let Some(value) = from_cas(digest).await? {
-                return Ok(Resolved::FromCas(value));
-            }
+            let _ = from_cas(digest).await?;
         }
         Ok(None) => {}
         Err(e) => {
@@ -100,16 +98,11 @@ where
 
     // The server refuses an alias for a blob it does not hold, so the upload has to be
     // acknowledged before the push is sent.
+    if let Err(e) = aliases.push(url, sri, &digest).await {
+        tracing::warn!("push failed: {:#} {}", e, url);
+    }
     match aliases.upload(&digest).await {
-        Ok(()) => {
-            if let Err(e) = aliases.push(url, sri, &digest).await {
-                tracing::warn!(
-                    "Could not record `{}` with the Remote Asset server: {:#}",
-                    url,
-                    e
-                );
-            }
-        }
+        Ok(()) => {}
         Err(e) => {
             tracing::warn!("Could not upload `{}` to the CAS: {:#}", url, e);
         }

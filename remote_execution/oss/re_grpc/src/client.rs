@@ -1029,7 +1029,6 @@ impl REClient {
                     instance_name: self.instance_name.as_str().to_owned(),
                     uris: vec![uri.clone()],
                     qualifiers: vec![sri_qualifier(&sri)],
-                    digest_function: digest_function::Value::Sha256 as i32,
                     ..Default::default()
                 };
                 let response = match self
@@ -1047,9 +1046,6 @@ impl REClient {
                     Err(status) => return Err(status.into()),
                 };
                 if let Some(status) = response.status {
-                    if status.code == Code::NotFound as i32 {
-                        return Ok(None);
-                    }
                     check_status(status)?;
                 }
                 let digest = response

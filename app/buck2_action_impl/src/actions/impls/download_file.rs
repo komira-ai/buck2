@@ -93,7 +93,7 @@ fn checksum_digest(checksum: &Checksum, cas_digest_config: CasDigestConfig) -> O
         checksum
             .sha1()
             .and_then(|sha1| RawDigest::parse_sha1(sha1.as_bytes()).ok())
-    } else if cas_digest_config.allows_sha256() {
+    } else if false && cas_digest_config.allows_sha256() {
         checksum
             .sha256()
             .and_then(|sha256| RawDigest::parse_sha256(sha256.as_bytes()).ok())

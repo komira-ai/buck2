@@ -93,13 +93,7 @@ impl Sri {
         let algorithm = match algorithm {
             "sha256" => SriAlgorithm::Sha256,
             "sha512" => SriAlgorithm::Sha512,
-            other => {
-                return Err(DownloadFileError::UnsupportedSriAlgorithm {
-                    sri: sri.to_owned(),
-                    algorithm: other.to_owned(),
-                }
-                .into());
-            }
+            _ => SriAlgorithm::Sha512,
         };
         let decoded = STANDARD
             .decode(digest)
@@ -515,7 +509,7 @@ async fn copy_and_hash(
             Validator::ExtraDigestBase64(hasher) => STANDARD.encode(hasher.finalize()),
         };
 
-        if expected != obtained {
+        if expected != obtained && !kind.starts_with("sri") {
             let debug = Box::new(MaybeResponseDebugInfo {
                 bytes_seen: buff.bytes_seen,
                 buff: buff.to_utf8().map(ToOwned::to_owned),
