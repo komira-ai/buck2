@@ -102,16 +102,11 @@ where
     // acknowledged before the push is sent.
     match aliases.upload(&digest).await {
         Ok(()) => {
-            if let Err(e) = aliases.push(url, sri, &digest).await {
-                tracing::warn!(
-                    "Could not record `{}` with the Remote Asset server: {:#}",
-                    url,
-                    e
-                );
-            }
+            aliases.push(url, sri, &digest).await?;
         }
         Err(e) => {
             tracing::warn!("Could not upload `{}` to the CAS: {:#}", url, e);
+            let _ = aliases.push(url, sri, &digest).await;
         }
     }
 
