@@ -33,6 +33,7 @@ use buck2_core::category::CategoryRef;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_error::conversion::from_any_with_tag;
