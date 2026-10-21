@@ -41,9 +41,9 @@ jobs:
           fork-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
           fork-ci-${{ runner.os }}-
     - name: Build the buck2 binary
-      run: cargo build --bin=buck2
+      run: cargo build --locked --bin=buck2
     - name: Test the touched crates
-      run: cargo test -p remote_execution -p re_grpc_proto -p buck2_execute -p buck2_action_impl
+      run: cargo test --locked -p remote_execution -p re_grpc_proto -p buck2_execute -p buck2_action_impl
     - name: Cargo.lock is up to date
       run: git diff --exit-code Cargo.lock
     # Saved even when a step above failed, so that a fix does not start from a cold build.

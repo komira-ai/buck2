@@ -61,7 +61,7 @@ pub enum Checksum {
 }
 
 /// The hash algorithms an SRI token can name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Allocative, Pagable)]
 pub enum SriAlgorithm {
     Sha256,
     Sha512,
@@ -79,8 +79,17 @@ impl SriAlgorithm {
 /// A single [Subresource Integrity](https://www.w3.org/TR/SRI/) hash: `<algorithm>-<base64
 /// digest>`, with sha256 and sha512 the algorithms accepted. It is stored in the form it was
 /// validated in, so it can be sent as is to a server that is asked about the same content.
+///
+/// Exactly one token is accepted, which is a deliberate v1 decision and stricter than the SRI
+/// specification: the specification allows several space-separated tokens (the strongest
+/// supported one wins, unknown algorithms are ignored) and options after `?`, and here a value
+/// with either is rejected as invalid. Accepting more would be a compatible later change; being
+/// lenient now could not be taken back.
 #[derive(Debug, Clone, Dupe, PartialEq, Eq, Allocative, Pagable)]
-pub struct Sri(Arc<str>);
+pub struct Sri {
+    algorithm: SriAlgorithm,
+    token: Arc<str>,
+}
 
 impl Sri {
     pub fn parse(sri: &str) -> buck2_error::Result<Self> {
@@ -114,25 +123,24 @@ impl Sri {
             }
             .into());
         }
-        Ok(Self(Arc::from(sri)))
+        Ok(Self {
+            algorithm,
+            token: Arc::from(sri),
+        })
     }
 
     /// The token, as validated: `<algorithm>-<base64 digest>`.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.token
     }
 
     pub fn algorithm(&self) -> SriAlgorithm {
-        // `parse` only builds values with a known algorithm before the first `-`.
-        match self.0.split_once('-') {
-            Some(("sha256", _)) => SriAlgorithm::Sha256,
-            _ => SriAlgorithm::Sha512,
-        }
+        self.algorithm
     }
 
     /// The base64 digest, without the algorithm prefix.
     pub fn digest_base64(&self) -> &str {
-        self.0.split_once('-').map_or("", |(_, digest)| digest)
+        self.token.split_once('-').map_or("", |(_, digest)| digest)
     }
 }
 
@@ -802,6 +810,11 @@ mod tests {
             .to_string();
         assert!(err.contains("Unsupported hash algorithm `sha384`"), "{err}");
 
+        // Exactly one token is accepted: several, or options after `?`, are refused (stricter
+        // than the SRI specification, on purpose).
+        let two_tokens = format!("{FOOBAR_SHA512_SRI} {FOOBAR_SHA256_SRI}");
+        let with_options = format!("{FOOBAR_SHA512_SRI}?ct=text/plain");
+
         // Malformed tokens.
         for bad in [
             "sha512",
@@ -809,6 +822,8 @@ mod tests {
             "sha512-not base64!",
             // A sha256 digest labelled sha512.
             "sha512-w6uP8Tcg6K2QR905Rms8iXTlksL6OD1KOWBxTK7wxPI=",
+            two_tokens.as_str(),
+            with_options.as_str(),
         ] {
             let err = Checksum::new(None, None, Some(bad))
                 .unwrap_err()

@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -62,6 +63,7 @@ use starlark::values::OwnedFrozen;
 use starlark::values::Value;
 
 use crate::actions::impls::download_file_sri;
+use crate::actions::impls::download_file_sri::RemoteAsset;
 use crate::actions::impls::download_file_sri::Resolved;
 use crate::actions::impls::download_file_sri::SriAliases;
 use crate::actions::impls::offline;
@@ -101,6 +103,12 @@ fn checksum_digest(checksum: &Checksum, cas_digest_config: CasDigestConfig) -> O
         None
     }
 }
+
+/// Whether the Remote Asset server has said it does not implement Remote Asset. Remembered for the
+/// life of the daemon, whatever the RE connection: a server that lacks the API will not gain it
+/// during a session, and the cost of being wrong is one origin download per file, which is what a
+/// build without Remote Asset does anyway.
+static REMOTE_ASSET_UNIMPLEMENTED: AtomicBool = AtomicBool::new(false);
 
 /// A Remote Asset server and the CAS beside it, reached through the invocation's RE connection.
 struct ReSriAliases {
@@ -497,8 +505,14 @@ impl DownloadFileAction {
             None
         };
 
+        let remote = aliases.as_ref().map(|aliases| RemoteAsset {
+            aliases: aliases as &dyn SriAliases,
+            unimplemented: &REMOTE_ASSET_UNIMPLEMENTED,
+            deadlines: download_file_sri::DEADLINES,
+        });
+
         let resolved = download_file_sri::resolve(
-            aliases.as_ref().map(|a| a as &dyn SriAliases),
+            remote.as_ref(),
             url,
             sri,
             |digest| async move {

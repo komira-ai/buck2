@@ -1011,7 +1011,9 @@ impl REClient {
     /// token such as `sha512-<base64>`), using `uri` as the asset's location. This is a pure
     /// lookup: `Ok(None)` is a miss (the server answered `NOT_FOUND`, either as the RPC status or
     /// in the response), any other failure is an error. The digest function is always sent as
-    /// SHA256, so the returned digest is a SHA256 one.
+    /// SHA256, so the returned digest is a SHA256 one. It is a single attempt (no retry) and has
+    /// no deadline of its own; the caller bounds how long it waits. `uri` is sent to the server
+    /// as is, so a URL that carries credentials leaks them to it.
     pub fn fetch_blob_by_sri<'a>(
         &'a self,
         metadata: &RemoteExecutionMetadata,
@@ -1024,10 +1026,13 @@ impl REClient {
         let uri = uri.to_owned();
         let sri = sri.to_owned();
         async move {
-            retry(|| async {
+            // A single attempt, with no `retry`: a lookup is an optimisation that a failure must
+            // not slow down. With a server that is down, five attempts would cost over a second
+            // per file before the download even starts. The caller bounds the time it waits.
+            let result: anyhow::Result<Option<TDigest>> = async {
                 let request = FetchBlobRequest {
                     instance_name: self.instance_name.as_str().to_owned(),
-                    uris: vec![uri.clone()],
+                    uris: vec![uri],
                     qualifiers: vec![sri_qualifier(&sri)],
                     digest_function: digest_function::Value::Sha256 as i32,
                     ..Default::default()
@@ -1036,7 +1041,7 @@ impl REClient {
                     .asset_fetch_client()
                     .await?
                     .fetch_blob(tonic::Request::from_parts(
-                        headers.clone(),
+                        headers,
                         Default::default(),
                         request,
                     ))
@@ -1052,18 +1057,29 @@ impl REClient {
                     }
                     check_status(status)?;
                 }
+                // Unset (`UNKNOWN`) means SHA256, as the Remote Asset spec says. A server that
+                // answered with another function did not honour the request, and its digest
+                // names nothing in a SHA256 CAS: that is a miss, not a hit to trust.
+                let function = response.digest_function;
+                if function != digest_function::Value::Unknown as i32
+                    && function != digest_function::Value::Sha256 as i32
+                {
+                    return Ok(None);
+                }
                 let digest = response
                     .blob_digest
                     .context("FetchBlob succeeded without a blob digest")?;
                 Ok(Some(tdigest_from(digest)))
-            })
-            .await
+            }
+            .await;
+            result.map_err(normalize_re_error)
         }
     }
 
     /// Tells a Remote Asset server that `digest`, a SHA256 digest of a blob already in the CAS,
     /// is the content behind `sri` at `uri`. The caller must have uploaded the blob first: a
     /// server is entitled to refuse an alias for content it does not hold.
+    /// Transient failures are retried; the caller bounds the total time it waits.
     pub fn push_blob_by_sri<'a>(
         &'a self,
         metadata: &RemoteExecutionMetadata,

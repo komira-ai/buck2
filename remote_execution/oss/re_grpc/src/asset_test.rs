@@ -53,6 +53,12 @@ enum FetchScript {
     MissInBody,
     /// A failure that is not a miss.
     Denied,
+    /// The server cannot be reached right now.
+    Unavailable,
+    /// The server does not implement Remote Asset.
+    Unimplemented,
+    /// A digest, with the digest function the response says it was computed with.
+    HitWithFunction(i32),
 }
 
 #[derive(Default)]
@@ -95,6 +101,16 @@ impl Fetch for FakeAsset {
                 ..Default::default()
             })),
             FetchScript::Denied => Err(Status::permission_denied("nope")),
+            FetchScript::Unavailable => Err(Status::unavailable("busy")),
+            FetchScript::Unimplemented => Err(Status::unimplemented("Fetch")),
+            FetchScript::HitWithFunction(function) => Ok(Response::new(FetchBlobResponse {
+                blob_digest: Some(Digest {
+                    hash: HASH.to_owned(),
+                    size_bytes: 5,
+                }),
+                digest_function: function,
+                ..Default::default()
+            })),
         }
     }
 
@@ -239,4 +255,52 @@ async fn push_sends_digest_and_sri() {
         })
     );
     assert_eq!(request.digest_function, 1);
+}
+
+/// A response that says its digest is of another function than the one asked for is a miss: the
+/// digest would name nothing in a SHA256 CAS. One that says SHA256 is a hit, and so is one that
+/// says nothing (the spec reads that as SHA256).
+#[tokio::test]
+async fn fetch_hit_of_another_digest_function_is_a_miss() {
+    // `DigestFunction.Value`: SHA256 = 1, SHA1 = 2, SHA512 = 4, BLAKE3 = 9.
+    for (function, hit) in [(0, true), (1, true), (2, false), (4, false), (9, false)] {
+        let (client, _fake) = start(FetchScript::HitWithFunction(function)).await;
+        let found = client
+            .fetch_blob_by_sri(&RemoteExecutionMetadata::default(), URL, SRI)
+            .await
+            .unwrap();
+        assert_eq!(found, hit.then(digest), "digest function {function}");
+    }
+}
+
+/// The lookup is one attempt: a server that is unavailable is asked once, not retried with
+/// backoff while the build waits. The error carries the status code, which is how the caller
+/// tells a server that is down from one that lacks the API.
+#[tokio::test]
+async fn fetch_unavailable_is_one_attempt() {
+    let (client, fake) = start(FetchScript::Unavailable).await;
+
+    let err = client
+        .fetch_blob_by_sri(&RemoteExecutionMetadata::default(), URL, SRI)
+        .await
+        .unwrap_err();
+
+    assert_eq!(fake.recorded.lock().unwrap().fetches.len(), 1);
+    let re_error = err.downcast_ref::<crate::REClientError>().unwrap();
+    assert_eq!(re_error.code, crate::TCode::UNAVAILABLE);
+}
+
+/// `UNIMPLEMENTED` reaches the caller as such, so it can stop asking a server that lacks the API.
+#[tokio::test]
+async fn fetch_unimplemented_is_reported_as_unimplemented() {
+    let (client, fake) = start(FetchScript::Unimplemented).await;
+
+    let err = client
+        .fetch_blob_by_sri(&RemoteExecutionMetadata::default(), URL, SRI)
+        .await
+        .unwrap_err();
+
+    assert_eq!(fake.recorded.lock().unwrap().fetches.len(), 1);
+    let re_error = err.downcast_ref::<crate::REClientError>().unwrap();
+    assert_eq!(re_error.code, crate::TCode::UNIMPLEMENTED);
 }
