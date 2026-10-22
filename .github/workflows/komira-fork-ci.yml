@@ -171,10 +171,7 @@ jobs:
         echo "::group::What existing callers get, binary built from the base commit"
         run "$RUNNER_TEMP/bin/buck2-base/buck2-base" test_download_file "legacy" || status=1
         echo "::endgroup::"
-        echo "::group::The same tests, binary built from this change"
+        echo "::group::Every test, binary built from this change"
         run "$RUNNER_TEMP/bin/buck2-head/buck2-head" test_download_file "test" || status=1
-        echo "::endgroup::"
-        echo "::group::sha512 tests, binary built from this change"
-        run "$RUNNER_TEMP/bin/buck2-head/buck2-head" test_download_file_sha512 "test" || status=1
         echo "::endgroup::"
         exit $status

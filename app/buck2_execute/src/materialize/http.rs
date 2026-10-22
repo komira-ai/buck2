@@ -1055,7 +1055,7 @@ mod tests {
 
     // A `Checksum` serialized by the code before `Entries` existed, for `foobar`'s SHA-1 and
     // SHA-256. Produced by running `pagable::testing::TestingSerializer` over
-    // `Checksum::new(..)` on the base commit and printing the bytes in hex. Layout: the variant
+    // `Checksum::new(..)` with the previous implementation and printing the bytes in hex. Layout: the variant
     // index (0, 1, 2), then for each `Arc<str>` its identity (the address it had in that run, a
     // varint) and the string as a length-prefixed byte string.
     const OLD_SHA1: &str = "00f0c581c0bceb1f2838383433643766393234313632313164653965626239363366663463653238313235393332383738";

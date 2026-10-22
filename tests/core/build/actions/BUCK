@@ -14,15 +14,6 @@ buck2_core_tests(
                 "CPE_RUST_X2P_SUPPORTS_VPNLESS": "0",
             },
         },
-        "test_download_file_sha512": {
-            "deps": [
-                "fbcode//buck2/tests/e2e_util:http_server",
-                "fbsource//third-party/pypi/aiohttp:aiohttp",
-            ],
-            "env": {
-                "CPE_RUST_X2P_SUPPORTS_VPNLESS": "0",
-            },
-        },
         "test_http_proxy_env": {
             "deps": [
                 "fbcode//buck2/tests/e2e_util:http_server",
