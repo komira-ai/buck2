@@ -60,6 +60,9 @@ struct HashAlgorithm {
     /// Length of the digest in bytes (the hex form is twice as long).
     digest_len: usize,
     new_hasher: fn() -> DynHasher,
+    /// The digest-config algorithm that computes this same hash, if there is one. A download is
+    /// then checked with the digest it computes for the CAS anyway instead of hashing twice.
+    digest_family: Option<DigestAlgorithmFamily>,
 }
 
 static HASH_ALGORITHMS: &[HashAlgorithm] = &[
@@ -67,31 +70,25 @@ static HASH_ALGORITHMS: &[HashAlgorithm] = &[
         name: "sha1",
         digest_len: SHA1_SIZE,
         new_hasher: || Box::new(Sha1::new()) as DynHasher,
+        digest_family: Some(DigestAlgorithmFamily::Sha1),
     },
     HashAlgorithm {
         name: "sha256",
         digest_len: SHA256_SIZE,
         new_hasher: || Box::new(Sha256::new()) as DynHasher,
+        digest_family: Some(DigestAlgorithmFamily::Sha256),
     },
     HashAlgorithm {
         name: "sha512",
         digest_len: SHA512_SIZE,
         new_hasher: || Box::new(Sha512::new()) as DynHasher,
+        digest_family: None,
     },
 ];
 
 impl HashAlgorithm {
     fn find(name: &str) -> Option<&'static HashAlgorithm> {
         HASH_ALGORITHMS.iter().find(|a| a.name == name)
-    }
-
-    /// The name of the algorithm a CAS digest config computes, if it is one in the table.
-    fn of_digest_family(family: DigestAlgorithmFamily) -> Option<&'static str> {
-        match family {
-            DigestAlgorithmFamily::Sha1 => Some("sha1"),
-            DigestAlgorithmFamily::Sha256 => Some("sha256"),
-            _ => None,
-        }
     }
 }
 
@@ -115,8 +112,11 @@ pub struct Checksum {
 enum DownloadFileError {
     #[error("Must pass in at least one checksum (e.g. `sha1 = ...`)")]
     MissingChecksum,
-    #[error("Unsupported checksum algorithm `{0}`, supported algorithms are: {supported}", supported = supported_algorithms())]
-    UnsupportedAlgorithm(String),
+    #[error("Unsupported checksum algorithm `{algorithm}`, supported algorithms are: {supported}")]
+    UnsupportedAlgorithm {
+        algorithm: String,
+        supported: String,
+    },
     #[error("Checksum algorithm `{0}` given more than once")]
     DuplicateAlgorithm(String),
     #[error("Invalid digest for `{digest_type}` argument, expected length of {expected_len} but got {}, digest `{digest}`", digest.len())]
@@ -157,8 +157,12 @@ impl Checksum {
 
         let mut validated: Vec<ChecksumEntry> = Vec::new();
         for (name, digest) in entries {
-            let algorithm = HashAlgorithm::find(name)
-                .ok_or_else(|| DownloadFileError::UnsupportedAlgorithm(name.to_owned()))?;
+            let algorithm = HashAlgorithm::find(name).ok_or_else(|| {
+                DownloadFileError::UnsupportedAlgorithm {
+                    algorithm: name.to_owned(),
+                    supported: supported_algorithms(),
+                }
+            })?;
             if validated.iter().any(|e| *e.algorithm == *algorithm.name) {
                 return Err(DownloadFileError::DuplicateAlgorithm(name.to_owned()).into());
             }
@@ -431,7 +435,7 @@ async fn copy_and_hash(
         ExtraDigest(DynHasher),
     }
 
-    let primary = HashAlgorithm::of_digest_family(digester.algorithm());
+    let primary = digester.algorithm();
     let mut validators = SmallVec::<[_; 3]>::new();
 
     for (name, expected) in checksum.iter() {
@@ -440,7 +444,7 @@ async fn copy_and_hash(
                 algorithm: name.to_owned(),
                 url: url.to_owned(),
             })?;
-        let validator = if primary == Some(algorithm.name) {
+        let validator = if algorithm.digest_family == Some(primary) {
             Validator::PrimaryDigest
         } else {
             Validator::ExtraDigest((algorithm.new_hasher)())

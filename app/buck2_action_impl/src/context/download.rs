@@ -45,7 +45,8 @@ enum CasArtifactError {
 pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// Downloads a URL to an output (filename as string or output artifact). The file at the URL
     /// must match every checksum given (`sha1`, `sha256` and/or `sha512`, each as a hex string,
-    /// and at least one is required) or the command will fail. The optional parameter
+    /// and at least one is required) or the command will fail. The optional parameter size_bytes
+    /// is checked against the size of the downloaded file. The optional parameter
     /// is_executable indicates whether the resulting file should be marked with executable
     /// permissions.
     /// (Meta-internal) The optional parameter vpnless_url indicates a url from which this resource
