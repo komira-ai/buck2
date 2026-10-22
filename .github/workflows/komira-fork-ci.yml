@@ -6,7 +6,7 @@ on:
       - komira/sha512-kwarg
   push:
     branches:
-      - 'komira/mut-**'
+      - 'komira/ci-**'
   workflow_dispatch: # allows manual triggering
 
 permissions:
