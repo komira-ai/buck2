@@ -5,7 +5,7 @@ on:
       - komira/base
   push:
     branches:
-      - 'komira/mut-**'
+      - 'komira/ci-**'
   workflow_dispatch: # allows manual triggering
 
 permissions:
