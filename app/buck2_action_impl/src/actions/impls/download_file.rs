@@ -823,6 +823,8 @@ mod tests {
             })
             .is_err()
         );
+    }
+
     #[test]
     fn test_check_downloaded_size() {
         // Defect: `size_bytes` ignored when the checksum alone cannot name a CAS digest (a
