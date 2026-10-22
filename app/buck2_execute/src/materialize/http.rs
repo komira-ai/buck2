@@ -886,29 +886,55 @@ mod tests {
         assert_eq!(only_512.sha256(), None);
         assert_eq!(only_512.sha512(), Some(FOOBAR_SHA512));
 
-        // Hex is accepted in either case and stored in lowercase, like the other algorithms.
-        let upper =
-            Checksum::from_pairs(&[("sha512", FOOBAR_SHA512.to_ascii_uppercase().as_str())])?;
-        assert_eq!(upper.sha512(), Some(FOOBAR_SHA512));
-
         Ok(())
     }
 
     #[test]
-    fn test_checksum_from_pairs_refuses() {
-        let err =
-            |entries: &[(&str, &str)]| format!("{:#}", Checksum::from_pairs(entries).unwrap_err());
+    fn test_checksum_from_pairs_lowercases() -> buck2_error::Result<()> {
+        // Hex is accepted in either case and stored in lowercase, like the other algorithms.
+        let upper =
+            Checksum::from_pairs(&[("sha512", FOOBAR_SHA512.to_ascii_uppercase().as_str())])?;
+        assert_eq!(upper.sha512(), Some(FOOBAR_SHA512));
+        Ok(())
+    }
 
-        assert!(err(&[]).contains("at least one checksum"));
-        assert!(err(&[("sha3_256", FOOBAR_SHA256)]).contains("Unsupported checksum algorithm"));
-        assert!(err(&[("sha512", FOOBAR_SHA256)]).contains("expected length of 128"));
-        assert!(err(&[("sha512", FOOBAR_SHA1)]).contains("expected length of 128"));
-        assert!(err(&[("sha256", FOOBAR_SHA512)]).contains("expected length of 64"));
+    fn from_pairs_error(entries: &[(&str, &str)]) -> String {
+        format!("{:#}", Checksum::from_pairs(entries).unwrap_err())
+    }
+
+    #[test]
+    fn test_checksum_from_pairs_refuses_an_empty_list() {
+        assert!(from_pairs_error(&[]).contains("at least one checksum"));
+    }
+
+    #[test]
+    fn test_checksum_from_pairs_refuses_an_unknown_algorithm() {
+        let err = from_pairs_error(&[("sha3_256", FOOBAR_SHA256)]);
+        assert!(err.contains("Unsupported checksum algorithm `sha3_256`"));
+        assert!(err.contains("sha1, sha256, sha512"));
+    }
+
+    #[test]
+    fn test_checksum_from_pairs_refuses_a_digest_of_the_wrong_length() {
+        assert!(from_pairs_error(&[("sha512", FOOBAR_SHA256)]).contains("expected length of 128"));
+        assert!(from_pairs_error(&[("sha512", FOOBAR_SHA1)]).contains("expected length of 128"));
+        assert!(from_pairs_error(&[("sha256", FOOBAR_SHA512)]).contains("expected length of 64"));
+    }
+
+    #[test]
+    fn test_checksum_from_pairs_refuses_non_hex_characters() {
         assert!(
-            err(&[("sha512", &FOOBAR_SHA512.replace('0', "z"))])
+            from_pairs_error(&[("sha512", &FOOBAR_SHA512.replace('0', "z"))])
                 .contains("expected 0-9 a-z hex characters")
         );
-        assert!(err(&[("sha1", FOOBAR_SHA1), ("sha1", FOOBAR_SHA1)]).contains("more than once"));
+    }
+
+    #[test]
+    fn test_checksum_from_pairs_refuses_an_algorithm_given_twice() {
+        assert!(
+            from_pairs_error(&[("sha1", FOOBAR_SHA1), ("sha1", FOOBAR_SHA1)])
+                .contains("more than once")
+        );
     }
 
     #[test]
