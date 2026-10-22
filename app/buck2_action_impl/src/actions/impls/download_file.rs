@@ -557,17 +557,15 @@ mod tests {
 
     #[test]
     fn test_check_downloaded_size() {
-        // Defect: `size_bytes` ignored when the checksum alone cannot name a CAS digest (a
-        // sha512-only download). Mutant: the comparison removed.
+        // A wrong size is refused, also when the checksum alone cannot name a CAS digest (a
+        // sha512-only download).
         let err = check_downloaded_size(Some(6), 7).unwrap_err();
         assert!(err.has_tag(ErrorTag::DownloadSizeMismatch));
         assert!(
             format!("{err:#}").contains("Downloaded size (7) does not match expected size (6)")
         );
 
-        // Defect: refusing a download whose size is right, or one that declared no size.
-        // Mutant: `expected != actual` turned into `expected == actual`, or `_ => Ok(())` turned
-        // into an error.
+        // A right size, or no declared size, is accepted.
         check_downloaded_size(Some(6), 6).unwrap();
         check_downloaded_size(None, 6).unwrap();
     }
@@ -575,12 +573,10 @@ mod tests {
     #[test]
     fn test_expected_size() {
         // A sha512-only download has no metadata; `size_bytes` is the only size there is.
-        // Mutant: `.or(size_bytes)` removed.
         assert_eq!(expected_size(None, Some(6)), Some(6));
         assert_eq!(expected_size(None, None), None);
 
         // With metadata, its size wins (it is `size_bytes` or the HEAD response's).
-        // Mutant: the two sources swapped.
         let metadata = FileMetadata {
             digest: TrackedFileDigest::new(
                 FileDigest::from_content(b"foobar", testing::sha256()),

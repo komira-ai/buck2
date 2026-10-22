@@ -32,6 +32,7 @@ use buck2_http::retries::IntoBuck2Error;
 use buck2_http::retries::http_retry;
 use bytes::Bytes;
 use digest::DynDigest;
+use dupe::Dupe;
 use futures::StreamExt;
 use futures::stream::Stream;
 use hyper::Response;
@@ -92,19 +93,29 @@ impl HashAlgorithm {
     }
 }
 
+/// One (algorithm, digest) pair of [`Checksum::Entries`]. Built only by [`Checksum::from_pairs`],
+/// which checks it against `HASH_ALGORITHMS`.
 #[derive(Debug, Clone, Allocative, Pagable)]
-struct ChecksumEntry {
+pub struct ChecksumEntry {
     /// A name from `HASH_ALGORITHMS`, checked when the entry is created.
     algorithm: Arc<str>,
     /// Lowercase hex.
     hex: Arc<str>,
 }
 
-/// The checksums a download must match: one or more (algorithm, hex digest) pairs. The
-/// content has to match every one of them.
-#[derive(Debug, Clone, Allocative, Pagable)]
-pub struct Checksum {
-    entries: Vec<ChecksumEntry>,
+/// The checksums a download must match.
+///
+/// `Entries` holds the checksums built by [`Checksum::from_pairs`] and is used when `sha512` is
+/// given; every download without it keeps using the other three variants.
+///
+/// `Checksum` derives `Pagable`, so a variant's position is part of its serialized form. New
+/// variants go last; never reorder or insert before an existing one.
+#[derive(Debug, Clone, Dupe, Allocative, Pagable)]
+pub enum Checksum {
+    Sha1(Arc<str>),
+    Sha256(Arc<str>),
+    Both { sha1: Arc<str>, sha256: Arc<str> },
+    Entries(Arc<[ChecksumEntry]>),
 }
 
 #[derive(buck2_error::Error, Debug)]
@@ -144,40 +155,85 @@ fn supported_algorithms() -> String {
 }
 
 impl Checksum {
-    /// Builds a checksum from (algorithm name, hex digest) pairs, refusing an algorithm that is
-    /// not in the table, a digest of the wrong length or with non-hex characters, and an empty
-    /// list.
-    pub fn new<'a>(
-        entries: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> buck2_error::Result<Self> {
+    pub fn new(sha1: Option<&str>, sha256: Option<&str>) -> buck2_error::Result<Self> {
         fn is_hex_digit(x: char) -> bool {
             let x = x.to_ascii_lowercase();
             x.is_ascii_digit() || ('a'..='f').contains(&x)
         }
 
+        fn validate_digest(
+            digest: Option<&str>,
+            digest_len: usize,
+            digest_type: &'static str,
+        ) -> buck2_error::Result<Option<Arc<str>>> {
+            match digest {
+                None => Ok(None),
+                Some(digest) => {
+                    let expected_len = digest_len * 2;
+                    if digest.len() != expected_len {
+                        return Err(DownloadFileError::InvalidDigestLength {
+                            digest: digest.to_owned(),
+                            expected_len,
+                            digest_type,
+                        }
+                        .into());
+                    }
+                    if let Some(bad_char) = digest.chars().find(|x| !is_hex_digit(*x)) {
+                        return Err(DownloadFileError::InvalidDigestCharacter {
+                            digest: digest.to_owned(),
+                            bad_char,
+                            digest_type,
+                        }
+                        .into());
+                    }
+                    Ok(Some(Arc::from(digest.to_ascii_lowercase())))
+                }
+            }
+        }
+
+        match (
+            validate_digest(sha1, SHA1_SIZE, "sha1")?,
+            validate_digest(sha256, SHA256_SIZE, "sha256")?,
+        ) {
+            (Some(sha1), None) => Ok(Checksum::Sha1(sha1)),
+            (None, Some(sha256)) => Ok(Checksum::Sha256(sha256)),
+            (Some(sha1), Some(sha256)) => Ok(Checksum::Both { sha1, sha256 }),
+            (None, None) => Err(DownloadFileError::MissingChecksum.into()),
+        }
+    }
+
+    /// Builds a checksum from (algorithm name, hex digest) pairs, for the algorithms of
+    /// `HASH_ALGORITHMS` that `new` has no argument for (`sha512`). Refuses an algorithm that is
+    /// not in the table, an algorithm given twice, a digest of the wrong length or with non-hex
+    /// characters, and an empty list. The content has to match every pair.
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> buck2_error::Result<Self> {
+        fn is_hex_char(x: char) -> bool {
+            x.is_ascii_digit() || ('a'..='f').contains(&x.to_ascii_lowercase())
+        }
+
         let mut validated: Vec<ChecksumEntry> = Vec::new();
-        for (name, digest) in entries {
+        for (name, digest) in pairs {
             let algorithm = HashAlgorithm::find(name).ok_or_else(|| {
                 DownloadFileError::UnsupportedAlgorithm {
-                    algorithm: name.to_owned(),
+                    algorithm: (*name).to_owned(),
                     supported: supported_algorithms(),
                 }
             })?;
             if validated.iter().any(|e| *e.algorithm == *algorithm.name) {
-                return Err(DownloadFileError::DuplicateAlgorithm(name.to_owned()).into());
+                return Err(DownloadFileError::DuplicateAlgorithm((*name).to_owned()).into());
             }
             let expected_len = algorithm.digest_len * 2;
             if digest.len() != expected_len {
                 return Err(DownloadFileError::InvalidDigestLength {
-                    digest: digest.to_owned(),
+                    digest: (*digest).to_owned(),
                     expected_len,
                     digest_type: algorithm.name,
                 }
                 .into());
             }
-            if let Some(bad_char) = digest.chars().find(|x| !is_hex_digit(*x)) {
+            if let Some(bad_char) = digest.chars().find(|x| !is_hex_char(*x)) {
                 return Err(DownloadFileError::InvalidDigestCharacter {
-                    digest: digest.to_owned(),
+                    digest: (*digest).to_owned(),
                     bad_char,
                     digest_type: algorithm.name,
                 }
@@ -192,48 +248,67 @@ impl Checksum {
         if validated.is_empty() {
             return Err(DownloadFileError::MissingChecksum.into());
         }
-        Ok(Self { entries: validated })
-    }
-
-    /// The hex digest for `algorithm`, if the checksum has one.
-    pub fn get(&self, algorithm: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| &*e.algorithm == algorithm)
-            .map(|e| &*e.hex)
-    }
-
-    /// The (algorithm name, hex digest) pairs, in the order they were given.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries.iter().map(|e| (&*e.algorithm, &*e.hex))
+        Ok(Self::Entries(Arc::from(validated)))
     }
 
     pub fn sha1(&self) -> Option<&str> {
-        self.get("sha1")
+        match self {
+            Self::Sha1(sha1) => Some(sha1),
+            Self::Sha256(..) => None,
+            Self::Both { sha1, .. } => Some(sha1),
+            Self::Entries(entries) => entry_hex(entries, "sha1"),
+        }
     }
 
     pub fn sha256(&self) -> Option<&str> {
-        self.get("sha256")
+        match self {
+            Self::Sha1(..) => None,
+            Self::Sha256(sha256) => Some(sha256),
+            Self::Both { sha256, .. } => Some(sha256),
+            Self::Entries(entries) => entry_hex(entries, "sha256"),
+        }
     }
 
     pub fn sha512(&self) -> Option<&str> {
-        self.get("sha512")
+        match self {
+            Self::Sha1(..) | Self::Sha256(..) | Self::Both { .. } => None,
+            Self::Entries(entries) => entry_hex(entries, "sha512"),
+        }
+    }
+
+    /// Every (algorithm name, hex digest) pair the content has to match.
+    fn pairs(&self) -> SmallVec<[(&str, &str); 3]> {
+        match self {
+            Self::Sha1(sha1) => SmallVec::from_iter([("sha1", &**sha1)]),
+            Self::Sha256(sha256) => SmallVec::from_iter([("sha256", &**sha256)]),
+            Self::Both { sha1, sha256 } => {
+                SmallVec::from_iter([("sha1", &**sha1), ("sha256", &**sha256)])
+            }
+            Self::Entries(entries) => entries.iter().map(|e| (&*e.algorithm, &*e.hex)).collect(),
+        }
     }
 
     /// A checksum with no validation of the digests, to test what verification does with a
     /// wrong or unusual one.
     #[cfg(test)]
     fn unvalidated(entries: &[(&str, &str)]) -> Self {
-        Self {
-            entries: entries
+        Self::Entries(
+            entries
                 .iter()
                 .map(|(algorithm, hex)| ChecksumEntry {
                     algorithm: Arc::from(*algorithm),
                     hex: Arc::from(*hex),
                 })
                 .collect(),
-        }
+        )
     }
+}
+
+fn entry_hex<'a>(entries: &'a [ChecksumEntry], algorithm: &str) -> Option<&'a str> {
+    entries
+        .iter()
+        .find(|e| &*e.algorithm == algorithm)
+        .map(|e| &*e.hex)
 }
 
 #[derive(Debug, buck2_error::Error)]
@@ -281,7 +356,7 @@ enum HttpDownloadError {
     #[error(transparent)]
     IoError(buck2_error::Error),
 
-    /// A checksum names an algorithm the table does not know. `Checksum::new` refuses those, so
+    /// A checksum names an algorithm the table does not know. `Checksum::from_pairs` refuses those, so
     /// this is a backstop: bytes are never accepted without being checked.
     #[error("Cannot verify download of {url}: unsupported checksum algorithm `{algorithm}`")]
     #[buck2(input)]
@@ -438,7 +513,7 @@ async fn copy_and_hash(
     let primary = digester.algorithm();
     let mut validators = SmallVec::<[_; 3]>::new();
 
-    for (name, expected) in checksum.iter() {
+    for (name, expected) in checksum.pairs() {
         let algorithm =
             HashAlgorithm::find(name).ok_or_else(|| HttpDownloadError::UnsupportedAlgorithm {
                 algorithm: name.to_owned(),
@@ -647,7 +722,7 @@ mod tests {
     const FOOBAR_SHA512: &str = "0a50261ebd1a390fed2bf326f2673c145582a6342d523204973d0219337f81616a8069b012587cf5635f6925f1b56c360230c19b273500ee013e030601bf2425";
 
     fn all_three() -> Checksum {
-        Checksum::new([
+        Checksum::from_pairs(&[
             ("sha1", FOOBAR_SHA1),
             ("sha256", FOOBAR_SHA256),
             ("sha512", FOOBAR_SHA512),
@@ -688,7 +763,7 @@ mod tests {
     async fn test_copy_and_hash_sha512_only() -> buck2_error::Result<()> {
         // A checksum that is only a SHA-512, as in an npm or yarn lock file, still gets the
         // digest config's digest (and the right size) from the same pass.
-        let checksum = Checksum::new([("sha512", FOOBAR_SHA512)])?;
+        let checksum = Checksum::from_pairs(&[("sha512", FOOBAR_SHA512)])?;
 
         let (digest, bytes) = do_test(testing::sha256(), &checksum).await?;
         assert_eq!(digest.to_string(), format!("{FOOBAR_SHA256}:6"));
@@ -707,7 +782,7 @@ mod tests {
         let wrong = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
         for config in [testing::sha1(), testing::sha256(), testing::blake3()] {
             assert_matches!(
-                do_test(config, &Checksum::new([("sha512", wrong)])?).await,
+                do_test(config, &Checksum::from_pairs(&[("sha512", wrong)])?).await,
                 Err(HttpDownloadError::InvalidChecksum {
                     digest_kind: "sha512",
                     ..
@@ -723,12 +798,12 @@ mod tests {
         // Every checksum is enforced, not just the first or the last.
         let wrong_sha512 = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
         for checksum in [
-            Checksum::new([
+            Checksum::from_pairs(&[
                 ("sha1", FOOBAR_SHA1),
                 ("sha256", FOOBAR_SHA256),
                 ("sha512", wrong_sha512),
             ])?,
-            Checksum::new([
+            Checksum::from_pairs(&[
                 ("sha512", wrong_sha512),
                 ("sha1", FOOBAR_SHA1),
                 ("sha256", FOOBAR_SHA256),
@@ -790,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_and_hash_unknown_algorithm_is_refused() {
-        // Even if an entry for an unknown algorithm got past `Checksum::new`, the bytes are not
+        // Even if an entry for an unknown algorithm got past `Checksum::from_pairs`, the bytes are not
         // accepted unverified.
         let checksum = Checksum::unvalidated(&[("sha3_256", FOOBAR_SHA256)]);
         assert_matches!(
@@ -800,30 +875,29 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_new() -> buck2_error::Result<()> {
+    fn test_checksum_from_pairs() -> buck2_error::Result<()> {
         let checksum = all_three();
         assert_eq!(checksum.sha1(), Some(FOOBAR_SHA1));
         assert_eq!(checksum.sha256(), Some(FOOBAR_SHA256));
         assert_eq!(checksum.sha512(), Some(FOOBAR_SHA512));
-        assert_eq!(checksum.get("sha3_256"), None);
 
-        let only_512 = Checksum::new([("sha512", FOOBAR_SHA512)])?;
+        let only_512 = Checksum::from_pairs(&[("sha512", FOOBAR_SHA512)])?;
         assert_eq!(only_512.sha1(), None);
         assert_eq!(only_512.sha256(), None);
         assert_eq!(only_512.sha512(), Some(FOOBAR_SHA512));
 
         // Hex is accepted in either case and stored in lowercase, like the other algorithms.
-        let upper = Checksum::new([("sha512", FOOBAR_SHA512.to_ascii_uppercase().as_str())])?;
+        let upper =
+            Checksum::from_pairs(&[("sha512", FOOBAR_SHA512.to_ascii_uppercase().as_str())])?;
         assert_eq!(upper.sha512(), Some(FOOBAR_SHA512));
 
         Ok(())
     }
 
     #[test]
-    fn test_checksum_new_refuses() {
-        let err = |entries: &[(&str, &str)]| {
-            format!("{:#}", Checksum::new(entries.iter().copied()).unwrap_err())
-        };
+    fn test_checksum_from_pairs_refuses() {
+        let err =
+            |entries: &[(&str, &str)]| format!("{:#}", Checksum::from_pairs(entries).unwrap_err());
 
         assert!(err(&[]).contains("at least one checksum"));
         assert!(err(&[("sha3_256", FOOBAR_SHA256)]).contains("Unsupported checksum algorithm"));
@@ -835,6 +909,196 @@ mod tests {
                 .contains("expected 0-9 a-z hex characters")
         );
         assert!(err(&[("sha1", FOOBAR_SHA1), ("sha1", FOOBAR_SHA1)]).contains("more than once"));
+    }
+
+    #[test]
+    fn test_checksum_new_is_unchanged() -> buck2_error::Result<()> {
+        // `Checksum::new` builds the same variants it always did, so every download without
+        // `sha512` keeps its representation.
+        assert_matches!(
+            Checksum::new(Some(FOOBAR_SHA1), None)?,
+            Checksum::Sha1(h) if &*h == FOOBAR_SHA1
+        );
+        assert_matches!(
+            Checksum::new(None, Some(FOOBAR_SHA256))?,
+            Checksum::Sha256(h) if &*h == FOOBAR_SHA256
+        );
+        assert_matches!(
+            Checksum::new(Some(FOOBAR_SHA1), Some(FOOBAR_SHA256))?,
+            Checksum::Both { sha1, sha256 } if &*sha1 == FOOBAR_SHA1 && &*sha256 == FOOBAR_SHA256
+        );
+
+        let both = Checksum::new(Some(FOOBAR_SHA1), Some(FOOBAR_SHA256))?;
+        assert_eq!(both.sha1(), Some(FOOBAR_SHA1));
+        assert_eq!(both.sha256(), Some(FOOBAR_SHA256));
+        assert_eq!(both.sha512(), None);
+        let only_1 = Checksum::new(Some(FOOBAR_SHA1), None)?;
+        assert_eq!((only_1.sha1(), only_1.sha256()), (Some(FOOBAR_SHA1), None));
+        let only_256 = Checksum::new(None, Some(FOOBAR_SHA256))?;
+        assert_eq!(
+            (only_256.sha1(), only_256.sha256()),
+            (None, Some(FOOBAR_SHA256))
+        );
+
+        // Lowercased, as before.
+        let upper = Checksum::new(Some(&FOOBAR_SHA1.to_ascii_uppercase()), None)?;
+        assert_eq!(upper.sha1(), Some(FOOBAR_SHA1));
+
+        // The messages of the errors it always gave.
+        let err = |sha1: Option<&str>, sha256: Option<&str>| {
+            format!("{:#}", Checksum::new(sha1, sha256).unwrap_err())
+        };
+        assert!(
+            err(None, None).contains(&"Must pass in at least one checksum (e.g. `sha1 = ...`)")
+        );
+        assert!(err(Some("abc"), None).contains(
+            &"Invalid digest for `sha1` argument, expected length of 40 but got 3, digest `abc`"
+        ));
+        assert!(
+            err(None, Some(FOOBAR_SHA1)).contains(&format!(
+                "Invalid digest for `sha256` argument, expected length of 64 but got 40, digest `{FOOBAR_SHA1}`"
+            ))
+        );
+        let bad = FOOBAR_SHA1.replace('8', "z");
+        assert!(
+            err(Some(&bad), None).contains(&format!(
+                "Invalid digest for `sha1` argument, expected 0-9 a-z hex characters, but got `z`, digest `{bad}`"
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_old_variants_check_every_digest() -> buck2_error::Result<()> {
+        // `Checksum::new` builds Sha1, Sha256 and Both; each of its digests is enforced, for a
+        // primary and for a secondary hasher.
+        let wrong_sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let wrong_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for config in [testing::sha1(), testing::sha256(), testing::blake3()] {
+            do_test(config, &Checksum::new(Some(FOOBAR_SHA1), None)?).await?;
+            do_test(config, &Checksum::new(None, Some(FOOBAR_SHA256))?).await?;
+            do_test(
+                config,
+                &Checksum::new(Some(FOOBAR_SHA1), Some(FOOBAR_SHA256))?,
+            )
+            .await?;
+
+            for (checksum, kind) in [
+                (Checksum::new(Some(wrong_sha1), None)?, "sha1"),
+                (Checksum::new(None, Some(wrong_sha256))?, "sha256"),
+                (
+                    Checksum::new(Some(FOOBAR_SHA1), Some(wrong_sha256))?,
+                    "sha256",
+                ),
+                (
+                    Checksum::new(Some(wrong_sha1), Some(FOOBAR_SHA256))?,
+                    "sha1",
+                ),
+            ] {
+                assert_matches!(
+                    do_test(config, &checksum).await,
+                    Err(HttpDownloadError::InvalidChecksum { digest_kind, .. }) if digest_kind == kind
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    // `Checksum` derives `Pagable`: it is part of analysis results, which can be written to disk
+    // and read by another process when DICE paging is on. The encoding of the variants that
+    // existed before `sha512` must not change, so a stored `Checksum` keeps decoding.
+
+    fn encode(checksum: &Checksum) -> Vec<u8> {
+        use pagable::PagableSerialize;
+        use pagable::testing::TestingSerializer;
+
+        let mut serializer = TestingSerializer::new();
+        checksum.pagable_serialize(&mut serializer).unwrap();
+        serializer.finish()
+    }
+
+    fn decode(bytes: &[u8]) -> Checksum {
+        use pagable::PagableDeserialize;
+        use pagable::testing::TestingDeserializer;
+
+        let mut deserializer = TestingDeserializer::new(bytes);
+        Checksum::pagable_deserialize(&mut deserializer).unwrap()
+    }
+
+    // A `Checksum` serialized by the code before `Entries` existed, for `foobar`'s SHA-1 and
+    // SHA-256. Produced by running `pagable::testing::TestingSerializer` over
+    // `Checksum::new(..)` on the base commit and printing the bytes in hex. Layout: the variant
+    // index (0, 1, 2), then for each `Arc<str>` its identity (the address it had in that run, a
+    // varint) and the string as a length-prefixed byte string.
+    const OLD_SHA1: &str = "00f0c581c0bceb1f2838383433643766393234313632313164653965626239363366663463653238313235393332383738";
+    const OLD_SHA256: &str = "0190cb81c0bceb1f4063336162386666313337323065386164393034376464333934363662336338393734653539326332666133383364346133393630373134636165663063346632";
+    const OLD_BOTH: &str = "02f0c281c0bceb1f2838383433643766393234313632313164653965626239363366663463653238313235393332383738b0c381c0bceb1f4063336162386666313337323065386164393034376464333934363662336338393734653539326332666133383364346133393630373134636165663063346632";
+
+    #[test]
+    fn test_checksum_old_variants_decode_from_the_old_bytes() {
+        // Data written before `Entries` existed still decodes to the same variants.
+        assert_matches!(
+            decode(&hex::decode(OLD_SHA1).unwrap()),
+            Checksum::Sha1(h) if &*h == FOOBAR_SHA1
+        );
+        assert_matches!(
+            decode(&hex::decode(OLD_SHA256).unwrap()),
+            Checksum::Sha256(h) if &*h == FOOBAR_SHA256
+        );
+        assert_matches!(
+            decode(&hex::decode(OLD_BOTH).unwrap()),
+            Checksum::Both { sha1, sha256 } if &*sha1 == FOOBAR_SHA1 && &*sha256 == FOOBAR_SHA256
+        );
+    }
+
+    #[test]
+    fn test_checksum_old_variants_encode_to_the_old_bytes() -> buck2_error::Result<()> {
+        // Only the identities differ between runs: compare the variant index and the strings.
+        for (checksum, old, strings) in [
+            (
+                Checksum::new(Some(FOOBAR_SHA1), None)?,
+                OLD_SHA1,
+                vec![FOOBAR_SHA1],
+            ),
+            (
+                Checksum::new(None, Some(FOOBAR_SHA256))?,
+                OLD_SHA256,
+                vec![FOOBAR_SHA256],
+            ),
+            (
+                Checksum::new(Some(FOOBAR_SHA1), Some(FOOBAR_SHA256))?,
+                OLD_BOTH,
+                vec![FOOBAR_SHA1, FOOBAR_SHA256],
+            ),
+        ] {
+            let old = hex::decode(old).unwrap();
+            let bytes = encode(&checksum);
+            assert_eq!(bytes[0], old[0]);
+            for s in &strings {
+                let payload = [&[s.len() as u8][..], s.as_bytes()].concat();
+                assert!(
+                    bytes.windows(payload.len()).any(|w| w == payload),
+                    "{s} not encoded as before"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_checksum_entries_variant_is_last_and_roundtrips() -> buck2_error::Result<()> {
+        // The new variant takes the next index, after Sha1 = 0, Sha256 = 1, Both = 2.
+        let checksum = all_three();
+        let bytes = encode(&checksum);
+        assert_eq!(bytes[0], 3);
+
+        let decoded = decode(&bytes);
+        assert_matches!(decoded, Checksum::Entries(..));
+        assert_eq!(decoded.pairs(), checksum.pairs());
+        assert_eq!(decoded.sha512(), Some(FOOBAR_SHA512));
+        Ok(())
     }
 
     #[test]
