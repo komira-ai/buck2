@@ -443,6 +443,38 @@ impl RemoteExecutionClient {
             .await
     }
 
+    /// Remote Asset `FetchBlob` by a hash (`algorithm` name and `hex` digest) of the content at
+    /// `uri`. `Ok(None)` is a miss; the server is only asked to look the asset up, never to
+    /// download anything.
+    pub async fn fetch_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        self.data
+            .client
+            .fetch_blob_by_checksum(uri, algorithm, hex, metadata)
+            .await
+    }
+
+    /// Remote Asset `PushBlob`: records that the blob `digest`, which must already be in the CAS,
+    /// is the content behind the hash (`algorithm` name and `hex` digest) at `uri`.
+    pub async fn push_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        digest: &TDigest,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<()> {
+        self.data
+            .client
+            .push_blob_by_checksum(uri, algorithm, hex, digest, metadata)
+            .await
+    }
+
     pub async fn get_digests_ttl(
         &self,
         digests: Vec<TDigest>,
@@ -1946,6 +1978,56 @@ impl RemoteExecutionClientImpl {
             .client()
             .upload_blob_with_digest(blob.blob, blob.digest, metadata);
         with_error_handler("upload_blob", self.get_session_id(), upload.await)
+    }
+
+    async fn fetch_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        // Only the OSS client speaks Remote Asset.
+        #[cfg(not(fbcode_build))]
+        {
+            with_error_handler(
+                "fetch_blob_by_checksum",
+                self.get_session_id(),
+                self.client()
+                    .fetch_blob_by_checksum(metadata, uri, algorithm, hex)
+                    .await,
+            )
+        }
+        #[cfg(fbcode_build)]
+        {
+            let _ = (uri, algorithm, hex, metadata);
+            Ok(None)
+        }
+    }
+
+    async fn push_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        digest: &TDigest,
+        metadata: &RemoteExecutionMetadata,
+    ) -> buck2_error::Result<()> {
+        #[cfg(not(fbcode_build))]
+        {
+            with_error_handler(
+                "push_blob_by_checksum",
+                self.get_session_id(),
+                self.client()
+                    .push_blob_by_checksum(metadata, uri, algorithm, hex, digest)
+                    .await,
+            )
+        }
+        #[cfg(fbcode_build)]
+        {
+            let _ = (uri, algorithm, hex, digest, metadata);
+            Ok(())
+        }
     }
 
     async fn materialize_files(

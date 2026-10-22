@@ -27,6 +27,8 @@ use async_compression::tokio::bufread::DeflateDecoder;
 use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
@@ -38,6 +40,11 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use lru::LruCache;
 use prost::Message;
+use re_grpc_proto::build::bazel::remote::asset::v1::FetchBlobRequest;
+use re_grpc_proto::build::bazel::remote::asset::v1::PushBlobRequest;
+use re_grpc_proto::build::bazel::remote::asset::v1::Qualifier;
+use re_grpc_proto::build::bazel::remote::asset::v1::fetch_client::FetchClient;
+use re_grpc_proto::build::bazel::remote::asset::v1::push_client::PushClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::ActionResult;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsResponse;
@@ -65,6 +72,7 @@ use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_reque
 use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::compressor;
 use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
+use re_grpc_proto::build::bazel::remote::execution::v2::digest_function;
 use re_grpc_proto::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::execution_stage;
 use re_grpc_proto::google::bytestream::ReadRequest;
@@ -115,6 +123,17 @@ fn tdigest_from(digest: Digest) -> TDigest {
         size_in_bytes: digest.size_bytes,
         ..Default::default()
     }
+}
+
+/// The Remote Asset `checksum.sri` qualifier for a hash given as an algorithm name and lowercase
+/// hex. The wire form is a Subresource Integrity token, `<algorithm>-<base64 of the raw hash
+/// bytes>`; callers hold hex, so this is the one place where the two meet.
+pub(crate) fn checksum_qualifier(algorithm: &str, hex: &str) -> anyhow::Result<Qualifier> {
+    let raw = ::hex::decode(hex).with_context(|| format!("`{hex}` is not a hex digest"))?;
+    Ok(Qualifier {
+        name: "checksum.sri".to_owned(),
+        value: format!("{algorithm}-{}", STANDARD.encode(raw)),
+    })
 }
 
 fn tstatus_ok() -> TStatus {
@@ -994,6 +1013,120 @@ impl REClient {
         }
     }
 
+    /// Asks a Remote Asset server which CAS blob is known under the hash `hex` of kind
+    /// `algorithm` (such as `sha512`), using `uri` as the asset's location. This is a pure
+    /// lookup: `Ok(None)` is a miss (the server answered `NOT_FOUND`, either as the RPC status or
+    /// in the response), any other failure is an error. The digest function is always sent as
+    /// SHA256, so the returned digest is a SHA256 one. It is a single attempt (no retry) and has
+    /// no deadline of its own; the caller bounds how long it waits. `uri` is sent to the server
+    /// as is, so a URL that carries credentials leaks them to it.
+    pub fn fetch_blob_by_checksum<'a>(
+        &'a self,
+        metadata: &RemoteExecutionMetadata,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<TDigest>>> + Send + use<'a> {
+        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+            .into_parts()
+            .0;
+        let uri = uri.to_owned();
+        let algorithm = algorithm.to_owned();
+        let hex = hex.to_owned();
+        async move {
+            // A single attempt, with no `retry`: a lookup is an optimisation that a failure must
+            // not slow down. With a server that is down, five attempts would cost over a second
+            // per file before the download even starts. The caller bounds the time it waits.
+            let result: anyhow::Result<Option<TDigest>> = async {
+                let request = FetchBlobRequest {
+                    instance_name: self.instance_name.as_str().to_owned(),
+                    uris: vec![uri],
+                    qualifiers: vec![checksum_qualifier(&algorithm, &hex)?],
+                    digest_function: digest_function::Value::Sha256 as i32,
+                    ..Default::default()
+                };
+                let response = match self
+                    .asset_fetch_client()
+                    .await?
+                    .fetch_blob(tonic::Request::from_parts(
+                        headers,
+                        Default::default(),
+                        request,
+                    ))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+                    Err(status) => return Err(status.into()),
+                };
+                if let Some(status) = response.status {
+                    if status.code == Code::NotFound as i32 {
+                        return Ok(None);
+                    }
+                    check_status(status)?;
+                }
+                // Unset (`UNKNOWN`) means SHA256, as the Remote Asset spec says. A server that
+                // answered with another function did not honour the request, and its digest
+                // names nothing in a SHA256 CAS: that is a miss, not a hit to trust.
+                let function = response.digest_function;
+                if function != digest_function::Value::Unknown as i32
+                    && function != digest_function::Value::Sha256 as i32
+                {
+                    return Ok(None);
+                }
+                let digest = response
+                    .blob_digest
+                    .context("FetchBlob succeeded without a blob digest")?;
+                Ok(Some(tdigest_from(digest)))
+            }
+            .await;
+            result.map_err(normalize_re_error)
+        }
+    }
+
+    /// Tells a Remote Asset server that `digest`, a SHA256 digest of a blob already in the CAS,
+    /// is the content behind the hash `hex` of kind `algorithm` at `uri`. The caller must have uploaded the blob first: a
+    /// server is entitled to refuse an alias for content it does not hold.
+    /// Transient failures are retried; the caller bounds the total time it waits.
+    pub fn push_blob_by_checksum<'a>(
+        &'a self,
+        metadata: &RemoteExecutionMetadata,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        digest: &TDigest,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + use<'a> {
+        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+            .into_parts()
+            .0;
+        let uri = uri.to_owned();
+        let qualifier = checksum_qualifier(algorithm, hex);
+        let digest = tdigest_to(digest);
+        async move {
+            let qualifier = qualifier?;
+            retry(|| async {
+                let request = PushBlobRequest {
+                    instance_name: self.instance_name.as_str().to_owned(),
+                    uris: vec![uri.clone()],
+                    qualifiers: vec![qualifier.clone()],
+                    blob_digest: Some(digest.clone()),
+                    digest_function: digest_function::Value::Sha256 as i32,
+                    ..Default::default()
+                };
+                self.asset_push_client()
+                    .await?
+                    .push_blob(tonic::Request::from_parts(
+                        headers.clone(),
+                        Default::default(),
+                        request,
+                    ))
+                    .await?;
+                Ok(())
+            })
+            .await
+        }
+    }
+
     pub fn download<'a>(
         &'a self,
         metadata: &RemoteExecutionMetadata,
@@ -1164,6 +1297,22 @@ impl REClient {
             ))
             .max_decoding_message_size(self.max_decoding_msg_size),
         )
+    }
+
+    async fn asset_fetch_client(&self) -> anyhow::Result<FetchClient<GrpcService>> {
+        let channel = self.pool.get(&self.cas_address).await?;
+        Ok(FetchClient::new(InterceptedService::new(
+            channel,
+            self.interceptor.dupe(),
+        )))
+    }
+
+    async fn asset_push_client(&self) -> anyhow::Result<PushClient<GrpcService>> {
+        let channel = self.pool.get(&self.cas_address).await?;
+        Ok(PushClient::new(InterceptedService::new(
+            channel,
+            self.interceptor.dupe(),
+        )))
     }
 
     async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {

@@ -148,4 +148,25 @@ mod tests {
         let err = error.find_typed_context::<RemoteExecutionError>().unwrap();
         assert_eq!(err.code, TCode::UNKNOWN);
     }
+
+    /// What the OSS client returns for a Remote Asset RPC that the server answers with
+    /// `UNIMPLEMENTED` (an `REClientError` with that code) comes out of `with_error_handler` with
+    /// the tag the download uses to stop asking. Catches an error that loses the tag on the way,
+    /// which would make every download ask a server that lacks the API again. Mutant: map
+    /// `TCode::UNIMPLEMENTED` to another tag in `get_re_error_tag`.
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn test_unimplemented_rpc_is_tagged() {
+        let client_error = anyhow::Error::from(REClientError {
+            message: "Fetch".to_owned(),
+            code: TCode::UNIMPLEMENTED,
+            group: TCodeReasonGroup::UNKNOWN,
+        })
+        .context("FetchBlob");
+
+        let error = with_error_handler::<()>("fetch_blob_by_checksum", "test", Err(client_error))
+            .unwrap_err();
+
+        assert!(error.has_tag(ErrorTag::ReUnimplemented));
+    }
 }
