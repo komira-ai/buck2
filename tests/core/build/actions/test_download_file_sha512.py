@@ -48,8 +48,8 @@ def declare(content: bytes, *algorithms: str) -> Dict[str, str]:
     return {algorithm: digest(algorithm, content) for algorithm in algorithms}
 
 
-def output_of(result: BuildResult) -> bytes:
-    return result.get_build_report().output_for_target("//:download").read_bytes()
+def output_of(result: BuildResult, target: str = "//:download") -> bytes:
+    return result.get_build_report().output_for_target(target).read_bytes()
 
 
 # Which checksums the rule passes to `download_file`. Every combination of the three
@@ -210,8 +210,12 @@ async def test_a_paged_out_download_is_read_back(
         paged_out = re.search(r"(\d+) paged out", status)
         assert paged_out is not None and int(paged_out.group(1)) > 0, status
 
-        result = await buck.build("//:download", *args)
-        assert output_of(result) == content
+        # A target that reads the download needs its analysis result back, which holds the
+        # action and with it the checksum.
+        result = await buck.build("//:copy", "--local-only", *args)
+        assert output_of(result, "//:copy") == content
         stats = result.invocation_record().get("page_in_by_key_type", {})
-        assert int(stats.get("AnalysisKey", {}).get("count", 0)) > 0, stats
+        assert "AnalysisKey" in stats and int(stats["AnalysisKey"]["count"]) > 0, list(
+            stats
+        )
         assert server.count("GET", "/file") == 1

@@ -1,4 +1,4 @@
-load(":defs.bzl", "download")
+load(":defs.bzl", "copy", "download")
 
 # What a test declares about the download comes from the config, so that one fixture serves
 # every combination of checksums and sizes.
@@ -10,3 +10,5 @@ download(
     sha512 = read_config("test", "sha512"),
     size_bytes = int(read_config("test", "size_bytes")) if read_config("test", "size_bytes") != None else None,
 )
+
+copy(name = "copy", dep = ":download")
