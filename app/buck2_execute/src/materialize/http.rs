@@ -32,7 +32,6 @@ use buck2_http::retries::IntoBuck2Error;
 use buck2_http::retries::http_retry;
 use bytes::Bytes;
 use digest::DynDigest;
-use dupe::Dupe;
 use futures::StreamExt;
 use futures::stream::Stream;
 use hyper::Response;
@@ -40,15 +39,75 @@ use pagable::Pagable;
 use sha1::Digest;
 use sha1::Sha1;
 use sha2::Sha256;
+use sha2::Sha512;
 use smallvec::SmallVec;
 
 use crate::digest_config::DigestConfig;
 
-#[derive(Debug, Clone, Dupe, Allocative, Pagable)]
-pub enum Checksum {
-    Sha1(Arc<str>),
-    Sha256(Arc<str>),
-    Both { sha1: Arc<str>, sha256: Arc<str> },
+type DynHasher = Box<dyn DynDigest + Send>;
+
+/// Length in bytes of a SHA-512 digest.
+const SHA512_SIZE: usize = 64;
+
+/// A hash algorithm a download can be checked against: its name as a rule author spells it
+/// (`sha256 = ...`), the length of its digest, and how to compute it.
+///
+/// This table is the single place that knows about the algorithms. Supporting another one
+/// (for example `sha3_256`) is one more entry here plus the matching named argument of
+/// `download_file`.
+struct HashAlgorithm {
+    name: &'static str,
+    /// Length of the digest in bytes (the hex form is twice as long).
+    digest_len: usize,
+    new_hasher: fn() -> DynHasher,
+}
+
+static HASH_ALGORITHMS: &[HashAlgorithm] = &[
+    HashAlgorithm {
+        name: "sha1",
+        digest_len: SHA1_SIZE,
+        new_hasher: || Box::new(Sha1::new()) as DynHasher,
+    },
+    HashAlgorithm {
+        name: "sha256",
+        digest_len: SHA256_SIZE,
+        new_hasher: || Box::new(Sha256::new()) as DynHasher,
+    },
+    HashAlgorithm {
+        name: "sha512",
+        digest_len: SHA512_SIZE,
+        new_hasher: || Box::new(Sha512::new()) as DynHasher,
+    },
+];
+
+impl HashAlgorithm {
+    fn find(name: &str) -> Option<&'static HashAlgorithm> {
+        HASH_ALGORITHMS.iter().find(|a| a.name == name)
+    }
+
+    /// The name of the algorithm a CAS digest config computes, if it is one in the table.
+    fn of_digest_family(family: DigestAlgorithmFamily) -> Option<&'static str> {
+        match family {
+            DigestAlgorithmFamily::Sha1 => Some("sha1"),
+            DigestAlgorithmFamily::Sha256 => Some("sha256"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Allocative, Pagable)]
+struct ChecksumEntry {
+    /// A name from `HASH_ALGORITHMS`, checked when the entry is created.
+    algorithm: Arc<str>,
+    /// Lowercase hex.
+    hex: Arc<str>,
+}
+
+/// The checksums a download must match: one or more (algorithm, hex digest) pairs. The
+/// content has to match every one of them.
+#[derive(Debug, Clone, Allocative, Pagable)]
+pub struct Checksum {
+    entries: Vec<ChecksumEntry>,
 }
 
 #[derive(buck2_error::Error, Debug)]
@@ -56,6 +115,10 @@ pub enum Checksum {
 enum DownloadFileError {
     #[error("Must pass in at least one checksum (e.g. `sha1 = ...`)")]
     MissingChecksum,
+    #[error("Unsupported checksum algorithm `{0}`, supported algorithms are: {supported}", supported = supported_algorithms())]
+    UnsupportedAlgorithm(String),
+    #[error("Checksum algorithm `{0}` given more than once")]
+    DuplicateAlgorithm(String),
     #[error("Invalid digest for `{digest_type}` argument, expected length of {expected_len} but got {}, digest `{digest}`", digest.len())]
     InvalidDigestLength {
         digest: String,
@@ -72,67 +135,99 @@ enum DownloadFileError {
     },
 }
 
+fn supported_algorithms() -> String {
+    HASH_ALGORITHMS
+        .iter()
+        .map(|a| a.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Checksum {
-    pub fn new(sha1: Option<&str>, sha256: Option<&str>) -> buck2_error::Result<Self> {
+    /// Builds a checksum from (algorithm name, hex digest) pairs, refusing an algorithm that is
+    /// not in the table, a digest of the wrong length or with non-hex characters, and an empty
+    /// list.
+    pub fn new<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> buck2_error::Result<Self> {
         fn is_hex_digit(x: char) -> bool {
             let x = x.to_ascii_lowercase();
             x.is_ascii_digit() || ('a'..='f').contains(&x)
         }
 
-        fn validate_digest(
-            digest: Option<&str>,
-            digest_len: usize,
-            digest_type: &'static str,
-        ) -> buck2_error::Result<Option<Arc<str>>> {
-            match digest {
-                None => Ok(None),
-                Some(digest) => {
-                    let expected_len = digest_len * 2;
-                    if digest.len() != expected_len {
-                        return Err(DownloadFileError::InvalidDigestLength {
-                            digest: digest.to_owned(),
-                            expected_len,
-                            digest_type,
-                        }
-                        .into());
-                    }
-                    if let Some(bad_char) = digest.chars().find(|x| !is_hex_digit(*x)) {
-                        return Err(DownloadFileError::InvalidDigestCharacter {
-                            digest: digest.to_owned(),
-                            bad_char,
-                            digest_type,
-                        }
-                        .into());
-                    }
-                    Ok(Some(Arc::from(digest.to_ascii_lowercase())))
-                }
+        let mut validated: Vec<ChecksumEntry> = Vec::new();
+        for (name, digest) in entries {
+            let algorithm = HashAlgorithm::find(name)
+                .ok_or_else(|| DownloadFileError::UnsupportedAlgorithm(name.to_owned()))?;
+            if validated.iter().any(|e| *e.algorithm == *algorithm.name) {
+                return Err(DownloadFileError::DuplicateAlgorithm(name.to_owned()).into());
             }
+            let expected_len = algorithm.digest_len * 2;
+            if digest.len() != expected_len {
+                return Err(DownloadFileError::InvalidDigestLength {
+                    digest: digest.to_owned(),
+                    expected_len,
+                    digest_type: algorithm.name,
+                }
+                .into());
+            }
+            if let Some(bad_char) = digest.chars().find(|x| !is_hex_digit(*x)) {
+                return Err(DownloadFileError::InvalidDigestCharacter {
+                    digest: digest.to_owned(),
+                    bad_char,
+                    digest_type: algorithm.name,
+                }
+                .into());
+            }
+            validated.push(ChecksumEntry {
+                algorithm: Arc::from(algorithm.name),
+                hex: Arc::from(digest.to_ascii_lowercase()),
+            });
         }
 
-        match (
-            validate_digest(sha1, SHA1_SIZE, "sha1")?,
-            validate_digest(sha256, SHA256_SIZE, "sha256")?,
-        ) {
-            (Some(sha1), None) => Ok(Checksum::Sha1(sha1)),
-            (None, Some(sha256)) => Ok(Checksum::Sha256(sha256)),
-            (Some(sha1), Some(sha256)) => Ok(Checksum::Both { sha1, sha256 }),
-            (None, None) => Err(DownloadFileError::MissingChecksum.into()),
+        if validated.is_empty() {
+            return Err(DownloadFileError::MissingChecksum.into());
         }
+        Ok(Self { entries: validated })
+    }
+
+    /// The hex digest for `algorithm`, if the checksum has one.
+    pub fn get(&self, algorithm: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| &*e.algorithm == algorithm)
+            .map(|e| &*e.hex)
+    }
+
+    /// The (algorithm name, hex digest) pairs, in the order they were given.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|e| (&*e.algorithm, &*e.hex))
     }
 
     pub fn sha1(&self) -> Option<&str> {
-        match self {
-            Self::Sha1(sha1) => Some(sha1),
-            Self::Sha256(..) => None,
-            Self::Both { sha1, .. } => Some(sha1),
-        }
+        self.get("sha1")
     }
 
     pub fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Sha1(..) => None,
-            Self::Sha256(sha256) => Some(sha256),
-            Self::Both { sha256, .. } => Some(sha256),
+        self.get("sha256")
+    }
+
+    pub fn sha512(&self) -> Option<&str> {
+        self.get("sha512")
+    }
+
+    /// A checksum with no validation of the digests, to test what verification does with a
+    /// wrong or unusual one.
+    #[cfg(test)]
+    fn unvalidated(entries: &[(&str, &str)]) -> Self {
+        Self {
+            entries: entries
+                .iter()
+                .map(|(algorithm, hex)| ChecksumEntry {
+                    algorithm: Arc::from(*algorithm),
+                    hex: Arc::from(*hex),
+                })
+                .collect(),
         }
     }
 }
@@ -181,12 +276,18 @@ enum HttpDownloadError {
 
     #[error(transparent)]
     IoError(buck2_error::Error),
+
+    /// A checksum names an algorithm the table does not know. `Checksum::new` refuses those, so
+    /// this is a backstop: bytes are never accepted without being checked.
+    #[error("Cannot verify download of {url}: unsupported checksum algorithm `{algorithm}`")]
+    #[buck2(input)]
+    UnsupportedAlgorithm { algorithm: String, url: String },
 }
 
 impl HttpDownloadError {
     fn into_final(mut self) -> Self {
         match &mut self {
-            Self::Client(..) | Self::IoError(..) => {}
+            Self::Client(..) | Self::IoError(..) | Self::UnsupportedAlgorithm { .. } => {}
             Self::InvalidChecksum { debug, .. } | Self::MaybeNotAllowedOnVpnless { debug, .. } => {
                 debug.is_final = true;
             }
@@ -220,7 +321,9 @@ impl HttpErrorForRetry for HttpDownloadError {
                 // message body... so it's a good idea to retry those.
                 cfg!(fbcode_build)
             }
-            Self::IoError(..) | Self::MaybeNotAllowedOnVpnless { .. } => false,
+            Self::IoError(..)
+            | Self::MaybeNotAllowedOnVpnless { .. }
+            | Self::UnsupportedAlgorithm { .. } => false,
         }
     }
 }
@@ -320,33 +423,29 @@ async fn copy_and_hash(
     let mut digester = FileDigest::digester(digest_config);
 
     // For each checksum entry we have, we're going to add a validator. We might have to create
-    // a new hasher, or reuse the `FileDigest::digester` if it matches.
+    // a new hasher, or reuse the `FileDigest::digester` if it matches. All of them are fed in the
+    // same pass over the stream.
 
     enum Validator {
         PrimaryDigest,
-        ExtraDigest(Box<dyn DynDigest + Send>),
+        ExtraDigest(DynHasher),
     }
 
-    let mut validators = SmallVec::<[_; 2]>::new();
+    let primary = HashAlgorithm::of_digest_family(digester.algorithm());
+    let mut validators = SmallVec::<[_; 3]>::new();
 
-    if let Some(sha1) = checksum.sha1() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha1 {
+    for (name, expected) in checksum.iter() {
+        let algorithm =
+            HashAlgorithm::find(name).ok_or_else(|| HttpDownloadError::UnsupportedAlgorithm {
+                algorithm: name.to_owned(),
+                url: url.to_owned(),
+            })?;
+        let validator = if primary == Some(algorithm.name) {
             Validator::PrimaryDigest
         } else {
-            Validator::ExtraDigest(Box::new(Sha1::new()) as _)
+            Validator::ExtraDigest((algorithm.new_hasher)())
         };
-
-        validators.push((validator, sha1, "sha1"));
-    }
-
-    if let Some(sha256) = checksum.sha256() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha256 {
-            Validator::PrimaryDigest
-        } else {
-            Validator::ExtraDigest(Box::new(Sha256::new()) as _)
-        };
-
-        validators.push((validator, sha256, "sha256"));
+        validators.push((validator, expected, algorithm.name));
     }
 
     let mut buff = DebugBuffer::new(512);
@@ -539,18 +638,23 @@ mod tests {
         Ok((digest, out))
     }
 
+    const FOOBAR_SHA1: &str = "8843d7f92416211de9ebb963ff4ce28125932878";
+    const FOOBAR_SHA256: &str = "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2";
+    const FOOBAR_SHA512: &str = "0a50261ebd1a390fed2bf326f2673c145582a6342d523204973d0219337f81616a8069b012587cf5635f6925f1b56c360230c19b273500ee013e030601bf2425";
+
+    fn all_three() -> Checksum {
+        Checksum::new([
+            ("sha1", FOOBAR_SHA1),
+            ("sha256", FOOBAR_SHA256),
+            ("sha512", FOOBAR_SHA512),
+        ])
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_copy_and_hash_ok() -> buck2_error::Result<()> {
-        let (digest, bytes) = do_test(
-            testing::blake3(),
-            &Checksum::Both {
-                sha1: Arc::from("8843d7f92416211de9ebb963ff4ce28125932878"),
-                sha256: Arc::from(
-                    "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
-                ),
-            },
-        )
-        .await?;
+        // None of the checksums is the digest config's algorithm, so each has its own hasher.
+        let (digest, bytes) = do_test(testing::blake3(), &all_three()).await?;
 
         assert_eq!(
             digest.to_string(),
@@ -563,14 +667,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_copy_and_hash_ok_with_primary_digest() -> buck2_error::Result<()> {
+        // One pass produces the digest config's digest and checks all three checksums, whether
+        // or not one of them is the digest config's own algorithm.
+        let (digest, bytes) = do_test(testing::sha256(), &all_three()).await?;
+        assert_eq!(digest.to_string(), format!("{FOOBAR_SHA256}:6"));
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "foobar");
+
+        let (digest, _) = do_test(testing::sha1(), &all_three()).await?;
+        assert_eq!(digest.to_string(), format!("{FOOBAR_SHA1}:6"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_sha512_only() -> buck2_error::Result<()> {
+        // A checksum that is only a SHA-512, as in an npm or yarn lock file, still gets the
+        // digest config's digest (and the right size) from the same pass.
+        let checksum = Checksum::new([("sha512", FOOBAR_SHA512)])?;
+
+        let (digest, bytes) = do_test(testing::sha256(), &checksum).await?;
+        assert_eq!(digest.to_string(), format!("{FOOBAR_SHA256}:6"));
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "foobar");
+
+        let (digest, _) = do_test(testing::blake3(), &checksum).await?;
+        assert_eq!(digest.size(), 6);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_invalid_sha512() -> buck2_error::Result<()> {
+        // A digest of the right length for another input, so a hasher that ignored its input
+        // or compared the wrong digest would be caught.
+        let wrong = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+        for config in [testing::sha1(), testing::sha256(), testing::blake3()] {
+            assert_matches!(
+                do_test(config, &Checksum::new([("sha512", wrong)])?).await,
+                Err(HttpDownloadError::InvalidChecksum {
+                    digest_kind: "sha512",
+                    ..
+                })
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_one_wrong_checksum_among_several() -> buck2_error::Result<()> {
+        // Every checksum is enforced, not just the first or the last.
+        let wrong_sha512 = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+        for checksum in [
+            Checksum::new([
+                ("sha1", FOOBAR_SHA1),
+                ("sha256", FOOBAR_SHA256),
+                ("sha512", wrong_sha512),
+            ])?,
+            Checksum::new([
+                ("sha512", wrong_sha512),
+                ("sha1", FOOBAR_SHA1),
+                ("sha256", FOOBAR_SHA256),
+            ])?,
+        ] {
+            assert_matches!(
+                do_test(testing::blake3(), &checksum).await,
+                Err(HttpDownloadError::InvalidChecksum {
+                    digest_kind: "sha512",
+                    ..
+                })
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_copy_and_hash_invalid_primary_hash() -> buck2_error::Result<()> {
         assert_matches!(
-            do_test(testing::sha1(), &Checksum::Sha1(Arc::from("oops"))).await,
+            do_test(testing::sha1(), &Checksum::unvalidated(&[("sha1", "oops")])).await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         assert_matches!(
-            do_test(testing::sha256(), &Checksum::Sha256(Arc::from("oops"))).await,
+            do_test(
+                testing::sha256(),
+                &Checksum::unvalidated(&[("sha256", "oops")])
+            )
+            .await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
@@ -580,16 +764,89 @@ mod tests {
     #[tokio::test]
     async fn test_copy_and_hash_invalid_secondary_hash() -> buck2_error::Result<()> {
         assert_matches!(
-            do_test(testing::blake3(), &Checksum::Sha1(Arc::from("oops"))).await,
+            do_test(
+                testing::blake3(),
+                &Checksum::unvalidated(&[("sha1", "oops")])
+            )
+            .await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         assert_matches!(
-            do_test(testing::blake3(), &Checksum::Sha256(Arc::from("oops"))).await,
+            do_test(
+                testing::blake3(),
+                &Checksum::unvalidated(&[("sha256", "oops")])
+            )
+            .await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_unknown_algorithm_is_refused() {
+        // Even if an entry for an unknown algorithm got past `Checksum::new`, the bytes are not
+        // accepted unverified.
+        let checksum = Checksum::unvalidated(&[("sha3_256", FOOBAR_SHA256)]);
+        assert_matches!(
+            do_test(testing::sha256(), &checksum).await,
+            Err(HttpDownloadError::UnsupportedAlgorithm { .. })
+        );
+    }
+
+    #[test]
+    fn test_checksum_new() -> buck2_error::Result<()> {
+        let checksum = all_three();
+        assert_eq!(checksum.sha1(), Some(FOOBAR_SHA1));
+        assert_eq!(checksum.sha256(), Some(FOOBAR_SHA256));
+        assert_eq!(checksum.sha512(), Some(FOOBAR_SHA512));
+        assert_eq!(checksum.get("sha3_256"), None);
+
+        let only_512 = Checksum::new([("sha512", FOOBAR_SHA512)])?;
+        assert_eq!(only_512.sha1(), None);
+        assert_eq!(only_512.sha256(), None);
+        assert_eq!(only_512.sha512(), Some(FOOBAR_SHA512));
+
+        // Hex is accepted in either case and stored in lowercase, like the other algorithms.
+        let upper = Checksum::new([("sha512", FOOBAR_SHA512.to_ascii_uppercase().as_str())])?;
+        assert_eq!(upper.sha512(), Some(FOOBAR_SHA512));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checksum_new_refuses() {
+        let err = |entries: &[(&str, &str)]| {
+            format!("{:#}", Checksum::new(entries.iter().copied()).unwrap_err())
+        };
+
+        assert!(err(&[]).contains("at least one checksum"));
+        assert!(err(&[("sha3_256", FOOBAR_SHA256)]).contains("Unsupported checksum algorithm"));
+        assert!(err(&[("sha512", FOOBAR_SHA256)]).contains("expected length of 128"));
+        assert!(err(&[("sha512", FOOBAR_SHA1)]).contains("expected length of 128"));
+        assert!(err(&[("sha256", FOOBAR_SHA512)]).contains("expected length of 64"));
+        assert!(
+            err(&[("sha512", &FOOBAR_SHA512.replace('0', "z"))])
+                .contains("expected 0-9 a-z hex characters")
+        );
+        assert!(err(&[("sha1", FOOBAR_SHA1), ("sha1", FOOBAR_SHA1)]).contains("more than once"));
+    }
+
+    #[test]
+    fn test_hash_algorithm_table() {
+        let mut names = std::collections::HashSet::new();
+        for algorithm in HASH_ALGORITHMS {
+            assert!(names.insert(algorithm.name), "duplicate {}", algorithm.name);
+            // The recorded length is what the hasher really produces.
+            assert_eq!(
+                (algorithm.new_hasher)().output_size(),
+                algorithm.digest_len,
+                "{}",
+                algorithm.name
+            );
+        }
+        assert!(names.contains("sha512"));
     }
 
     #[test]

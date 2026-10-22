@@ -44,8 +44,10 @@ enum CasArtifactError {
 #[starlark_module]
 pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// Downloads a URL to an output (filename as string or output artifact). The file at the URL
-    /// must have the given sha1 or the command will fail. The optional parameter is_executable
-    /// indicates whether the resulting file should be marked with executable permissions.
+    /// must match every checksum given (`sha1`, `sha256` and/or `sha512`, each as a hex string,
+    /// and at least one is required) or the command will fail. The optional parameter
+    /// is_executable indicates whether the resulting file should be marked with executable
+    /// permissions.
     /// (Meta-internal) The optional parameter vpnless_url indicates a url from which this resource
     /// can be downloaded off VPN; this has the same restrictions as `url` above.
     fn download_file<'v>(
@@ -55,6 +57,7 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] vpnless_url: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha1: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha256: NoneOr<&str>,
+        #[starlark(require = named, default = NoneOr::None)] sha512: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] size_bytes: NoneOr<u64>,
         #[starlark(require = named, default = false)] is_executable: bool,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
@@ -68,7 +71,15 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
             has_content_based_path.into_option(),
         )?;
 
-        let checksum = Checksum::new(sha1.into_option(), sha256.into_option())?;
+        let checksum = Checksum::new(
+            [
+                ("sha1", sha1.into_option()),
+                ("sha256", sha256.into_option()),
+                ("sha512", sha512.into_option()),
+            ]
+            .into_iter()
+            .filter_map(|(algorithm, digest)| Some((algorithm, digest?))),
+        )?;
 
         this.register_action(
             buck_indexset![output_artifact],
