@@ -11,6 +11,7 @@
 
 import asyncio
 import hashlib
+import re
 import socket
 from typing import List, Optional
 
@@ -461,3 +462,96 @@ async def test_a_wrong_size_is_a_miss_in_the_cas(buck: Buck) -> None:
             stderr_regex=f"Downloaded size \\({len(content)}\\) does not match expected size \\({len(content) + 1}\\)",
         )
         assert server.count("GET", "/file") == 2
+
+
+# What a rule that names only a sha1 and/or a sha256 gets is part of buck2's interface. The
+# expectations below are written out in full, not computed by the code under test, and the
+# tests in this section are the ones CI also runs against the binary built from the base
+# commit, so that "the same as before" is observed, not claimed.
+LEGACY_CONTENT = b"komira download_file compatibility fixture\n"
+LEGACY_SHA1 = "8d0d39823ec300851e9d25c6f562235014ebe667"
+LEGACY_SHA256 = "af3ca0aae2c6bf68b080e7684d8e80cda49960313459af32014116de0ce270e0"
+
+
+@buck_test(data_dir="download")
+@pytest.mark.parametrize("shape", ["sha1", "sha256", "both", "both_uppercase"])
+async def test_legacy_checksums_download_the_same_bytes(
+    buck: Buck, shape: str
+) -> None:
+    declared = {
+        "sha1": configs("", sha1=LEGACY_SHA1),
+        "sha256": configs("", sha256=LEGACY_SHA256),
+        "both": configs("", sha1=LEGACY_SHA1, sha256=LEGACY_SHA256),
+        "both_uppercase": configs(
+            "", sha1=LEGACY_SHA1.upper(), sha256=LEGACY_SHA256.upper()
+        ),
+    }[shape][2:]
+    async with StaticHttpServer({"/file": LEGACY_CONTENT}) as server:
+        output = await build_and_read(
+            buck, "//:download", *configs(server.url("/file")), *declared
+        )
+        assert output == LEGACY_CONTENT
+        assert hashlib.sha1(output).hexdigest() == LEGACY_SHA1  # patternlint-disable-line poor-choice-of-hash-function
+        assert sha256_hex(output) == LEGACY_SHA256
+        assert server.count("GET", "/file") == 1
+
+
+@buck_test(data_dir="download")
+async def test_legacy_wrong_digests_fail_with_the_same_messages(buck: Buck) -> None:
+    zeros40 = "0" * 40
+    zeros64 = "0" * 64
+    async with StaticHttpServer({"/file": LEGACY_CONTENT}) as server:
+        url = server.url("/file")
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha1=zeros40)),
+            stderr_regex=re.escape(
+                f"Invalid sha1 digest. Expected {zeros40}, got {LEGACY_SHA1}. URL: {url}"
+            ),
+        )
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha256=zeros64)),
+            stderr_regex=re.escape(
+                f"Invalid sha256 digest. Expected {zeros64}, got {LEGACY_SHA256}. URL: {url}"
+            ),
+        )
+        await expect_failure(
+            buck.build(
+                "//:download", *configs(url, sha1=LEGACY_SHA1, sha256=zeros64)
+            ),
+            stderr_regex=re.escape(
+                f"Invalid sha256 digest. Expected {zeros64}, got {LEGACY_SHA256}. URL: {url}"
+            ),
+        )
+        await expect_failure(
+            buck.build(
+                "//:download", *configs(url, sha1=zeros40, sha256=LEGACY_SHA256)
+            ),
+            stderr_regex=re.escape(
+                f"Invalid sha1 digest. Expected {zeros40}, got {LEGACY_SHA1}. URL: {url}"
+            ),
+        )
+
+
+@buck_test(data_dir="download")
+async def test_legacy_malformed_digests_fail_with_the_same_messages(
+    buck: Buck,
+) -> None:
+    async with StaticHttpServer({"/file": LEGACY_CONTENT}) as server:
+        url = server.url("/file")
+        await expect_failure(
+            buck.build("//:download", *configs(url)),
+            stderr_regex="Must pass in at least one checksum",
+        )
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha1="xxxxxx")),
+            stderr_regex=re.escape(
+                "Invalid digest for `sha1` argument, expected length of 40 but got 6, digest `xxxxxx`"
+            ),
+        )
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha256="z" * 64)),
+            stderr_regex=re.escape(
+                "Invalid digest for `sha256` argument, expected 0-9 a-z hex characters, but got `z`"
+            ),
+        )
+        assert server.count("GET", "/file") == 0
