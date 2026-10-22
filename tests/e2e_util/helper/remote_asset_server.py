@@ -40,11 +40,6 @@ _PROTO_ROOT = (
     / "proto"
 )
 
-_PROTOS = [
-    "build/bazel/remote/execution/v2/remote_execution.proto",
-    "build/bazel/remote/asset/v1/remote_asset.proto",
-    "google/bytestream/bytestream.proto",
-]
 
 _BLOB_RESOURCE = re.compile(r"blobs/([0-9a-f]+)/(\d+)$")
 
@@ -65,7 +60,7 @@ def _generate() -> Dict[str, Any]:
         f"--python_out={out}",
         f"--grpc_python_out={out}",
     ]
-    code = protoc.main(argv + [str(_PROTO_ROOT / p) for p in _PROTOS])
+    code = protoc.main(argv + sorted(str(p) for p in _PROTO_ROOT.rglob("*.proto")))
     assert code == 0, "protoc failed on buck2's Remote Execution protos"
     sys.path.insert(0, out)
     names = {
@@ -76,6 +71,7 @@ def _generate() -> Dict[str, Any]:
         "bs": "google.bytestream.bytestream_pb2",
         "bs_grpc": "google.bytestream.bytestream_pb2_grpc",
         "status": "google.rpc.status_pb2",
+        "semver": "build.bazel.semver.semver_pb2",
     }
     _generated = {short: importlib.import_module(full) for short, full in names.items()}
     return _generated
@@ -145,8 +141,8 @@ class RemoteAssetServer:
                             update_enabled=False
                         ),
                     ),
-                    low_api_version=pb["re"].SemVer(major=2),
-                    high_api_version=pb["re"].SemVer(major=2, minor=3),
+                    low_api_version=pb["semver"].SemVer(major=2),
+                    high_api_version=pb["semver"].SemVer(major=2, minor=3),
                 )
 
         class Cas(pb["re_grpc"].ContentAddressableStorageServicer):  # type: ignore
