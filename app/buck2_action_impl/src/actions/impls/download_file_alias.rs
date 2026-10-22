@@ -490,7 +490,7 @@ mod tests {
             config,
             ProjectRelativePath::new("out/pkg.tgz").unwrap(),
             url,
-            &Checksum::new([("sha512", hex)])?,
+            &Checksum::from_pairs(&[("sha512", hex)])?,
             false,
         )
         .await?;
@@ -548,7 +548,7 @@ mod tests {
     }
 
     /// A hit means the content comes from the CAS: no HTTP request is made, and the digest the
-    /// server named is the one handed on. Catches a hit that is ignored.
+    /// server named is the one handed on.
     #[tokio::test]
     async fn hit_makes_no_http_request() {
         let http = FakeHttp::start().await;
@@ -564,8 +564,6 @@ mod tests {
 
     /// A hit whose blob is not the size the rule author gave in `size_bytes` is not used: the CAS
     /// is not asked for it and the file is downloaded (where the same size check then decides).
-    /// Catches a hit trusted without comparing its size. Mutant: drop the `expected_size` guard in
-    /// `resolve`; the digest is then handed to `from_cas`.
     #[tokio::test]
     async fn hit_of_the_wrong_size_is_a_miss() {
         let http = FakeHttp::start().await;
@@ -579,8 +577,7 @@ mod tests {
         assert_eq!(aliases.calls(), vec!["fetch", "upload", "push"]);
     }
 
-    /// A hit of the size that was given is used as any hit is. Catches a size guard that rejects
-    /// every hit. Mutant: `size != digest.size()` turned into `size == digest.size()`.
+    /// A hit of the size that was given is used as any hit is.
     #[tokio::test]
     async fn hit_of_the_given_size_is_used() {
         let http = FakeHttp::start().await;
@@ -620,7 +617,7 @@ mod tests {
 
     /// If asking the CAS about what a hit named fails (rather than saying it has nothing), the
     /// build still does not fail: the file is downloaded and checked against its checksums. Remote
-    /// Asset is never what breaks a build. Catches a `?` on the `from_cas` result.
+    /// Asset is never what breaks a build.
     #[tokio::test]
     async fn hit_the_cas_fails_on_downloads() {
         let http = FakeHttp::start().await;
@@ -668,8 +665,7 @@ mod tests {
     }
 
     /// A server without Remote Asset is asked once. The download that finds out goes to the URL
-    /// and does not upload or push, and the next one makes no Remote Asset call at all. Catches a
-    /// server that is asked, and warned about, for every file.
+    /// and does not upload or push, and the next one makes no Remote Asset call at all.
     #[tokio::test]
     async fn unimplemented_is_remembered() {
         let http = FakeHttp::start().await;
@@ -733,9 +729,8 @@ mod tests {
         assert_eq!(aliases.calls(), vec!["fetch", "upload", "push"]);
     }
 
-    /// A miss downloads, then uploads, then records, in that order. Catches a push that is sent
-    /// before the upload: the server would refuse an alias for a blob it does not hold yet. The
-    /// recorded digest is the sha256 of the downloaded bytes.
+    /// A miss downloads, then uploads, then records, in that order, and the recorded digest is the
+    /// sha256 of the downloaded bytes.
     #[tokio::test]
     async fn miss_downloads_then_uploads_then_pushes() {
         let http = FakeHttp::start().await;

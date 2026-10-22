@@ -344,8 +344,7 @@ async fn fetch_unimplemented_is_reported_as_unimplemented() {
 }
 
 /// The API takes the hash as hex and the wire carries it as a Subresource Integrity token:
-/// `<algorithm>-<base64 of the raw bytes>`. Catches a token that base64-encodes the hex text
-/// instead of the bytes, or one built without the algorithm prefix.
+/// `<algorithm>-<base64 of the raw bytes>`.
 #[test]
 fn qualifier_is_the_standard_sri_form_of_the_hex() {
     let sha512 = crate::client::checksum_qualifier(

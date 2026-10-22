@@ -726,13 +726,12 @@ mod tests {
     const SHA256: &str = "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2";
     const SHA512: &str = "0a50261ebd1a390fed2bf326f2673c145582a6342d523204973d0219337f81616a8069b012587cf5635f6925f1b56c360230c19b273500ee013e030601bf2425";
 
-    /// `sha1` and `sha256` declare the digest as they always did. Catches a change to which one
-    /// wins or to which the digest config accepts, since that decides what the CAS is asked for.
+    /// `sha1` and `sha256` declare the digest as they always did.
     #[test]
     fn sha1_and_sha256_checksums_declare_a_digest() {
-        let sha1 = Checksum::new([("sha1", SHA1)]).unwrap();
-        let sha256 = Checksum::new([("sha256", SHA256)]).unwrap();
-        let both = Checksum::new([("sha1", SHA1), ("sha256", SHA256)]).unwrap();
+        let sha1 = Checksum::new(Some(SHA1), None).unwrap();
+        let sha256 = Checksum::new(None, Some(SHA256)).unwrap();
+        let both = Checksum::new(Some(SHA1), Some(SHA256)).unwrap();
 
         assert_matches!(
             checksum_digest(&sha1, testing::sha1()),
@@ -757,11 +756,10 @@ mod tests {
     }
 
     /// A `sha512` alone declares no digest, whatever the config accepts, so the action downloads
-    /// the file to learn it (or asks a Remote Asset server). Catches a sha512 that is mistaken for
-    /// a CAS digest.
+    /// the file to learn it (or asks a Remote Asset server).
     #[test]
     fn sha512_checksum_declares_no_digest() {
-        let sha512 = Checksum::new([("sha512", SHA512)]).unwrap();
+        let sha512 = Checksum::from_pairs(&[("sha512", SHA512)]).unwrap();
         for config in [
             testing::sha1(),
             testing::sha256(),
@@ -773,14 +771,13 @@ mod tests {
     }
 
     /// Remote Asset is asked about a file only when its checksum gives no CAS digest and has a hash
-    /// the server can be asked about. Catches a lookup (and with it an upload and a push) for a
-    /// download that works without one, which would change what existing callers do.
+    /// the server can be asked about.
     #[test]
     fn remote_asset_is_asked_only_when_the_checksum_gives_no_digest() {
-        let sha1 = Checksum::new([("sha1", SHA1)]).unwrap();
-        let sha256 = Checksum::new([("sha256", SHA256)]).unwrap();
-        let sha512 = Checksum::new([("sha512", SHA512)]).unwrap();
-        let sha1_512 = Checksum::new([("sha1", SHA1), ("sha512", SHA512)]).unwrap();
+        let sha1 = Checksum::new(Some(SHA1), None).unwrap();
+        let sha256 = Checksum::new(None, Some(SHA256)).unwrap();
+        let sha512 = Checksum::from_pairs(&[("sha512", SHA512)]).unwrap();
+        let sha1_512 = Checksum::from_pairs(&[("sha1", SHA1), ("sha512", SHA512)]).unwrap();
         let key =
             |checksum: &Checksum, config| alias_key(checksum, config).map(|key| key.algorithm);
 
@@ -827,17 +824,15 @@ mod tests {
 
     #[test]
     fn test_check_downloaded_size() {
-        // Defect: `size_bytes` ignored when the checksum alone cannot name a CAS digest (a
-        // sha512-only download). Mutant: the comparison removed.
+        // A wrong size is refused, also when the checksum alone cannot name a CAS digest (a
+        // sha512-only download).
         let err = check_downloaded_size(Some(6), 7).unwrap_err();
         assert!(err.has_tag(ErrorTag::DownloadSizeMismatch));
         assert!(
             format!("{err:#}").contains("Downloaded size (7) does not match expected size (6)")
         );
 
-        // Defect: refusing a download whose size is right, or one that declared no size.
-        // Mutant: `expected != actual` turned into `expected == actual`, or `_ => Ok(())` turned
-        // into an error.
+        // A right size, or no declared size, is accepted.
         check_downloaded_size(Some(6), 6).unwrap();
         check_downloaded_size(None, 6).unwrap();
     }
@@ -845,12 +840,10 @@ mod tests {
     #[test]
     fn test_expected_size() {
         // A sha512-only download has no metadata; `size_bytes` is the only size there is.
-        // Mutant: `.or(size_bytes)` removed.
         assert_eq!(expected_size(None, Some(6)), Some(6));
         assert_eq!(expected_size(None, None), None);
 
         // With metadata, its size wins (it is `size_bytes` or the HEAD response's).
-        // Mutant: the two sources swapped.
         let metadata = FileMetadata {
             digest: TrackedFileDigest::new(
                 FileDigest::from_content(b"foobar", testing::sha256()),

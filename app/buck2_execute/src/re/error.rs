@@ -151,9 +151,7 @@ mod tests {
 
     /// What the OSS client returns for a Remote Asset RPC that the server answers with
     /// `UNIMPLEMENTED` (an `REClientError` with that code) comes out of `with_error_handler` with
-    /// the tag the download uses to stop asking. Catches an error that loses the tag on the way,
-    /// which would make every download ask a server that lacks the API again. Mutant: map
-    /// `TCode::UNIMPLEMENTED` to another tag in `get_re_error_tag`.
+    /// the tag the download uses to stop asking.
     #[cfg(not(fbcode_build))]
     #[test]
     fn test_unimplemented_rpc_is_tagged() {
