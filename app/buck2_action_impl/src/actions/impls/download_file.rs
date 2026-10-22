@@ -67,6 +67,15 @@ enum DownloadFileActionError {
     ContentBasedPathWithoutMetadata(BuildArtifactPath),
 }
 
+/// The size a download must have: the declared metadata's, else `size_bytes`. The metadata's size
+/// is `size_bytes` when that was given, so `size_bytes` only matters when no metadata could be
+/// declared (for example a sha512-only download).
+fn expected_size(metadata: Option<&FileMetadata>, size_bytes: Option<u64>) -> Option<u64> {
+    metadata
+        .map(|metadata| metadata.digest.size())
+        .or(size_bytes)
+}
+
 /// Fails if a size was declared (by `size_bytes` or a HEAD response) and the download has another.
 fn check_downloaded_size(expected: Option<u64>, actual: u64) -> buck2_error::Result<()> {
     match expected {
@@ -383,9 +392,7 @@ impl DownloadFileAction {
         // checked even when no digest could be declared up front (for example a sha512-only
         // download), where it is the only thing that can catch a wrong size.
         check_downloaded_size(
-            metadata
-                .map(|metadata| metadata.digest.size())
-                .or(self.inner.size_bytes),
+            expected_size(metadata, self.inner.size_bytes),
             digest.size(),
         )?;
 
@@ -539,9 +546,9 @@ impl Action for DownloadFileAction {
 
 #[cfg(test)]
 mod tests {
-    use buck2_error::ErrorTag;
+    use buck2_common::cas_digest::testing;
 
-    use super::check_downloaded_size;
+    use super::*;
 
     // TODO: This needs proper tests, but right now it's kind of a pain to get the
     //       action framework up and running to test actions
@@ -551,8 +558,7 @@ mod tests {
     #[test]
     fn test_check_downloaded_size() {
         // Defect: `size_bytes` ignored when the checksum alone cannot name a CAS digest (a
-        // sha512-only download). Mutant: `.or(self.inner.size_bytes)` removed at the call site,
-        // which passes `None` here for that download.
+        // sha512-only download). Mutant: the comparison removed.
         let err = check_downloaded_size(Some(6), 7).unwrap_err();
         assert!(err.has_tag(ErrorTag::DownloadSizeMismatch));
         assert!(
@@ -564,5 +570,25 @@ mod tests {
         // into an error.
         check_downloaded_size(Some(6), 6).unwrap();
         check_downloaded_size(None, 6).unwrap();
+    }
+
+    #[test]
+    fn test_expected_size() {
+        // A sha512-only download has no metadata; `size_bytes` is the only size there is.
+        // Mutant: `.or(size_bytes)` removed.
+        assert_eq!(expected_size(None, Some(6)), Some(6));
+        assert_eq!(expected_size(None, None), None);
+
+        // With metadata, its size wins (it is `size_bytes` or the HEAD response's).
+        // Mutant: the two sources swapped.
+        let metadata = FileMetadata {
+            digest: TrackedFileDigest::new(
+                FileDigest::from_content(b"foobar", testing::sha256()),
+                testing::sha256(),
+            ),
+            is_executable: false,
+        };
+        assert_eq!(expected_size(Some(&metadata), Some(9)), Some(6));
+        assert_eq!(expected_size(Some(&metadata), None), Some(6));
     }
 }
