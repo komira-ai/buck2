@@ -140,7 +140,7 @@ jobs:
       run: |
         sudo apt-get update && sudo apt-get install -y libzstd1
         python3 -m venv "$RUNNER_TEMP/venv"
-        "$RUNNER_TEMP/venv/bin/pip" install pytest==8.3.5 pytest-asyncio==0.26.0 aiohttp==3.11.18 decorator==5.2.1 psutil==7.0.0
+        "$RUNNER_TEMP/venv/bin/pip" install pytest==8.3.5 pytest-asyncio==0.26.0 aiohttp==3.11.18 decorator==5.2.1 psutil==7.0.0 grpcio==1.71.0 grpcio-tools==1.71.0
         chmod +x "$RUNNER_TEMP"/bin/*/buck2-*
     - name: Set up the harness outside the build system that normally runs it
       run: |
@@ -177,5 +177,8 @@ jobs:
         echo "::endgroup::"
         echo "::group::sha512 tests, binary built from this change"
         run "$RUNNER_TEMP/bin/buck2-head/buck2-head" test_download_file_sha512 "test" || status=1
+        echo "::endgroup::"
+        echo "::group::Remote Asset tests, binary built from this change"
+        run "$RUNNER_TEMP/bin/buck2-head/buck2-head" test_download_file_remote_asset "test" || status=1
         echo "::endgroup::"
         exit $status
