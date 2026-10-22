@@ -12,8 +12,9 @@
 import asyncio
 import hashlib
 import re
+import shutil
 import socket
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 from aiohttp import web
@@ -21,6 +22,7 @@ from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.http_server import sha1_hex, StaticHttpServer
+from buck2.tests.e2e_util.helper.remote_asset_server import RemoteAssetServer, sri
 from buck2.tests.e2e_util.helper.utils import random_string
 
 
@@ -29,6 +31,7 @@ def configs(
     *,
     sha1: Optional[str] = None,
     sha256: Optional[str] = None,
+    sha512: Optional[str] = None,
     size: Optional[int] = None,
 ) -> List[str]:
     """`-c` arguments declaring the download the fixture's targets read from the config."""
@@ -37,6 +40,8 @@ def configs(
         args += ["-c", f"test.sha1={sha1}"]
     if sha256 is not None:
         args += ["-c", f"test.sha256={sha256}"]
+    if sha512 is not None:
+        args += ["-c", f"test.sha512={sha512}"]
     if size is not None:
         args += ["-c", f"test.size_bytes={size}"]
     return args
@@ -44,6 +49,23 @@ def configs(
 
 def sha256_hex(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+ALGORITHMS = ["sha1", "sha256", "sha512"]
+
+
+def digest(algorithm: str, content: bytes) -> str:
+    return hashlib.new(algorithm, content).hexdigest()
+
+
+def wrong_digest(algorithm: str) -> str:
+    """A well-formed digest of `algorithm` that no content has."""
+    return "0" * len(digest(algorithm, b""))
+
+
+def declare(content: bytes, *algorithms: str) -> Dict[str, str]:
+    """The `configs` keyword arguments declaring `content`'s digest in each of `algorithms`."""
+    return {algorithm: digest(algorithm, content) for algorithm in algorithms}
 
 
 def use_fbsource_digests(buck: Buck) -> None:
@@ -465,12 +487,10 @@ async def test_a_wrong_size_is_a_miss_in_the_cas(buck: Buck) -> None:
 
 
 # What a rule that names only a sha1 and/or a sha256 gets is part of buck2's interface. The
-# expectations below are written out in full, not computed by the code under test, and the
-# tests in this section are the ones CI also runs against the binary built from the base
-# commit, so that "the same as before" is observed, not claimed.
-LEGACY_CONTENT = b"komira download_file compatibility fixture\n"
-LEGACY_SHA1 = "8d0d39823ec300851e9d25c6f562235014ebe667"
-LEGACY_SHA256 = "af3ca0aae2c6bf68b080e7684d8e80cda49960313459af32014116de0ce270e0"
+# expectations below are written out in full, not computed by the code under test.
+LEGACY_CONTENT = b"download_file legacy checksum fixture\n"
+LEGACY_SHA1 = "10fde9893af2c4d19c7a406b5db0de4695dff0d6"
+LEGACY_SHA256 = "ae9eef44af54a0623acd40d91538a61a99bf2d4067c0cc64cdf3814c0efc9458"
 
 
 @buck_test(data_dir="download")
@@ -555,3 +575,336 @@ async def test_legacy_malformed_digests_fail_with_the_same_messages(
             ),
         )
         assert server.count("GET", "/file") == 0
+
+
+# Which checksums the rule passes to `download_file`. Every combination of the three
+# algorithms is a declaration that has to download and verify.
+SHAPES = [
+    ("sha1",),
+    ("sha256",),
+    ("sha512",),
+    ("sha1", "sha256"),
+    ("sha1", "sha512"),
+    ("sha256", "sha512"),
+    ("sha1", "sha256", "sha512"),
+]
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+@pytest.mark.parametrize("shape", SHAPES, ids=["+".join(s) for s in SHAPES])
+async def test_downloads_with_every_combination_of_checksums(
+    buck: Buck, shape: Tuple[str, ...]
+) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        output = await build_and_read(
+            buck,
+            "//:download",
+            *configs(server.url("/file"), **declare(content, *shape)),
+        )
+        assert output == content
+        assert server.count("GET", "/file") == 1
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_sha512_in_capitals_is_accepted(buck: Buck) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        output = await build_and_read(
+            buck,
+            "//:download",
+            *configs(server.url("/file"), sha512=digest("sha512", content).upper()),
+        )
+        assert output == content
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_sha512_with_the_right_size_downloads(buck: Buck) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        output = await build_and_read(
+            buck,
+            "//:download",
+            *configs(
+                server.url("/file"),
+                **declare(content, "sha512"),
+                size=len(content),
+            ),
+        )
+        assert output == content
+        assert server.count("GET", "/file") == 1
+
+
+# Each case names the algorithm whose digest is wrong and the algorithms declared next to it,
+# which are right.
+WRONG_DIGEST_CASES = [
+    (wrong, others)
+    for wrong in ALGORITHMS
+    for others in ([], [a for a in ALGORITHMS if a != wrong])
+]
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+@pytest.mark.parametrize(
+    "wrong,others",
+    WRONG_DIGEST_CASES,
+    ids=[f"{w}_wrong_with_{'+'.join(o) or 'nothing'}" for w, o in WRONG_DIGEST_CASES],
+)
+async def test_a_wrong_digest_of_each_kind_fails_the_build(
+    buck: Buck, wrong: str, others: List[str]
+) -> None:
+    content = random_string().encode()
+    declared = declare(content, *others)
+    declared[wrong] = wrong_digest(wrong)
+    async with StaticHttpServer({"/file": content}) as server:
+        url = server.url("/file")
+        await expect_failure(
+            buck.build("//:download", *configs(url, **declared)),
+            stderr_regex=re.escape(
+                f"Invalid {wrong} digest. Expected {wrong_digest(wrong)}, "
+                f"got {digest(wrong, content)}. URL: {url}"
+            ),
+        )
+        # The content was fetched and then refused: the check is on the bytes.
+        assert server.count("GET", "/file") == 1
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_sha512_that_is_not_a_digest_is_refused_before_any_download(
+    buck: Buck,
+) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        url = server.url("/file")
+        too_short = digest("sha256", content)
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha512=too_short)),
+            stderr_regex=re.escape(
+                "Invalid digest for `sha512` argument, expected length of 128 "
+                f"but got 64, digest `{too_short}`"
+            ),
+        )
+        not_hex = "z" * 128
+        await expect_failure(
+            buck.build("//:download", *configs(url, sha512=not_hex)),
+            stderr_regex=re.escape(
+                "Invalid digest for `sha512` argument, expected 0-9 a-z hex "
+                "characters, but got `z`"
+            ),
+        )
+        assert server.count("GET", "/file") == 0
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_sha512_alone_checks_the_declared_size(buck: Buck) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        await expect_failure(
+            buck.build(
+                "//:download",
+                *configs(
+                    server.url("/file"),
+                    **declare(content, "sha512"),
+                    size=len(content) + 1,
+                ),
+            ),
+            stderr_regex=f"Downloaded size \\({len(content)}\\) does not match expected size \\({len(content) + 1}\\)",
+        )
+
+
+# A checksum is part of an action, and an action is part of an analysis result, which can be
+# paged out to disk and back while a daemon runs.
+PAGING = {
+    "buck2_hydration": {"enable_paging": "true", "page_out_min_free_disk_gb": "0"}
+}
+
+
+@buck_test(
+    data_dir="download",
+    skip_for_os=["windows"],
+    write_invocation_record=True,
+    extra_buck_config=PAGING,
+)
+@pytest.mark.parametrize("shape", SHAPES, ids=["+".join(s) for s in SHAPES])
+async def test_a_paged_out_download_is_read_back(
+    buck: Buck, shape: Tuple[str, ...]
+) -> None:
+    content = random_string().encode()
+    async with StaticHttpServer({"/file": content}) as server:
+        args = configs(server.url("/file"), **declare(content, *shape))
+        assert await build_and_read(buck, "//:download", *args) == content
+
+        await buck.debug("hydration", "page-out")
+        status = (await buck.debug("hydration", "status")).stdout
+        paged_out = re.search(r"(\d+) paged out", status)
+        assert paged_out is not None and int(paged_out.group(1)) > 0, status
+
+        # A target that reads the download needs its analysis result back, which holds the
+        # action and with it the checksum.
+        result = await buck.build("//:copy", "--local-only", *args)
+        output = result.get_build_report().output_for_target("//:copy").read_bytes()
+        assert output == content
+        stats = result.invocation_record().get("page_in_by_key_type", {})
+        assert "AnalysisKey" in stats and int(stats["AnalysisKey"]["count"]) > 0, list(
+            stats
+        )
+        assert server.count("GET", "/file") == 1
+
+
+# With remote execution configured, a download that its checksums do not give a CAS digest for
+# (a sha512 alone) is looked up in, and recorded with, a Remote Asset server. The server in these
+# tests is a fake CAS plus Remote Asset server on a loopback port (see `remote_asset_server.py`),
+# and the file's origin is a local HTTP server, so a test can count exactly what each of them
+# was asked.
+def use_remote_asset(buck: Buck, server: RemoteAssetServer) -> None:
+    """Points the project at the fake, with a CAS keyed by SHA256, as Remote Asset requires."""
+    with open(buck.cwd / ".buckconfig", "a") as buckconfig:
+        buckconfig.write("[buck2]\ndigest_algorithms = SHA256\n")
+        buckconfig.write(server.buckconfig())
+
+
+async def build_from_scratch(buck: Buck, *args: str) -> bytes:
+    """A build in a new daemon with an empty `buck-out`, which is what another machine has."""
+    await buck.kill()
+    shutil.rmtree(buck.cwd / "buck-out", ignore_errors=True)
+    return await build_and_read(buck, "//:download", *args)
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_second_clean_build_downloads_nothing(buck: Buck) -> None:
+    content = random_string().encode()
+    sha512 = digest("sha512", content)
+    async with RemoteAssetServer() as ra, StaticHttpServer({"/file": content}) as origin:
+        use_remote_asset(buck, ra)
+        url = origin.url("/file")
+        declared = configs(url, sha512=sha512)
+
+        # The first build asks, misses, downloads, uploads the blob and records it.
+        assert await build_and_read(buck, "//:download", *declared) == content
+        assert origin.count("GET", "/file") == 1
+        assert ra.fetches == [(url, sri("sha512", content))]
+        assert ra.uploads == [digest("sha256", content)]
+        assert ra.pushes == [
+            (url, sri("sha512", content), digest("sha256", content), len(content))
+        ]
+        assert ra.refused == []
+
+        # A new daemon, an empty `buck-out`: the file is nowhere on disk. The server knows it,
+        # so it comes out of the CAS and the origin sees nothing at all.
+        before = len(origin.requests)
+        assert await build_from_scratch(buck, *declared) == content
+        assert len(origin.requests) == before
+        assert len(ra.fetches) == 2
+        assert ra.fetches[1] == (url, sri("sha512", content))
+        assert len(ra.pushes) == 1
+        assert digest("sha256", content) in ra.reads
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_the_record_is_per_url_and_per_hash(buck: Buck) -> None:
+    content = random_string().encode()
+    other = random_string().encode()
+    async with RemoteAssetServer() as ra, StaticHttpServer(
+        {"/file": content, "/other": other, "/mirror": content}
+    ) as origin:
+        use_remote_asset(buck, ra)
+        await buck.build(
+            "//:download",
+            *configs(origin.url("/file"), sha512=digest("sha512", content)),
+        )
+        assert origin.count("GET", "/file") == 1
+
+        # The same hash at another URL is a different asset to the server, so it is a miss
+        # and the bytes come from that URL.
+        assert (
+            await build_from_scratch(
+                buck,
+                *configs(origin.url("/mirror"), sha512=digest("sha512", content)),
+            )
+            == content
+        )
+        assert origin.count("GET", "/mirror") == 1
+
+        # Another hash at the first URL is a miss as well (and the download then refuses the
+        # bytes, since they do not have that hash).
+        await buck.kill()
+        shutil.rmtree(buck.cwd / "buck-out", ignore_errors=True)
+        await expect_failure(
+            buck.build(
+                "//:download",
+                *configs(origin.url("/file"), sha512=digest("sha512", other)),
+            ),
+            stderr_regex="Invalid sha512 digest",
+        )
+        assert origin.count("GET", "/file") == 2
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_sha512_with_other_checksums_is_recorded_under_the_sha512(
+    buck: Buck,
+) -> None:
+    content = random_string().encode()
+    async with RemoteAssetServer() as ra, StaticHttpServer({"/file": content}) as origin:
+        use_remote_asset(buck, ra)
+        url = origin.url("/file")
+        declared = configs(url, **declare(content, "sha1", "sha512"))
+        await buck.build("//:download", *declared)
+        assert [p[:2] for p in ra.pushes] == [(url, sri("sha512", content))]
+
+        before = len(origin.requests)
+        assert await build_from_scratch(buck, *declared) == content
+        assert len(origin.requests) == before
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_download_that_fails_its_checksum_is_not_recorded(buck: Buck) -> None:
+    content = random_string().encode()
+    async with RemoteAssetServer() as ra, StaticHttpServer({"/file": content}) as origin:
+        use_remote_asset(buck, ra)
+        wrong = wrong_digest("sha512")
+        await expect_failure(
+            buck.build("//:download", *configs(origin.url("/file"), sha512=wrong)),
+            stderr_regex=re.escape(f"Invalid sha512 digest. Expected {wrong}"),
+        )
+        assert origin.count("GET", "/file") == 1
+        assert ra.pushes == []
+        assert ra.uploads == []
+        assert ra.assets == {}
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_a_server_without_remote_asset_changes_nothing_for_the_build(
+    buck: Buck,
+) -> None:
+    content = random_string().encode()
+    async with RemoteAssetServer(implement_assets=False) as ra, StaticHttpServer(
+        {"/file": content}
+    ) as origin:
+        use_remote_asset(buck, ra)
+        url = origin.url("/file")
+        declared = configs(url, sha512=digest("sha512", content))
+
+        assert await build_and_read(buck, "//:download", *declared) == content
+        assert origin.count("GET", "/file") == 1
+        assert ra.pushes == []
+
+        # Nothing was recorded, so the next clean build downloads again, and succeeds.
+        assert await build_from_scratch(buck, *declared) == content
+        assert origin.count("GET", "/file") == 2
+
+
+@buck_test(data_dir="download", skip_for_os=["windows"])
+async def test_downloads_that_give_a_cas_digest_do_not_use_remote_asset(
+    buck: Buck,
+) -> None:
+    content = random_string().encode()
+    async with RemoteAssetServer() as ra, StaticHttpServer({"/file": content}) as origin:
+        use_remote_asset(buck, ra)
+        url = origin.url("/file")
+        for algorithms in (("sha256",), ("sha1",), ("sha1", "sha256")):
+            output = await build_from_scratch(
+                buck, *configs(url, **declare(content, *algorithms), size=len(content))
+            )
+            assert output == content
+        assert ra.fetches == []
+        assert ra.pushes == []
