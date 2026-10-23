@@ -571,10 +571,9 @@ impl DownloadFileAction {
             },
             || async move {
                 let (value, _) = self.download(ctx, client, url, None).await?;
-                let digest = value
+                let digest = *value
                     .digest()
-                    .internal_error("A downloaded file has a digest")?
-                    .clone();
+                    .internal_error("A downloaded file has a digest")?;
                 Ok((value, digest))
             },
         )

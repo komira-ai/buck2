@@ -337,9 +337,9 @@ mod tests {
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             BODY.len()
                         );
-                        let _ = stream.write_all(head.as_bytes()).await;
-                        let _ = stream.write_all(BODY).await;
-                        let _ = stream.shutdown().await;
+                        stream.write_all(head.as_bytes()).await.ok();
+                        stream.write_all(BODY).await.ok();
+                        stream.shutdown().await.ok();
                     });
                 }
             });
@@ -421,7 +421,7 @@ mod tests {
         ) -> buck2_error::Result<Option<FileDigest>> {
             self.calls.lock().unwrap().push("fetch");
             match &self.fetch {
-                FetchReply::Hit(digest) => Ok(Some(digest.clone())),
+                FetchReply::Hit(digest) => Ok(Some(*digest)),
                 FetchReply::Miss => Ok(None),
                 FetchReply::Error => Err(buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Input,
@@ -458,7 +458,7 @@ mod tests {
         ) -> buck2_error::Result<()> {
             self.calls.lock().unwrap().push("push");
             assert_eq!(key, KEY);
-            *self.pushed.lock().unwrap() = Some((url.to_owned(), digest.clone()));
+            *self.pushed.lock().unwrap() = Some((url.to_owned(), *digest));
             if self.push_hangs {
                 std::future::pending::<()>().await;
             }
@@ -494,7 +494,7 @@ mod tests {
             false,
         )
         .await?;
-        Ok(((), digest.data().clone()))
+        Ok(((), *digest.data()))
     }
 
     async fn client() -> HttpClient {
@@ -543,7 +543,7 @@ mod tests {
         )
         .await
         .expect("resolve did not return: a Remote Asset step has no deadline");
-        let asked = asked.lock().unwrap().clone();
+        let asked = *asked.lock().unwrap();
         (outcome, asked)
     }
 
