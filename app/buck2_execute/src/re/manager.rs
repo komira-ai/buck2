@@ -530,6 +530,35 @@ impl ManagedRemoteExecutionClient {
             .await
     }
 
+    /// See [`RemoteExecutionClient::fetch_blob_by_checksum`].
+    pub async fn fetch_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        self.lock()?
+            .get()
+            .await?
+            .fetch_blob_by_checksum(uri, algorithm, hex, &self.no_action_metadata)
+            .await
+    }
+
+    /// See [`RemoteExecutionClient::push_blob_by_checksum`].
+    pub async fn push_blob_by_checksum(
+        &self,
+        uri: &str,
+        algorithm: &str,
+        hex: &str,
+        digest: &TDigest,
+    ) -> buck2_error::Result<()> {
+        self.lock()?
+            .get()
+            .await?
+            .push_blob_by_checksum(uri, algorithm, hex, digest, &self.no_action_metadata)
+            .await
+    }
+
     /// See [`RemoteExecutionClient::check_presence`]; misses and failures are classified per
     /// `info`, whose use case must be this client's.
     pub async fn check_presence(

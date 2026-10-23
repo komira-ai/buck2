@@ -75,6 +75,12 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// is checked against the size of the downloaded file. The optional parameter
     /// is_executable indicates whether the resulting file should be marked with executable
     /// permissions.
+    ///
+    /// The digest of a file given only a `sha512` is not known until it has been read, so it cannot
+    /// be taken from the CAS directly. When remote execution is configured, a Remote Asset server
+    /// is first asked whether it knows the file by that hash, and is told about it after a
+    /// download.
+    ///
     /// (Meta-internal) The optional parameter vpnless_url indicates a url from which this resource
     /// can be downloaded off VPN; this has the same restrictions as `url` above.
     fn download_file<'v>(

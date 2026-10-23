@@ -7,12 +7,15 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     test_deps = [
         "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio-stream",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-compression",
+        "fbsource//third-party/rust:base64",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:h2",
+        "fbsource//third-party/rust:hex",
         "fbsource//third-party/rust:http",
         "fbsource//third-party/rust:http-body",
         "fbsource//third-party/rust:http-body-util",

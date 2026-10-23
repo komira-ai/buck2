@@ -1043,12 +1043,14 @@ name = "buck2_action_impl"
 version = "0.1.0"
 dependencies = [
  "allocative",
+ "assert_matches",
  "async-trait",
  "blake3",
  "buck2_action_metadata_proto",
  "buck2_artifact",
  "buck2_build_api",
  "buck2_build_signals",
+ "buck2_certs",
  "buck2_common",
  "buck2_core",
  "buck2_data",
@@ -1083,6 +1085,7 @@ dependencies = [
  "starlark",
  "starlark_map",
  "strong_hash",
+ "tokio",
  "tracing",
 ]
 
@@ -9268,11 +9271,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "base64 0.23.1",
  "buck2_re_configuration",
  "buck2_util",
  "dupe",
  "futures 0.3.34",
  "h2",
+ "hex",
  "http",
  "http-body",
  "http-body-util",
@@ -9287,6 +9292,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tokio-util 0.7.19",
  "tonic",
  "tower",

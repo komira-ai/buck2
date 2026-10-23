@@ -31,6 +31,11 @@ pub mod build {
             tonic::include_proto!("build.bazel.semver");
         }
         pub mod remote {
+            pub mod asset {
+                pub mod v1 {
+                    tonic::include_proto!("build.bazel.remote.asset.v1");
+                }
+            }
             pub mod execution {
                 pub mod v2 {
                     tonic::include_proto!("build.bazel.remote.execution.v2");
