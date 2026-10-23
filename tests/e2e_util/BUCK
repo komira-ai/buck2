@@ -33,6 +33,15 @@ python_library(
 )
 
 python_library(
+    name = "remote_asset_server",
+    srcs = ["helper/remote_asset_server.py"],
+    deps = [
+        "fbsource//third-party/pypi/grpcio:grpcio",
+        "fbsource//third-party/pypi/grpcio-tools:grpcio-tools",
+    ],
+)
+
+python_library(
     name = "utilities",
     srcs = [
         "asserts.py",
