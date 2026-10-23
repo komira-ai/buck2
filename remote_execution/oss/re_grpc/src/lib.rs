@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+#[cfg(test)]
+mod asset_test;
 mod client;
 mod digest;
 mod error;

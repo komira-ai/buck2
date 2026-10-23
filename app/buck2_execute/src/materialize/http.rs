@@ -61,6 +61,9 @@ struct HashAlgorithm {
     /// Length of the digest in bytes (the hex form is twice as long).
     digest_len: usize,
     new_hasher: fn() -> DynHasher,
+    /// Whether a Remote Asset server can be asked about content by this hash. It is asked with a
+    /// Subresource Integrity token, so only algorithms that specification defines qualify.
+    lookup_capable: bool,
     /// The digest-config algorithm that computes this same hash, if there is one. A download is
     /// then checked with the digest it computes for the CAS anyway instead of hashing twice.
     digest_family: Option<DigestAlgorithmFamily>,
@@ -71,18 +74,21 @@ static HASH_ALGORITHMS: &[HashAlgorithm] = &[
         name: "sha1",
         digest_len: SHA1_SIZE,
         new_hasher: || Box::new(Sha1::new()) as DynHasher,
+        lookup_capable: false,
         digest_family: Some(DigestAlgorithmFamily::Sha1),
     },
     HashAlgorithm {
         name: "sha256",
         digest_len: SHA256_SIZE,
         new_hasher: || Box::new(Sha256::new()) as DynHasher,
+        lookup_capable: true,
         digest_family: Some(DigestAlgorithmFamily::Sha256),
     },
     HashAlgorithm {
         name: "sha512",
         digest_len: SHA512_SIZE,
         new_hasher: || Box::new(Sha512::new()) as DynHasher,
+        lookup_capable: true,
         digest_family: None,
     },
 ];
@@ -91,6 +97,15 @@ impl HashAlgorithm {
     fn find(name: &str) -> Option<&'static HashAlgorithm> {
         HASH_ALGORITHMS.iter().find(|a| a.name == name)
     }
+}
+
+/// One hash of a download, as a Remote Asset server can be asked about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumKey<'a> {
+    /// The algorithm's name, as in the table (`sha512`).
+    pub algorithm: &'static str,
+    /// Lowercase hex.
+    pub hex: &'a str,
 }
 
 /// One (algorithm, digest) pair of [`Checksum::Entries`]. Built only by [`Checksum::from_pairs`],
@@ -249,6 +264,37 @@ impl Checksum {
             return Err(DownloadFileError::MissingChecksum.into());
         }
         Ok(Self::Entries(Arc::from(validated)))
+    }
+
+    /// The hash to look this download up by in a Remote Asset server: of the lookup-capable ones
+    /// the checksum has, the one with the longest digest, whatever order the table lists them in
+    /// (`sha1` is not lookup-capable). `None` when there is no such hash.
+    pub fn lookup_key(&self) -> Option<ChecksumKey<'_>> {
+        self.lookup_key_among(HASH_ALGORITHMS.iter())
+    }
+
+    fn lookup_key_among(
+        &self,
+        algorithms: impl Iterator<Item = &'static HashAlgorithm>,
+    ) -> Option<ChecksumKey<'_>> {
+        let pairs = self.pairs();
+        algorithms
+            .filter(|algorithm| algorithm.lookup_capable)
+            .filter_map(|algorithm| {
+                let hex = pairs
+                    .iter()
+                    .find(|(name, _)| *name == algorithm.name)
+                    .map(|(_, hex)| *hex)?;
+                Some((
+                    algorithm.digest_len,
+                    ChecksumKey {
+                        algorithm: algorithm.name,
+                        hex,
+                    },
+                ))
+            })
+            .max_by_key(|(digest_len, _)| *digest_len)
+            .map(|(_, key)| key)
     }
 
     pub fn sha1(&self) -> Option<&str> {
@@ -1124,6 +1170,68 @@ mod tests {
         assert_matches!(decoded, Checksum::Entries(..));
         assert_eq!(decoded.pairs(), checksum.pairs());
         assert_eq!(decoded.sha512(), Some(FOOBAR_SHA512));
+        Ok(())
+    }
+
+    /// The lookup key is the strongest hash the SRI specification defines, whatever order the
+    /// checksums were given in, and never a sha1.
+    #[test]
+    fn test_lookup_key() -> buck2_error::Result<()> {
+        let key = |entries: &[(&str, &str)]| {
+            Checksum::from_pairs(entries)
+                .unwrap()
+                .lookup_key()
+                .map(|k| (k.algorithm, k.hex.to_owned()))
+        };
+
+        assert_eq!(
+            key(&[("sha512", FOOBAR_SHA512)]),
+            Some(("sha512", FOOBAR_SHA512.to_owned()))
+        );
+        assert_eq!(
+            key(&[("sha256", FOOBAR_SHA256), ("sha512", FOOBAR_SHA512)]),
+            Some(("sha512", FOOBAR_SHA512.to_owned()))
+        );
+        assert_eq!(
+            key(&[("sha512", FOOBAR_SHA512), ("sha256", FOOBAR_SHA256)]),
+            Some(("sha512", FOOBAR_SHA512.to_owned()))
+        );
+        assert_eq!(
+            key(&[("sha1", FOOBAR_SHA1), ("sha256", FOOBAR_SHA256)]),
+            Some(("sha256", FOOBAR_SHA256.to_owned()))
+        );
+        assert_eq!(key(&[("sha1", FOOBAR_SHA1)]), None);
+
+        // The variants every download without `sha512` is built as answer the same way.
+        let new_key = |sha1, sha256| {
+            Checksum::new(sha1, sha256)
+                .unwrap()
+                .lookup_key()
+                .map(|k| (k.algorithm, k.hex.to_owned()))
+        };
+        assert_eq!(new_key(Some(FOOBAR_SHA1), None), None);
+        assert_eq!(
+            new_key(None, Some(FOOBAR_SHA256)),
+            Some(("sha256", FOOBAR_SHA256.to_owned()))
+        );
+        assert_eq!(
+            new_key(Some(FOOBAR_SHA1), Some(FOOBAR_SHA256)),
+            Some(("sha256", FOOBAR_SHA256.to_owned()))
+        );
+
+        Ok(())
+    }
+
+    /// The choice does not depend on where an algorithm sits in the table.
+    #[test]
+    fn test_lookup_key_ignores_table_order() -> buck2_error::Result<()> {
+        let checksum = all_three();
+        for key in [
+            checksum.lookup_key_among(HASH_ALGORITHMS.iter()),
+            checksum.lookup_key_among(HASH_ALGORITHMS.iter().rev()),
+        ] {
+            assert_eq!(key.map(|k| k.algorithm), Some("sha512"));
+        }
         Ok(())
     }
 

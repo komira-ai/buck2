@@ -7,6 +7,7 @@ buck2_core_tests(
         "test_download_file": {
             "deps": [
                 "fbcode//buck2/tests/e2e_util:http_server",
+                "fbcode//buck2/tests/e2e_util:remote_asset_server",
                 "fbsource//third-party/pypi/aiohttp:aiohttp",
             ],
             "env": {

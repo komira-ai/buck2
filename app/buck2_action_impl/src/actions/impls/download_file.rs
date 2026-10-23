@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -23,6 +24,7 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_signals::env::WaitingData;
+use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::RawDigest;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileMetadata;
@@ -32,28 +34,38 @@ use buck2_core::category::CategoryRef;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::http::Checksum;
+use buck2_execute::materialize::http::ChecksumKey;
 use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::http::http_head;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
+use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::presence::NegativeCache;
 use buck2_hash::BuckIndexSet;
 use buck2_http::HttpClient;
 use dupe::Dupe;
 use pagable::Pagable;
 use pagable::pagable_typetag;
+use remote_execution::NamedDigest;
+use remote_execution::TDigest;
 use starlark::values::OwnedFrozen;
 use starlark::values::Value;
 
+use crate::actions::impls::download_file_alias;
+use crate::actions::impls::download_file_alias::ChecksumAliases;
+use crate::actions::impls::download_file_alias::RemoteAsset;
+use crate::actions::impls::download_file_alias::Resolved;
 use crate::actions::impls::offline;
 
 #[derive(Debug, buck2_error::Error)]
@@ -96,6 +108,106 @@ enum DeclaredMetadata {
     Unknown,
     /// The size had to come from a HEAD request, and that failed.
     HeadFailed(buck2_error::Error),
+}
+
+/// The digest the checksum names, if it names one the digest config accepts. `None` for a
+/// checksum that does not (for example a `sha512` alone): that digest is not known until the file
+/// is read.
+fn checksum_digest(checksum: &Checksum, cas_digest_config: CasDigestConfig) -> Option<RawDigest> {
+    if cas_digest_config.allows_sha1() {
+        checksum
+            .sha1()
+            .and_then(|sha1| RawDigest::parse_sha1(sha1.as_bytes()).ok())
+    } else if cas_digest_config.allows_sha256() {
+        checksum
+            .sha256()
+            .and_then(|sha256| RawDigest::parse_sha256(sha256.as_bytes()).ok())
+    } else {
+        None
+    }
+}
+
+/// The hash to ask a Remote Asset server about, for a file whose checksum does not give its CAS
+/// digest. `None` when the checksum does give it (those downloads go to the CAS or the origin as
+/// they always did) or has no hash a server can be asked about.
+fn alias_key(checksum: &Checksum, cas_digest_config: CasDigestConfig) -> Option<ChecksumKey<'_>> {
+    match checksum_digest(checksum, cas_digest_config) {
+        Some(_) => None,
+        None => checksum.lookup_key(),
+    }
+}
+
+/// Whether the Remote Asset server has said it does not implement Remote Asset. Remembered for the
+/// life of the daemon, whatever the RE connection: a server that lacks the API will not gain it
+/// during a session, and the cost of being wrong is one origin download per file, which is what a
+/// build without Remote Asset does anyway.
+static REMOTE_ASSET_UNIMPLEMENTED: AtomicBool = AtomicBool::new(false);
+
+/// A Remote Asset server and the CAS beside it, reached through the invocation's RE connection.
+struct ReChecksumAliases {
+    re: ManagedRemoteExecutionClient,
+    /// Where the downloaded file is on disk, for the upload.
+    abs_path: String,
+}
+
+#[async_trait]
+impl ChecksumAliases for ReChecksumAliases {
+    async fn fetch(
+        &self,
+        url: &str,
+        key: ChecksumKey<'_>,
+    ) -> buck2_error::Result<Option<FileDigest>> {
+        self.re
+            .fetch_blob_by_checksum(url, key.algorithm, key.hex)
+            .await?
+            .map(|digest| sha256_file_digest(&digest))
+            .transpose()
+    }
+
+    async fn upload(&self, digest: &FileDigest) -> buck2_error::Result<()> {
+        self.re
+            .upload_files_and_directories(
+                vec![NamedDigest {
+                    name: self.abs_path.clone(),
+                    digest: digest.to_re(),
+                    ..Default::default()
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+    }
+
+    async fn push(
+        &self,
+        url: &str,
+        key: ChecksumKey<'_>,
+        digest: &FileDigest,
+    ) -> buck2_error::Result<()> {
+        self.re
+            .push_blob_by_checksum(url, key.algorithm, key.hex, &digest.to_re())
+            .await
+    }
+}
+
+/// The digest a Remote Asset server returned, which was asked for as sha256.
+fn sha256_file_digest(digest: &TDigest) -> buck2_error::Result<FileDigest> {
+    let size = u64::try_from(digest.size_in_bytes).map_err(|_| {
+        buck2_error!(
+            ErrorTag::Input,
+            "Remote Asset server returned a negative size in `{}`",
+            digest
+        )
+    })?;
+    let raw = RawDigest::parse_sha256(digest.hash.as_bytes()).map_err(|e| {
+        buck2_error!(
+            ErrorTag::Input,
+            "Remote Asset server returned a digest that is not sha256, `{}`: {}",
+            digest,
+            e
+        )
+    })?;
+    Ok(FileDigest::new(raw, size))
 }
 
 #[derive(Debug, Allocative, Pagable)]
@@ -178,21 +290,8 @@ impl DownloadFileAction {
         client: &HttpClient,
         digest_config: DigestConfig,
     ) -> DeclaredMetadata {
-        let digest = if digest_config.cas_digest_config().allows_sha1() {
-            self.inner
-                .checksum
-                .sha1()
-                .and_then(|sha1| RawDigest::parse_sha1(sha1.as_bytes()).ok())
-        } else if digest_config.cas_digest_config().allows_sha256() {
-            self.inner
-                .checksum
-                .sha256()
-                .and_then(|sha256| RawDigest::parse_sha256(sha256.as_bytes()).ok())
-        } else {
-            None
-        };
-
-        let digest = match digest {
+        let digest = match checksum_digest(&self.inner.checksum, digest_config.cas_digest_config())
+        {
             Some(digest) => digest,
             None => return DeclaredMetadata::Unknown,
         };
@@ -421,6 +520,65 @@ impl DownloadFileAction {
         Ok((value, ActionExecutionKind::Simple))
     }
 
+    /// Gets a file whose checksum does not give its CAS digest. A Remote Asset server, when remote
+    /// execution is configured, may know which CAS blob has the content behind `key`, in which case
+    /// it is declared from the CAS without downloading it; otherwise it is downloaded, and then
+    /// recorded with the server.
+    async fn download_with_alias(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+        client: &HttpClient,
+        url: &str,
+        key: ChecksumKey<'_>,
+    ) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
+        let aliases = if download_file_alias::aliases_usable(
+            ctx.cas_configured(),
+            ctx.digest_config().cas_digest_config(),
+        ) {
+            let path = ctx.fs().resolve_build(self.output().get_path(), None)?;
+            Some(ReChecksumAliases {
+                re: ctx.re_client().with_use_case(ctx.invocation_re_use_case()),
+                abs_path: ctx.fs().fs().resolve(&path).to_string(),
+            })
+        } else {
+            None
+        };
+
+        let remote = aliases.as_ref().map(|aliases| RemoteAsset {
+            aliases: aliases as &dyn ChecksumAliases,
+            unimplemented: &REMOTE_ASSET_UNIMPLEMENTED,
+            deadlines: download_file_alias::DEADLINES,
+        });
+
+        let resolved = download_file_alias::resolve(
+            remote.as_ref(),
+            url,
+            key,
+            self.inner.size_bytes,
+            |digest| async move {
+                let metadata = FileMetadata {
+                    digest: TrackedFileDigest::new(digest, ctx.digest_config().cas_digest_config()),
+                    is_executable: self.inner.is_executable,
+                };
+                self.declare_from_cas(ctx, &metadata).await
+            },
+            || async move {
+                let (value, _) = self.download(ctx, client, url, None).await?;
+                let digest = value
+                    .digest()
+                    .internal_error("A downloaded file has a digest")?
+                    .clone();
+                Ok((value, digest))
+            },
+        )
+        .await?;
+
+        Ok(match resolved {
+            Resolved::FromCas(value) => (value, ActionExecutionKind::Deferred),
+            Resolved::Downloaded(value) => (value, ActionExecutionKind::Simple),
+        })
+    }
+
     /// Execute this action for offline builds (e.g. no network).
     async fn execute_for_offline(
         &self,
@@ -520,7 +678,15 @@ impl Action for DownloadFileAction {
                 Some(value) => (value, ActionExecutionKind::Deferred),
                 None => self.download(ctx, client, url, Some(metadata)).await?,
             },
-            None => self.download(ctx, client, url, None).await?,
+            None => {
+                // The checksum does not give the CAS digest, so the CAS cannot be asked for the
+                // file directly. A Remote Asset server may know it by a hash the checksum has.
+                let digest_config = ctx.digest_config().cas_digest_config();
+                match alias_key(&self.inner.checksum, digest_config) {
+                    Some(key) => self.download_with_alias(ctx, client, url, key).await?,
+                    None => self.download(ctx, client, url, None).await?,
+                }
+            }
         };
 
         // If we're tracing I/O, get the materializer to copy to the offline cache
@@ -546,6 +712,7 @@ impl Action for DownloadFileAction {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use buck2_common::cas_digest::testing;
 
     use super::*;
@@ -554,6 +721,106 @@ mod tests {
     //       action framework up and running to test actions
     #[test]
     fn downloads_file() {}
+
+    const SHA1: &str = "8843d7f92416211de9ebb963ff4ce28125932878";
+    const SHA256: &str = "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2";
+    const SHA512: &str = "0a50261ebd1a390fed2bf326f2673c145582a6342d523204973d0219337f81616a8069b012587cf5635f6925f1b56c360230c19b273500ee013e030601bf2425";
+
+    /// `sha1` and `sha256` declare the digest as they always did.
+    #[test]
+    fn sha1_and_sha256_checksums_declare_a_digest() {
+        let sha1 = Checksum::new(Some(SHA1), None).unwrap();
+        let sha256 = Checksum::new(None, Some(SHA256)).unwrap();
+        let both = Checksum::new(Some(SHA1), Some(SHA256)).unwrap();
+
+        assert_matches!(
+            checksum_digest(&sha1, testing::sha1()),
+            Some(RawDigest::Sha1(..))
+        );
+        assert_matches!(
+            checksum_digest(&sha256, testing::sha256()),
+            Some(RawDigest::Sha256(..))
+        );
+        // When both are accepted, the one that is listed as the 160-bit digest wins.
+        assert_matches!(
+            checksum_digest(&both, testing::sha1_sha256()),
+            Some(RawDigest::Sha1(..))
+        );
+        assert_matches!(
+            checksum_digest(&both, testing::sha256()),
+            Some(RawDigest::Sha256(..))
+        );
+        // A checksum the config does not accept declares nothing.
+        assert_matches!(checksum_digest(&sha256, testing::sha1()), None);
+        assert_matches!(checksum_digest(&sha1, testing::sha256()), None);
+    }
+
+    /// A `sha512` alone declares no digest, whatever the config accepts, so the action downloads
+    /// the file to learn it (or asks a Remote Asset server).
+    #[test]
+    fn sha512_checksum_declares_no_digest() {
+        let sha512 = Checksum::from_pairs(&[("sha512", SHA512)]).unwrap();
+        for config in [
+            testing::sha1(),
+            testing::sha256(),
+            testing::sha1_sha256(),
+            testing::blake3(),
+        ] {
+            assert_matches!(checksum_digest(&sha512, config), None);
+        }
+    }
+
+    /// Remote Asset is asked about a file only when its checksum gives no CAS digest and has a hash
+    /// the server can be asked about.
+    #[test]
+    fn remote_asset_is_asked_only_when_the_checksum_gives_no_digest() {
+        let sha1 = Checksum::new(Some(SHA1), None).unwrap();
+        let sha256 = Checksum::new(None, Some(SHA256)).unwrap();
+        let sha512 = Checksum::from_pairs(&[("sha512", SHA512)]).unwrap();
+        let sha1_512 = Checksum::from_pairs(&[("sha1", SHA1), ("sha512", SHA512)]).unwrap();
+        let key =
+            |checksum: &Checksum, config| alias_key(checksum, config).map(|key| key.algorithm);
+
+        assert_eq!(key(&sha512, testing::sha256()), Some("sha512"));
+        // The sha1 gives the digest under a sha1 config; under a sha256 one it does not, and the
+        // sha512 is what the server is asked about (never the sha1).
+        assert_eq!(key(&sha1_512, testing::sha1()), None);
+        assert_eq!(key(&sha1_512, testing::sha256()), Some("sha512"));
+        // Existing callers: the digest is given, or there is nothing to ask a server with.
+        assert_eq!(key(&sha256, testing::sha256()), None);
+        assert_eq!(key(&sha1, testing::sha1()), None);
+        assert_eq!(key(&sha1, testing::sha256()), None);
+    }
+
+    #[test]
+    fn remote_asset_digest_is_parsed_as_sha256() {
+        let digest = sha256_file_digest(&TDigest {
+            hash: SHA256.to_owned(),
+            size_in_bytes: 6,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(digest.size(), 6);
+        assert_eq!(digest.raw_digest().to_string(), SHA256);
+
+        // A digest of another function, or without a usable size, is an error and so a miss.
+        assert!(
+            sha256_file_digest(&TDigest {
+                hash: SHA1.to_owned(),
+                size_in_bytes: 6,
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            sha256_file_digest(&TDigest {
+                hash: SHA256.to_owned(),
+                size_in_bytes: -1,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_check_downloaded_size() {
