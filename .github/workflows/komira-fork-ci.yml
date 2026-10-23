@@ -1,0 +1,218 @@
+name: Fork CI
+on:
+  push:
+    branches:
+      - 'komira/ci-**'
+  workflow_dispatch: # allows manual triggering
+
+permissions:
+  contents: read
+
+jobs:
+  # What upstream's "Format" workflow runs.
+  format:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_rust_toolchain
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-format
+    - name: Check formatting
+      run: python3 fmt.py --check
+
+  # What upstream's "Build and test" workflow runs for lint, on linux.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_cargo_env
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+        cache-on-failure: true
+    - name: Run clippy
+      run: python3 test.py --ci --git --lint-only
+      shell: bash
+    - name: Run rustdoc
+      run: python3 test.py --ci --git --rustdoc-only
+      shell: bash
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v6
+    - name: Free disk space
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+    - name: Install the Rust toolchain from rust-toolchain.toml
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        rustup toolchain install "$channel" --profile minimal --component llvm-tools-preview --component rust-src
+        rustup default "$channel"
+        rustc --version
+    - name: Install system packages
+      run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+    - name: Restore the cargo cache
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: fork-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.run_id }}
+        restore-keys: |
+          fork-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          fork-ci-${{ runner.os }}-
+    - name: Build the buck2 binary
+      run: cargo build --locked --bin=buck2
+    - name: Keep the binary for the end-to-end tests
+      run: strip -o "$RUNNER_TEMP/buck2-head" target/debug/buck2
+    - uses: actions/upload-artifact@v4
+      with:
+        name: buck2-head
+        path: ${{ runner.temp }}/buck2-head
+        retention-days: 3
+    - name: Test the touched crates
+      run: cargo test --locked --no-fail-fast -p buck2_execute -p buck2_action_impl -p remote_execution
+    - name: Cargo.lock is up to date
+      run: git diff --exit-code Cargo.lock
+    # Saved even when a step above failed, so that a fix does not start from a cold build.
+    - name: Save the cargo cache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  # The binary of upstream main as this branch was cut from it, so that the end-to-end tests of
+  # what existing callers get can run against it as well as against the change.
+  base-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: 51a0dd0f29847c4d887b22a7ad3a691cac6b5a54
+    - name: Free disk space
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+    - name: Install the Rust toolchain from rust-toolchain.toml
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        rustup toolchain install "$channel" --profile minimal --component llvm-tools-preview --component rust-src
+        rustup default "$channel"
+    - name: Install system packages
+      run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+    - name: Restore the cargo cache
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: fork-ci-base-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.run_id }}
+        restore-keys: |
+          fork-ci-base-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          fork-ci-base-${{ runner.os }}-
+    - name: Build the buck2 binary
+      run: cargo build --locked --bin=buck2
+    - name: Keep the binary for the end-to-end tests
+      run: strip -o "$RUNNER_TEMP/buck2-base" target/debug/buck2
+    - uses: actions/upload-artifact@v4
+      with:
+        name: buck2-base
+        path: ${{ runner.temp }}/buck2-base
+        retention-days: 3
+    - name: Save the cargo cache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  # The end-to-end tests for `download_file` (python unittest, harness in tests/e2e_util),
+  # against a local HTTP server. Upstream runs them only inside its own build system; here the
+  # harness is driven directly.
+  download-file-e2e:
+    needs: [build-and-test, base-binary]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/download-artifact@v4
+      with:
+        path: ${{ runner.temp }}/bin
+    - name: Install the test dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y libzstd1
+        python3 -m venv "$RUNNER_TEMP/venv"
+        "$RUNNER_TEMP/venv/bin/pip" install aiohttp==3.11.18 decorator==5.2.1 psutil==7.0.0 grpcio==1.71.0 grpcio-tools==1.71.0
+        chmod +x "$RUNNER_TEMP"/bin/*/buck2-*
+    - name: Set up the harness outside the build system that normally runs it
+      run: |
+        # The tests import `buck2.tests.e2e_util...`; the repository root is that `buck2` package.
+        mkdir -p "$RUNNER_TEMP/pyroot"
+        ln -s "$GITHUB_WORKSPACE" "$RUNNER_TEMP/pyroot/buck2"
+        printf 'fbmake = {"build_rule": "oss"}\n' > "$RUNNER_TEMP/pyroot/__manifest__.py"
+    - name: Run the download_file tests
+      run: |
+        # Run from outside the checkout: it holds a buck2.py that would shadow the package.
+        cd "$RUNNER_TEMP"
+        export PYTHONPATH="$RUNNER_TEMP/pyroot"
+        export BUCK2_E2E_TEST_FLAVOR=isolated BUCK2_MAX_BLOCKING_THREADS=8 BUCK2_RUNTIME_THREADS=8
+        actions="$GITHUB_WORKSPACE/tests/core/build/actions"
+        export TEST_REPO_DATA="$actions/test_download_file_data"
+        # These need a remote execution server, which the open-source build has none of.
+        export NEEDS_RE="test_is_uploaded_from_disk|test_uses_the_cas_when_it_has_the_content|test_content_the_cas_holds_needs_no_url|test_a_second_checksum_is_not_checked_against_content_the_cas_serves|test_a_wrong_size_is_a_miss_in_the_cas"
+        # These assume a build of buck2 that the open-source one is not: it sends no HEAD request
+        # before a GET, and it has no BLAKE3-KEYED digest.
+        export NOT_OSS="test_retries_transient_errors|test_a_server_without_head_support|test_a_content_based_path_under_a_different_preferred_digest"
+        run() { # binary, regex selecting the tests
+          export TEST_EXECUTABLE="$1"
+          ids=$("$RUNNER_TEMP/venv/bin/python" - "$2" <<'PY'
+        import os, re, sys, unittest
+        suite = unittest.defaultTestLoader.loadTestsFromName("buck2.tests.core.build.actions.test_download_file")
+        def flat(s):
+            for t in s:
+                if isinstance(t, unittest.TestSuite):
+                    yield from flat(t)
+                else:
+                    yield t
+        skip = re.compile(os.environ["NEEDS_RE"] + "|" + os.environ["NOT_OSS"])
+        for t in flat(suite):
+            if re.search(sys.argv[1], t.id()) and not skip.search(t.id()):
+                print(t.id())
+        PY
+          )
+          echo "$ids" | wc -l
+          "$RUNNER_TEMP/venv/bin/python" -m unittest -v $ids
+        }
+        status=0
+        echo "::group::What existing callers get, binary built from upstream main"
+        run "$RUNNER_TEMP/bin/buck2-base/buck2-base" legacy || status=1
+        echo "::endgroup::"
+        echo "::group::Every test, binary built from this change"
+        run "$RUNNER_TEMP/bin/buck2-head/buck2-head" . || status=1
+        echo "::endgroup::"
+        exit $status
