@@ -63,9 +63,39 @@ enum DownloadFileActionError {
     #[error("Exactly one output file must be specified for a download file action, got {0}")]
     WrongNumberOfOutputs(usize),
     #[error(
-        "Downloads using content-based path {0} must supply metadata (usually in the form of a sha1)!"
+        "Downloads using content-based path {0} must supply metadata (usually in the form of a sha1 or sha256; a sha512 alone is not enough)!"
     )]
     ContentBasedPathWithoutMetadata(BuildArtifactPath),
+}
+
+/// The size a download must have: the declared metadata's, else `size_bytes` when the checksum is
+/// sha512-only. The metadata's size is `size_bytes` when that was given, so `size_bytes` only
+/// matters when no metadata could be declared. That is always the case for a sha512-only
+/// download; for a checksum with a sha1 or sha256 it is only a configuration quirk, and the
+/// check stays off there, as it was before sha512 existed.
+fn expected_size(
+    metadata: Option<&FileMetadata>,
+    size_bytes: Option<u64>,
+    sha512_only: bool,
+) -> Option<u64> {
+    match metadata {
+        Some(metadata) => Some(metadata.digest.size()),
+        None if sha512_only => size_bytes,
+        None => None,
+    }
+}
+
+/// Fails if a size was declared (by `size_bytes` or a HEAD response) and the download has another.
+fn check_downloaded_size(expected: Option<u64>, actual: u64) -> buck2_error::Result<()> {
+    match expected {
+        Some(expected) if expected != actual => Err(buck2_error!(
+            ErrorTag::DownloadSizeMismatch,
+            "Downloaded size ({}) does not match expected size ({})",
+            actual,
+            expected,
+        )),
+        _ => Ok(()),
+    }
 }
 
 enum DeclaredMetadata {
@@ -370,17 +400,17 @@ impl DownloadFileAction {
 
         // RE knows this file by the digest (checksum, size), where the size came from
         // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
-        // every remote consumer unable to find its input, so it is caught here.
-        if let Some(metadata) = metadata
-            && digest.size() != metadata.digest.size()
-        {
-            return Err(buck2_error!(
-                ErrorTag::DownloadSizeMismatch,
-                "Downloaded size ({}) does not match expected size ({})",
-                digest.size(),
-                metadata.digest.size(),
-            ));
-        }
+        // every remote consumer unable to find its input, so it is caught here. `size_bytes` is
+        // checked even when no digest could be declared up front (for example a sha512-only
+        // download), where it is the only thing that can catch a wrong size.
+        check_downloaded_size(
+            expected_size(
+                metadata,
+                self.inner.size_bytes,
+                self.inner.checksum.sha1().is_none() && self.inner.checksum.sha256().is_none(),
+            ),
+            digest.size(),
+        )?;
 
         // The declared metadata, when there is any, is the value: the checksum verified the
         // content and the size was checked above, and a content-based output path was resolved
@@ -532,8 +562,69 @@ impl Action for DownloadFileAction {
 
 #[cfg(test)]
 mod tests {
+    use buck2_common::cas_digest::testing;
+
+    use super::*;
+
     // TODO: This needs proper tests, but right now it's kind of a pain to get the
     //       action framework up and running to test actions
     #[test]
     fn downloads_file() {}
+
+    #[test]
+    fn test_check_downloaded_size() {
+        // A wrong size is refused, also when the checksum alone cannot name a CAS digest (a
+        // sha512-only download).
+        let err = check_downloaded_size(Some(6), 7).unwrap_err();
+        assert!(err.has_tag(ErrorTag::DownloadSizeMismatch));
+        assert!(
+            format!("{err:#}").contains("Downloaded size (7) does not match expected size (6)")
+        );
+
+        // A right size, or no declared size, is accepted.
+        check_downloaded_size(Some(6), 6).unwrap();
+        check_downloaded_size(None, 6).unwrap();
+    }
+
+    #[test]
+    fn content_based_path_error_says_sha512_is_not_enough() {
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+        use buck2_core::fs::buck_out_path::BuckOutPathKind;
+        use buck2_core::target::label::label::TargetLabel;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+
+        let target =
+            TargetLabel::testing_parse("cell//pkg:t").configure(ConfigurationData::testing_new());
+        let err = DownloadFileActionError::ContentBasedPathWithoutMetadata(BuildArtifactPath::new(
+            BaseDeferredKey::TargetLabel(target),
+            ForwardRelativePathBuf::unchecked_new("out".into()),
+            BuckOutPathKind::Configuration,
+        ));
+        let msg = format!("{err}");
+        assert!(msg.contains("a sha1 or sha256"), "{msg}");
+        assert!(msg.contains("a sha512 alone is not enough"), "{msg}");
+    }
+
+    #[test]
+    fn test_expected_size() {
+        // A sha512-only download has no metadata; `size_bytes` is the only size there is.
+        assert_eq!(expected_size(None, Some(6), true), Some(6));
+        assert_eq!(expected_size(None, None, true), None);
+
+        // A checksum with a sha1 or sha256 that declared no metadata (the digest config allows
+        // sha1 but only a sha256 was given) is not size-checked, as before sha512 existed.
+        assert_eq!(expected_size(None, Some(6), false), None);
+
+        // With metadata, its size wins (it is `size_bytes` or the HEAD response's).
+        let metadata = FileMetadata {
+            digest: TrackedFileDigest::new(
+                FileDigest::from_content(b"foobar", testing::sha256()),
+                testing::sha256(),
+            ),
+            is_executable: false,
+        };
+        assert_eq!(expected_size(Some(&metadata), Some(9), true), Some(6));
+        assert_eq!(expected_size(Some(&metadata), None, false), Some(6));
+    }
 }
