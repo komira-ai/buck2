@@ -79,6 +79,11 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// more than one if you have them; the file must match all of them. `sha1` and `sha256` keep
     /// working as before.
     ///
+    /// A `sha512` alone cannot name the file's digest to the content-addressed store (which uses
+    /// sha1 or sha256), so a download with only a `sha512` cannot be given a content-based output
+    /// path (`has_content_based_path`); add a `sha1` or `sha256` for that. A `sha512`-only
+    /// download is still size-checked against `size_bytes` when that is given.
+    ///
     /// ```python
     /// ctx.actions.download_file(
     ///     out,
