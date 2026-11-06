@@ -65,7 +65,6 @@ use buck2_directory::directory::directory_iterator::DirectoryIteratorPathStack;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::unordered_entry_walk;
 use buck2_error::BuckErrorContext;
-use buck2_error::BuckErrorOptionContext;
 use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::current_span;
@@ -80,6 +79,7 @@ use buck2_execute::blob_store::Origin;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryEntry;
 use buck2_execute::directory::ActionDirectoryMember;
+use buck2_execute::directory::ActionImmutableDirectory;
 use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::directory::INTERNER;
 use buck2_execute::execute::blocking::BlockingExecutor;
@@ -92,6 +92,7 @@ use buck2_execute::materialize::materializer::CleanStaleArtifactsArgs;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
+use buck2_execute::materialize::materializer::HeldContent;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
@@ -118,7 +119,6 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use itertools::Itertools;
 use jiff::Timestamp;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -136,7 +136,6 @@ use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
 use crate::materializers::deferred::artifact_tree::artifact_metadata_matches_entry;
 use crate::materializers::deferred::io_handler::DefaultIoHandler;
 use crate::materializers::deferred::io_handler::IoHandler;
-use crate::materializers::immediate;
 use crate::materializers::v2::clean_stale::Cleaner;
 use crate::materializers::v2::entry::DiskEntry;
 use crate::materializers::v2::index::DigestIndex;
@@ -156,8 +155,13 @@ use crate::materializers::v2::tree::WriteHold;
 use crate::sqlite::materializer_db::MaterializerState;
 use crate::sqlite::materializer_db::MaterializerStateSqliteDb;
 
-/// The value of `buck2.materializer` that selects this implementation.
-pub const CONFIG_VALUE: &str = "v2";
+/// Rolls this implementation out: a daemon runs it when `buck2.materializer_v2_version` is set
+/// to at most this value, and the deferred materializer otherwise.
+///
+/// Bump this with any fix that a rollback waited on. Setting the config above every version in
+/// the fleet rolls back; setting it to the fixed version then rolls out again to the binaries
+/// that have the fix, and to no others.
+pub const ROLLOUT_VERSION: u32 = 2;
 
 /// How often buffered access-time bumps reach sqlite under `AccessTimesUpdates::Full`.
 const ACCESS_TIMES_FLUSH_PERIOD: Duration = Duration::from_secs(5);
@@ -247,12 +251,12 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
         let mut entries_from_sqlite = 0;
         let mut refused = Vec::new();
         for entry in sqlite_state.into_iter().flatten() {
-            // Rows are trusted, as they were before; what they say is on disk is tracked as such.
+            // Rows are trusted, as the deferred core trusts its own: what they say is on disk is
+            // tracked as such, and never checked against disk.
             let tracked = Tracked {
                 entry: DiskEntry::from_action(&entry.metadata),
                 last_access_time: entry.last_access_time,
                 classification: entry.classification,
-                verified: false,
             };
             if tree.load(entry.path.clone(), tracked.dupe()) {
                 shared.add(&tracked);
@@ -265,20 +269,33 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
         if !refused.is_empty() {
             // Rows that nest come from a table neither core wrote; they are dropped rather than
             // crash every start, and the paths they named are materialized again when asked.
-            let _ignored = buck2_core::soft_error!(
+            buck2_core::soft_error!(
                 "disk_state_materializer_nested_rows",
                 internal_error!(
                     "{} rows of the materializer state nest with others and are dropped, the first: `{}`",
                     refused.len(),
                     refused[0]
-                ),
-                quiet: true
+                )
             );
             if let Some(db) = &mut sqlite_db {
                 let _ignored = db.materializer_state_table().delete(refused);
             }
         }
 
+        let strict = configs.strict_leases.then(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let weak = WeakSender {
+                tx: sender.tx.downgrade(),
+                shared: shared.dupe(),
+            };
+            tokio::spawn(remove_freed_roots(
+                io.dupe(),
+                blocking_executor.dupe(),
+                weak,
+                rx,
+            ));
+            tx
+        });
         let processor = Processor {
             sender: sender.dupe(),
             tree,
@@ -287,6 +304,7 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
             touched: (!matches!(configs.update_access_times, AccessTimesUpdates::Disabled))
                 .then(BuckMutSet::default),
             shared: shared.dupe(),
+            strict,
         };
         let thread = thread_spawn("buck2-dsm", move || processor.run(rx))
             .buck_error_context("Cannot start materializer thread")?;
@@ -409,7 +427,6 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
                 entry: DiskEntry::from_action(&entry),
                 last_access_time: Timestamp::now(),
                 classification,
-                verified: true,
             },
             reply,
         })?;
@@ -439,38 +456,10 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
             path: root.path.clone(),
             source,
         };
-        let mut granted = granted.await.map_err(|_| failed(stopped()))?;
-        if !granted.held.guard().holds_for_writing() && !granted.verified {
-            // A root loaded from sqlite is trusted for its content, not for still being there
-            // as the rows say: its first reader checks kind and size against disk. One that fails
-            // is forgotten and put there again like any untracked path.
-            let (fs, path, entry) = (self.io.fs().dupe(), root.path.clone(), root.entry.dupe());
-            let as_tracked = self
-                .blocking_executor
-                .execute_io_inline(move || on_disk_as(&fs, &path, &entry))
-                .await
-                .map_err(failed)?;
-            let path = root.path.clone();
-            if as_tracked {
-                self.on_processor(move |processor| processor.mark_verified(&path))
-                    .await
-                    .map_err(failed)?;
-            } else {
-                self.on_processor(move |processor| processor.untrack(&path))
-                    .await
-                    .map_err(failed)?;
-                drop(granted);
-                granted = self
-                    .acquire_one(root.path.clone(), Want::Content(root.entry.dupe()))
-                    .await
-                    .map_err(failed)?;
-            }
-        }
         let Granted {
             mut held,
             exclusions,
-            ..
-        } = granted;
+        } = granted.await.map_err(|_| failed(stopped()))?;
         if !held.guard().holds_for_writing() {
             // What is there already counts as a final output from here on, if it was not one.
             if classification == ArtifactClassification::FinalOutput {
@@ -522,14 +511,23 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
         }
     }
 
-    /// Waits for a root granted for writing and for whatever was still running under it to end.
-    async fn take_for_writing(
-        &self,
-        granted: oneshot::Receiver<Granted>,
-    ) -> buck2_error::Result<RootGuard> {
+    /// Waits for a root to be granted, in whichever mode, and for whatever was still running
+    /// under it to end.
+    async fn take(&self, granted: oneshot::Receiver<Granted>) -> buck2_error::Result<RootGuard> {
         let Granted { mut held, .. } = granted.await.map_err(|_| stopped())?;
         held.settle_except(None).await;
         Ok(held.into_guard())
+    }
+
+    /// Waits for every root of one request, in the order of its wants.
+    async fn take_all(
+        &self,
+        answers: Vec<oneshot::Receiver<Granted>>,
+    ) -> buck2_error::Result<Vec<RootGuard>> {
+        join_all(answers.into_iter().map(|answer| self.take(answer)))
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Takes every path for writing, as one request.
@@ -539,14 +537,7 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
     ) -> buck2_error::Result<Roots> {
         let (answers, withdraw) =
             self.acquire(paths.into_iter().map(|path| (path, Want::Write)).collect())?;
-        let guards = join_all(
-            answers
-                .into_iter()
-                .map(|answer| self.take_for_writing(answer)),
-        )
-        .await
-        .into_iter()
-        .collect::<buck2_error::Result<Vec<_>>>()?;
+        let guards = self.take_all(answers).await?;
         withdraw.disarm();
         Ok(Roots(guards))
     }
@@ -563,19 +554,27 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
             .await
     }
 
-    /// Puts a reported root's files into the store: content this daemon produced, not known to
-    /// be in the CAS, entering the store as it comes into existence. The root is write-held, so
-    /// nothing reads or replaces it meanwhile. A failure costs only the store's copy, which is
-    /// why it is reported rather than failing the report.
+    /// Puts a root's files into the store: content not known to be in the CAS, entering the
+    /// store as this daemon produces it or finds it on disk. The root is held, so nothing
+    /// replaces it meanwhile. A failure costs only the store's copy, which is why it is reported
+    /// rather than failing the caller.
     async fn stash(&self, root: &Root) {
         let files = files_to_insert(self.io.fs(), &root.path, &root.entry, Origin::BuckOut);
         if let Err(e) = self.store.insert_files(files).await {
-            let _ignored = buck2_core::soft_error!(
+            buck2_core::soft_error_or_panic!(
                 "blob_store_insert_failed",
-                e.context(format!("Putting `{}` into the store", root.path)),
-                quiet: true
+                e.context(format!("Putting `{}` into the store", root.path))
             );
         }
+    }
+
+    /// Records content this daemon produced at the guard's root, an action's output or a
+    /// publish: the stash takes it first, since it is nowhere else, then it is reported as an
+    /// intermediate output. A download is reported through `report` alone: the CAS has it.
+    async fn report_produced(&self, guard: &RootGuard, root: Root) -> buck2_error::Result<()> {
+        self.stash(&root).await;
+        self.report(guard, root.entry, ArtifactClassification::IntermediateOnly)
+            .await
     }
 
     /// The roots behind a write lease this materializer handed out.
@@ -649,7 +648,7 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         self.cleaner.prevent().await
     }
 
-    async fn declare_existing_impl(
+    async fn declare_existing(
         &self,
         lease: &WriteLease,
         artifacts: Vec<DeclareArtifactPayload>,
@@ -667,15 +666,13 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
                         root.path
                     )
                 })?;
-                self.stash(&root).await;
-                self.report(guard, root.entry, ArtifactClassification::IntermediateOnly)
-                    .await?;
+                self.report_produced(guard, root).await?;
             }
         }
         Ok(())
     }
 
-    async fn materialize_impl(
+    async fn materialize(
         &self,
         request: MaterializeRequest,
     ) -> buck2_error::Result<MaterializeResponse> {
@@ -712,15 +709,9 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         let inputs = join_all(plan.roots.iter().zip(answers).map(|(root, answer)| {
             self.materialize_root(answer, root, classification, &info, &dispatcher)
         }));
-        let outputs = join_all(
-            outputs
-                .into_iter()
-                .map(|answer| self.take_for_writing(answer)),
-        );
+        let outputs = self.take_all(outputs);
         let (inputs, outputs) = futures::join!(inputs, outputs);
-        let outputs = outputs
-            .into_iter()
-            .collect::<buck2_error::Result<Vec<_>>>()?;
+        let outputs = outputs?;
         withdraw.disarm();
 
         let mut lease = Vec::with_capacity(plan.roots.len());
@@ -754,9 +745,9 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
 
     /// A copy of buck-out content is nothing to this core: the destination's value names the
     /// same digests as the source's, and whoever needs the destination on disk materializes it
-    /// from them, out of the store or the CAS. A source outside buck-out, a source file, is not
-    /// known to be in the CAS, so its content enters the store, checked against the digest the
-    /// value claims, and the destination is materialized from there when asked.
+    /// from them, out of the store or the CAS. Nor is a symlink to a source, which copies
+    /// nothing. A copy of a source file is the action's to make under `hold_or_take`
+    /// (`materialize::produce`), as a local run makes its outputs; it does not come here.
     async fn declare_copy_impl(
         &self,
         _path: ProjectRelativePathBuf,
@@ -764,21 +755,14 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         srcs: Vec<CopiedArtifact>,
     ) -> buck2_error::Result<()> {
         let buck_out = self.io.buck_out_path();
-        let from_outside: Vec<CopiedArtifact> = srcs
-            .into_iter()
-            .filter(|src| !src.src.starts_with(buck_out))
-            .collect();
-        if from_outside.is_empty() {
-            return Ok(());
+        let copies_a_source_file =
+            |src: &&CopiedArtifact| !src.src.starts_with(buck_out) && has_files(&src.dest_entry);
+        if let Some(src) = srcs.iter().find(copies_a_source_file) {
+            return Err(internal_error!(
+                "A copy of `{}`, outside buck-out, was declared to the disk-state materializer, which makes no copies: the action produces it under `hold_or_take`",
+                src.src
+            ));
         }
-        let files = from_outside
-            .into_iter()
-            .flat_map(|src| {
-                let entry = src.dest_entry.map_dir(|dir| dir.shared(&*INTERNER));
-                files_to_insert(self.io.fs(), &src.src, &entry, Origin::Source)
-            })
-            .collect();
-        self.store.insert_files(files).await?;
         Ok(())
     }
 
@@ -792,41 +776,39 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         Ok(())
     }
 
-    /// Onto disk and tracked, as a local action's output is when it is reported: a write whose
-    /// content the CAS already holds does not get here under the probe this core asks for
-    /// (`materializer_probes_writes`), and the rest is disk state like any other.
+    /// Not this core's: a write is the action's to make under `hold_or_take`
+    /// (`materialize::produce`), as a local run makes its outputs.
     async fn declare_write<'a>(
         &self,
-        generate: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
+        _generate: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
     ) -> buck2_error::Result<Vec<ArtifactValue>> {
-        let requests = generate()?;
-        let paths: Vec<ProjectRelativePathBuf> = requests
-            .iter()
-            .map(|request| request.path.clone())
-            .collect();
-        let roots = self.take_all_for_writing(paths.clone()).await?;
-        let values = immediate::write_to_disk(
-            self.io.fs(),
-            self.blocking_executor.as_ref(),
-            self.io.digest_config(),
-            Box::new(move || Ok(requests)),
-            // The report seals them, as it does every root.
-            false,
-        )
-        .await?;
-        for (path, value) in paths.into_iter().zip_eq(&values) {
-            let guard = roots
-                .at(&path)
-                .internal_error("a written path is one of its lease's roots")?;
-            let root = Root {
-                path,
-                entry: value.entry().dupe(),
-            };
-            self.stash(&root).await;
-            self.report(guard, root.entry, ArtifactClassification::IntermediateOnly)
-                .await?;
+        Err(internal_error!(
+            "A write was declared to the disk-state materializer, which makes no writes: the action produces it under `hold_or_take`"
+        ))
+    }
+
+    fn is_disk_state(&self) -> bool {
+        true
+    }
+
+    /// Found content is backed from its path before it is handed out: a previous daemon's write
+    /// or copy, whose store went with it.
+    async fn hold_or_take(
+        &self,
+        path: ProjectRelativePathBuf,
+        value: ArtifactValue,
+    ) -> buck2_error::Result<HeldContent> {
+        let entry = value.entry().dupe();
+        let (answers, withdraw) =
+            self.acquire(vec![(path.clone(), Want::Produce(entry.dupe()))])?;
+        let mut guards = self.take_all(answers).await?;
+        withdraw.disarm();
+        let guard = guards.pop().expect("one want, one grant");
+        if guard.holds_for_writing() {
+            return Ok(HeldContent::Missing(WriteLease::new(Roots(vec![guard]))));
         }
-        Ok(values)
+        self.stash(&Root { path, entry }).await;
+        Ok(HeldContent::Found(ReadLease::new(Roots(vec![guard]))))
     }
 
     /// A match is a use of the matched roots, as a read is: what a dep-file hit goes on relying
@@ -860,7 +842,7 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
             .await
     }
 
-    async fn prepare_outputs_impl(
+    async fn prepare_outputs(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<WriteLease> {
@@ -877,7 +859,7 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
             .await
     }
 
-    async fn publish_impl(
+    async fn publish(
         &self,
         lease: &WriteLease,
         src: ProjectRelativePathBuf,
@@ -893,7 +875,6 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         let Granted {
             mut held,
             exclusions,
-            ..
         } = self
             .acquire_one(dest.clone(), Want::Content(entry.dupe()))
             .await?;
@@ -930,14 +911,8 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
                 fs_util::rename(&src_abs, &dest_abs).categorize_internal()
             })
             .await?;
-        let root = Root { path: dest, entry };
-        self.stash(&root).await;
-        self.report(
-            held.guard(),
-            root.entry,
-            ArtifactClassification::IntermediateOnly,
-        )
-        .await?;
+        self.report_produced(held.guard(), Root { path: dest, entry })
+            .await?;
         Ok(ReadLease::new(Roots(vec![held.into_guard()])))
     }
 
@@ -1100,6 +1075,9 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         snapshot.blob_store_bytes = store.bytes;
         snapshot.blob_store_removed_bytes = store.removed_bytes;
         snapshot.blob_store_served_files = store.served;
+        snapshot.blob_store_memory_entries = store.memory_entries;
+        snapshot.blob_store_memory_bytes = store.memory_bytes;
+        snapshot.blob_store_memory_served_files = store.memory_served;
         snapshot.disk_state_materializer_copied_from_disk =
             self.shared.copied_from_disk.load(Ordering::Relaxed);
     }
@@ -1374,13 +1352,12 @@ fn download_task<T: IoHandler>(
                                     Ok(()) => copied.push(wanted.path),
                                     // A miss: the CAS is asked.
                                     Err(e) => {
-                                        let _ignored = buck2_core::soft_error!(
+                                        buck2_core::soft_error_or_panic!(
                                             "disk_state_materializer_copy_failed",
                                             e.context(format!(
                                                 "Copying `{source}` to `{}`",
                                                 wanted.path
-                                            )),
-                                            quiet: true
+                                            ))
                                         );
                                     }
                                 }
@@ -1475,6 +1452,17 @@ fn copy_from_disk(
     copied
 }
 
+/// Whether `entry` has a file anywhere in it.
+fn has_files(entry: &ActionDirectoryEntry<ActionImmutableDirectory>) -> bool {
+    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
+    while let Some((_, entry)) = walk.next() {
+        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(_)) = entry {
+            return true;
+        }
+    }
+    false
+}
+
 /// The files of `entry`, on disk under `root`, as the store wants them for insertion.
 fn files_to_insert(
     fs: &ProjectRoot,
@@ -1516,43 +1504,6 @@ fn shared(e: MaterializeEntryError) -> SharedMaterializingError {
         MaterializeEntryError::Error(e) => SharedMaterializingError::Error(e),
         MaterializeEntryError::NotFound(e) => SharedMaterializingError::NotFound(e),
     }
-}
-
-/// Whether what is at `root` is `entry` as far as a stat can tell: the kind of every node and the
-/// size of every file. Content is not read; a root loaded from sqlite is trusted for that.
-fn on_disk_as(
-    fs: &ProjectRoot,
-    root: &ProjectRelativePath,
-    entry: &ArtifactMetadata,
-) -> buck2_error::Result<bool> {
-    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
-    while let Some((path, entry)) = walk.next() {
-        let abs = fs.resolve(root.join(path.get()));
-        let metadata = match fs_util::symlink_metadata(&abs) {
-            Ok(metadata) => metadata,
-            // Not there, or a file where a directory was on the way to it.
-            Err(e)
-                if matches!(
-                    e.io_error_kind(),
-                    Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
-                ) =>
-            {
-                return Ok(false);
-            }
-            Err(e) => return Err(e.categorize_internal()),
-        };
-        let as_entry = match entry {
-            DirectoryEntry::Dir(_) => metadata.is_dir(),
-            DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) => {
-                metadata.is_file() && metadata.len() == file.digest.size()
-            }
-            DirectoryEntry::Leaf(_) => metadata.is_symlink(),
-        };
-        if !as_entry {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Removes what is at `root` and not in `entry`, leaving the excluded paths untouched. Without
@@ -1793,8 +1744,6 @@ impl Drop for Held {
 /// The processor's answer to one want of a request.
 pub(crate) struct Granted {
     pub(crate) held: Held,
-    /// For a read: whether this daemon has seen the content on disk; see `Grant::verified`.
-    pub(crate) verified: bool,
     /// For a write: the tracked roots below it that the holder must leave alone.
     pub(crate) exclusions: Vec<ProjectRelativePathBuf>,
 }
@@ -2025,6 +1974,82 @@ pub(crate) struct Processor {
     /// times are not persisted (`buck2.update_access_times = disabled`).
     touched: Option<BuckMutSet<ProjectRelativePathBuf>>,
     shared: Arc<Shared>,
+    /// Where intermediate roots nothing holds any more go to be removed from disk, under
+    /// `strict_leases`.
+    strict: Option<mpsc::UnboundedSender<Freed>>,
+}
+
+/// A tracked root nothing holds any more, for `remove_freed_roots`.
+struct Freed {
+    path: ProjectRelativePathBuf,
+    last_access_time: Timestamp,
+}
+
+/// Directories under buck-out whose roots are read after the command that made them, by the
+/// test runner and by whoever expands an external cell; `strict_leases` leaves those alone.
+const READ_AFTER_THE_COMMAND: &[&str] = &["test", "external_cells"];
+
+/// Under `strict_leases`: removes each root it is handed from disk, so that nothing reads it
+/// without a lease. Whether the content could be put back is not checked: that depends on who
+/// holds its digest, which has nothing to do with its leases, so a check here would be a
+/// snapshot, and a root kept on its account is one an unleased reader gets away with. A request
+/// for the content after this goes to the stash or the CAS and fails at the read when neither
+/// has it.
+async fn remove_freed_roots<T: IoHandler>(
+    io: Arc<T>,
+    blocking_executor: Arc<dyn BlockingExecutor>,
+    sender: WeakSender,
+    mut freed: mpsc::UnboundedReceiver<Freed>,
+) {
+    while let Some(root) = freed.recv().await {
+        let Some(sender) = sender.upgrade() else {
+            return;
+        };
+        remove_freed_root(&io, &blocking_executor, &sender, root).await;
+    }
+}
+
+async fn remove_freed_root<T: IoHandler>(
+    io: &Arc<T>,
+    blocking_executor: &Arc<dyn BlockingExecutor>,
+    sender: &Sender,
+    freed: Freed,
+) {
+    let Freed {
+        path,
+        last_access_time,
+    } = freed;
+    let buck_out = io.buck_out_path();
+    if READ_AFTER_THE_COMMAND.iter().any(|dir| {
+        path.starts_with(buck_out.join(ProjectRelativePathBuf::unchecked_new(dir.to_string())))
+    }) {
+        return;
+    }
+    // Taken as the cleaner takes a stale root: refused when anything has used, held or waited
+    // for it since it was freed.
+    let taken = match sender
+        .take_for_cleaning(vec![(path.clone(), Expect::Tracked { last_access_time })])
+        .await
+    {
+        Ok(mut taken) => taken.pop().flatten(),
+        Err(_) => return,
+    };
+    let Some(Granted { mut held, .. }) = taken else {
+        return;
+    };
+    held.settle_except(None).await;
+    let fs = io.fs().dupe();
+    let removed = path.clone();
+    if let Err(e) = blocking_executor
+        .execute_io_inline(move || cleanup_path(&fs, &removed))
+        .await
+    {
+        buck2_core::soft_error_or_panic!(
+            "disk_state_materializer_strict_remove_failed",
+            e.context(format!("Removing `{path}` on its release"))
+        );
+    }
+    drop(held);
 }
 
 impl Processor {
@@ -2149,39 +2174,43 @@ impl Processor {
         }
     }
 
-    /// Records that a reader found the root at `path` on disk as tracked.
-    fn mark_verified(&mut self, path: &ProjectRelativePath) {
-        self.tree.mark_verified(path);
-    }
-
-    /// Forgets the root at or above `path`, found not to be on disk as the rows said; sqlite
-    /// follows, so that no later start trusts the rows either.
-    fn untrack(&mut self, path: &ProjectRelativePath) {
-        let change = self.tree.untrack_containing(path);
-        self.apply(Effects {
-            grants: Vec::new(),
-            change,
-        });
-    }
-
     /// Makes the root at `path` a final output, which clean-stale keeps longer; sqlite follows.
     fn promote(&mut self, path: &ProjectRelativePath) {
         if let Some(change) = self.tree.promote(path, ArtifactClassification::FinalOutput) {
             self.apply(Effects {
                 grants: Vec::new(),
                 change,
+                freed: Vec::new(),
             });
         }
     }
 
     /// Mirrors what an operation changed and hands its grants to their requesters.
     fn apply(&mut self, effects: Effects<oneshot::Sender<Granted>>) {
-        self.account(&effects.change);
-        self.persist(effects.change);
-        for (reply, grant) in effects.grants {
+        let Effects {
+            grants,
+            change,
+            freed,
+        } = effects;
+        self.account(&change);
+        self.persist(change);
+        for (reply, grant) in grants {
             // A requester gone already drops the grant, whose guard releases the root through
             // this same channel.
             let _ignored = reply.send(self.granted(grant));
+        }
+        if let Some(strict) = &self.strict {
+            for path in freed {
+                if let Lookup::Exact(tracked) = self.tree.lookup(&path)
+                    && tracked.classification == ArtifactClassification::IntermediateOnly
+                {
+                    // The remover gone takes the mode with it.
+                    let _ignored = strict.send(Freed {
+                        last_access_time: tracked.last_access_time,
+                        path,
+                    });
+                }
+            }
         }
     }
 
@@ -2196,7 +2225,6 @@ impl Processor {
                 }),
                 tasks: grant.tasks,
             },
-            verified: grant.verified,
             exclusions: grant.exclusions,
         }
     }
@@ -2265,10 +2293,9 @@ impl Processor {
     /// Ends the mirroring after a failure: the rows go as far as they can be made to, so that
     /// no later start trusts them.
     fn abandon_mirror(&mut self, e: buck2_error::Error) {
-        let _ignored = buck2_core::soft_error!(
+        buck2_core::soft_error_or_panic!(
             "disk_state_materializer_persist",
-            e.context("the mirror is abandoned"),
-            quiet: true
+            e.context("the mirror is abandoned")
         );
         if let Some(db) = &mut self.sqlite_db {
             let all: Vec<ProjectRelativePathBuf> =

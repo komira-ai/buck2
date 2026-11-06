@@ -25,10 +25,10 @@ use crate::environment::GlobalsBuilder;
 use crate::eval::Evaluator;
 use crate::values::StringValue;
 use crate::values::Value;
-use crate::values::ValueOfUnchecked;
+use crate::values::ValueOf;
 use crate::values::none::NoneOr;
 use crate::values::none::NoneType;
-use crate::values::tuple::UnpackTuple;
+use crate::values::tuple::TupleType;
 use crate::values::typing::StarlarkCallable;
 use crate::values::typing::iter::StarlarkIter;
 
@@ -46,12 +46,12 @@ pub fn filter(builder: &mut GlobalsBuilder) {
     /// ```
     fn filter<'v>(
         #[starlark(require = pos)] func: NoneOr<StarlarkCallable<'v>>,
-        #[starlark(require = pos)] seq: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
+        #[starlark(require = pos)] seq: ValueOf<'v, StarlarkIter<Value<'v>>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Vec<Value<'v>>> {
         let mut res = Vec::new();
 
-        for v in seq.get().iterate(eval.heap())? {
+        for v in seq.to_value().iterate(eval.heap())? {
             match func {
                 NoneOr::None => {
                     if !v.is_none() {
@@ -81,10 +81,10 @@ pub fn map(builder: &mut GlobalsBuilder) {
     /// ```
     fn map<'v>(
         #[starlark(require = pos)] func: StarlarkCallable<'v>,
-        #[starlark(require = pos)] seq: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
+        #[starlark(require = pos)] seq: ValueOf<'v, StarlarkIter<Value<'v>>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Vec<Value<'v>>> {
-        let it = seq.get().iterate(eval.heap())?;
+        let it = seq.to_value().iterate(eval.heap())?;
         let mut res = Vec::with_capacity(it.size_hint().0);
         for v in it {
             res.push(func.0.invoke_pos(&[v], eval)?);
@@ -102,7 +102,7 @@ pub fn debug(builder: &mut GlobalsBuilder) {
     }
 }
 
-struct PrintWrapper<'a, 'b>(&'a Vec<Value<'b>>);
+struct PrintWrapper<'a, 'b>(&'a [Value<'b>]);
 impl fmt::Display for PrintWrapper<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, v) in self.0.iter().enumerate() {
@@ -133,27 +133,27 @@ impl PrintHandler for StderrPrintHandler {
 #[starlark_module]
 pub fn print(builder: &mut GlobalsBuilder) {
     /// Print some values to the output.
-    fn print(
-        #[starlark(args)] args: UnpackTuple<Value>,
-        eval: &mut Evaluator,
+    fn print<'v>(
+        #[starlark(args)] args: ValueOf<'v, TupleType<Value<'v>>>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         // In practice most users should want to put the print somewhere else, but this does for now
         // Unfortunately, we can't use PrintWrapper because strings to_str() and Display are different.
         eval.print_handler
-            .println(&args.items.iter().map(|x| x.to_str()).join(" "))?;
+            .println(&args.items().map(|x| x.to_str()).join(" "))?;
         Ok(NoneType)
     }
 }
 
 #[starlark_module]
 pub fn pprint(builder: &mut GlobalsBuilder) {
-    fn pprint(
-        #[starlark(args)] args: UnpackTuple<Value>,
-        eval: &mut Evaluator,
+    fn pprint<'v>(
+        #[starlark(args)] args: ValueOf<'v, TupleType<Value<'v>>>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         // In practice most users may want to put the print somewhere else, but this does for now
         eval.print_handler
-            .println(&format!("{:#}", PrintWrapper(&args.items)))?;
+            .println(&format!("{:#}", PrintWrapper(args.tuple().content())))?;
         Ok(NoneType)
     }
 }

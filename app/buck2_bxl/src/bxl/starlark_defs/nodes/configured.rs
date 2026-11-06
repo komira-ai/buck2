@@ -28,7 +28,6 @@ use buck2_build_api::analysis::AnalysisResult;
 use buck2_build_api::bxl::unconfigured_attribute::StarlarkCoercedAttr;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::data::HasIoProvider;
 use buck2_configuration_providers::configuration_info::ConfigurationInfo;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
@@ -42,13 +41,10 @@ use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::types::target_label::StarlarkConfiguredTargetLabel;
+use buck2_node::attrs::arena::AttrToken;
+use buck2_node::attrs::arena::CoercedAttrArenaBuilder;
+use buck2_node::attrs::arena::OwnedCoercedAttr;
 use buck2_node::attrs::attr_type::arg::StringWithMacros;
-use buck2_node::attrs::attr_type::dict::DictLiteral;
-use buck2_node::attrs::attr_type::list::ListLiteral;
-use buck2_node::attrs::attr_type::query::QueryAttr;
-use buck2_node::attrs::attr_type::transition_dep::CoercedTransitionDep;
-use buck2_node::attrs::attr_type::tuple::TupleLiteral;
-use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_node::attrs::configured_traversal::ConfiguredAttrTraversal;
 use buck2_node::attrs::display::AttrDisplayWithContext;
@@ -91,41 +87,55 @@ use crate::bxl::starlark_defs::nodes::configured::attr_resolution_ctx::LazyAttrR
 
 mod attr_resolution_ctx;
 
-fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<CoercedAttr> {
+/// Strip configurations off `attr`, encoding the result into its own
+/// single-value storage.
+fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<OwnedCoercedAttr> {
+    let mut b = CoercedAttrArenaBuilder::default();
+    let root = strip_cfg_into(attr, &mut b)?;
+    OwnedCoercedAttr::seal_from_builder(b, root)
+}
+
+fn strip_cfg_into(
+    attr: &ConfiguredAttr,
+    b: &mut CoercedAttrArenaBuilder,
+) -> buck2_error::Result<AttrToken> {
     Ok(match attr {
-        ConfiguredAttr::Bool(v) => CoercedAttr::Bool(*v),
-        ConfiguredAttr::Int(v) => CoercedAttr::Int(*v),
-        ConfiguredAttr::String(v) => CoercedAttr::String(v.dupe()),
-        ConfiguredAttr::EnumVariant(v) => CoercedAttr::EnumVariant(v.dupe()),
-        ConfiguredAttr::List(list) => CoercedAttr::List(ListLiteral(
-            list.iter()
-                .map(attr_with_stripped_cfg)
-                .collect::<buck2_error::Result<Vec<_>>>()?
-                .into(),
-        )),
-        ConfiguredAttr::Tuple(tuple) => CoercedAttr::Tuple(TupleLiteral(
-            tuple
+        ConfiguredAttr::Bool(v) => b.encode_bool(v.0)?,
+        ConfiguredAttr::Int(v) => b.encode_int(*v)?,
+        ConfiguredAttr::String(v) => b.encode_string(v.0.as_str())?,
+        ConfiguredAttr::EnumVariant(v) => b.encode_enum_variant(v.0.as_str())?,
+        ConfiguredAttr::List(list) => {
+            let items = list
                 .iter()
-                .map(attr_with_stripped_cfg)
-                .collect::<buck2_error::Result<Vec<_>>>()?
-                .into(),
-        )),
-        ConfiguredAttr::Dict(dict) => CoercedAttr::Dict(DictLiteral(
-            dict.iter()
-                .map(|(k, v)| Ok((attr_with_stripped_cfg(k)?, attr_with_stripped_cfg(v)?)))
-                .collect::<buck2_error::Result<Vec<_>>>()?
-                .into(),
-        )),
-        ConfiguredAttr::None => CoercedAttr::None,
-        ConfiguredAttr::OneOf(attr, i) => {
-            CoercedAttr::OneOf(Box::new(attr_with_stripped_cfg(attr)?), *i)
+                .map(|v| strip_cfg_into(v, b))
+                .collect::<buck2_error::Result<Vec<_>>>()?;
+            b.encode_list(&items)?
         }
-        ConfiguredAttr::Visibility(v) => CoercedAttr::Visibility(v.dupe()),
-        ConfiguredAttr::WithinView(v) => CoercedAttr::WithinView(v.dupe()),
+        ConfiguredAttr::Tuple(tuple) => {
+            let items = tuple
+                .iter()
+                .map(|v| strip_cfg_into(v, b))
+                .collect::<buck2_error::Result<Vec<_>>>()?;
+            b.encode_tuple(&items)?
+        }
+        ConfiguredAttr::Dict(dict) => {
+            let pairs = dict
+                .iter()
+                .map(|(k, v)| Ok((strip_cfg_into(k, b)?, strip_cfg_into(v, b)?)))
+                .collect::<buck2_error::Result<Vec<_>>>()?;
+            b.encode_dict(&pairs)?
+        }
+        ConfiguredAttr::None => b.encode_none()?,
+        ConfiguredAttr::OneOf(attr, i) => {
+            let inner = strip_cfg_into(attr, b)?;
+            b.encode_one_of(*i, inner)?
+        }
+        ConfiguredAttr::Visibility(v) => b.encode_visibility(v)?,
+        ConfiguredAttr::WithinView(v) => b.encode_within_view(v)?,
         ConfiguredAttr::ExplicitConfiguredDep(dep) => {
             // Platform information is lost during this conversion
             // This is fine for most use cases since dep and configured dep display the same
-            CoercedAttr::Dep(dep.label.unconfigured())
+            b.encode_dep(&dep.label.unconfigured())?
         }
         ConfiguredAttr::SplitTransitionDep(dep) => {
             let deps: BuckMutSet<_> = dep.deps.values().map(|l| l.unconfigured()).collect();
@@ -137,28 +147,20 @@ fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<CoercedA
             }
             // This loses the split transition information. This is fine for most use cases since
             // dep and transition dep display the same
-            CoercedAttr::Dep(
-                deps.iter()
-                    .next()
-                    .ok_or_else(|| {
-                        buck2_error::internal_error!("deps is empty after checking length")
-                    })?
-                    .dupe(),
-            )
+            b.encode_dep(deps.iter().next().ok_or_else(|| {
+                buck2_error::internal_error!("deps is empty after checking length")
+            })?)?
         }
         ConfiguredAttr::TransitionDep(dep) => {
             // This loses the transition information. This is fine for most use cases since
             // dep and transition dep display the same
-            CoercedAttr::TransitionDep(Box::new(CoercedTransitionDep {
-                dep: dep.dep.unconfigured(),
-                transition: None, // The transition information is not available in ConfiguredTransitionDep
-            }))
+            b.encode_transition_dep(&dep.dep.unconfigured(), None)?
         }
-        ConfiguredAttr::ConfigurationDep(dep) => CoercedAttr::ConfigurationDep(dep.dupe()),
-        ConfiguredAttr::PluginDep(dep, _) => CoercedAttr::PluginDep(dep.dupe()),
-        ConfiguredAttr::Dep(dep) => CoercedAttr::Dep(dep.label.unconfigured()),
-        ConfiguredAttr::SourceLabel(dep) => CoercedAttr::SourceLabel(dep.unconfigured()),
-        ConfiguredAttr::Label(label) => CoercedAttr::Label(label.unconfigured()),
+        ConfiguredAttr::ConfigurationDep(dep) => b.encode_configuration_dep(dep)?,
+        ConfiguredAttr::PluginDep(dep, _) => b.encode_plugin_dep(dep)?,
+        ConfiguredAttr::Dep(dep) => b.encode_dep(&dep.label.unconfigured())?,
+        ConfiguredAttr::SourceLabel(dep) => b.encode_source_label(&dep.unconfigured())?,
+        ConfiguredAttr::Label(label) => b.encode_label(&label.unconfigured())?,
         ConfiguredAttr::Arg(arg) => {
             let unconfigured_parts = match &arg.string_with_macros {
                 StringWithMacros::StringPart(s) => StringWithMacros::StringPart(s.clone()),
@@ -176,78 +178,17 @@ fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<CoercedA
                                 macr,
                             ) => buck2_node::attrs::attr_type::arg::StringWithMacrosPart::Macro(
                                 *write_to_file,
-                                match macr {
-                                    buck2_node::attrs::attr_type::arg::MacroBase::Location {
-                                        label,
-                                        dep_kind,
-                                    } => buck2_node::attrs::attr_type::arg::MacroBase::Location {
-                                        label: label.unconfigured(),
-                                        dep_kind: *dep_kind,
-                                    },
-                                    buck2_node::attrs::attr_type::arg::MacroBase::Exe {
-                                        label,
-                                        exec_dep,
-                                    } => buck2_node::attrs::attr_type::arg::MacroBase::Exe {
-                                        label: label.unconfigured(),
-                                        exec_dep: *exec_dep,
-                                    },
-                                    buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(
-                                        var_name,
-                                    ) => {
-                                        buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(
-                                            var_name.clone(),
-                                        )
-                                    }
-                                    buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(
-                                        box_value,
-                                    ) => {
-                                        let (var_name, target, arg) = &**box_value;
-                                        buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(
-                                            Box::new((var_name.clone(), target.unconfigured(), arg.clone())),
-                                        )
-                                    }
-                                    buck2_node::attrs::attr_type::arg::MacroBase::Query(
-                                        query_macro,
-                                    ) => {
-                                        buck2_node::attrs::attr_type::arg::MacroBase::Query(
-                                            Box::new(
-                                                buck2_node::attrs::attr_type::query::QueryMacroBase {
-                                                    expansion_type: query_macro
-                                                        .expansion_type
-                                                        .clone(),
-                                                    query: buck2_node::attrs::attr_type::query::QueryAttrBase {
-                                                        query: query_macro.query.query.clone(),
-                                                        resolved_literals: buck2_node::attrs::attr_type::query::ResolvedQueryLiterals(
-                                                            query_macro
-                                                                .query
-                                                                .resolved_literals
-                                                                .0
-                                                                .iter()
-                                                                .map(|(k, v)| (*k, v.unconfigured()))
-                                                                .collect(),
-                                                        ),
-                                                    },
-                                                },
-                                            ),
-                                        )
-                                    }
-                                    buck2_node::attrs::attr_type::arg::MacroBase::Source(path) => {
-                                        buck2_node::attrs::attr_type::arg::MacroBase::Source(
-                                            path.clone(),
-                                        )
-                                    }
-                                },
+                                unconfigure_macro(macr),
                             ),
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice(),
                 ),
             };
-            CoercedAttr::Arg(unconfigured_parts)
+            b.encode_arg(&unconfigured_parts)?
         }
-        ConfiguredAttr::Query(query) => CoercedAttr::Query(Box::new(QueryAttr {
-            providers: query.providers.clone(),
-            query: buck2_node::attrs::attr_type::query::QueryAttrBase {
+        ConfiguredAttr::Query(query) => {
+            b.encode_query(&buck2_node::attrs::attr_type::query::QueryAttrBase {
                 query: query.query.query.clone(),
                 resolved_literals: buck2_node::attrs::attr_type::query::ResolvedQueryLiterals(
                     query
@@ -258,11 +199,11 @@ fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<CoercedA
                         .map(|(k, v)| (*k, v.unconfigured()))
                         .collect(),
                 ),
-            },
-        })),
-        ConfiguredAttr::SourceFile(path) => CoercedAttr::SourceFile(path.clone()),
-        ConfiguredAttr::Metadata(m) => CoercedAttr::Metadata(m.clone()),
-        ConfiguredAttr::TargetModifiers(m) => CoercedAttr::TargetModifiers(m.clone()),
+            })?
+        }
+        ConfiguredAttr::SourceFile(path) => b.encode_source_file(path)?,
+        ConfiguredAttr::Metadata(m) => b.encode_metadata(m)?,
+        ConfiguredAttr::TargetModifiers(m) => b.encode_target_modifiers(m)?,
     })
 }
 
@@ -401,6 +342,10 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     /// You should store the result of this function call for further usage in the code rather than calling
     /// `attrs_eager()` each time you need to access the attrs.
     ///
+    /// The result includes the special attributes (those that start with `buck.`, as in
+    /// `buck2 cquery -A`). `buck.exec_group_platforms` is present only for targets whose rule
+    /// declares named execution groups.
+    ///
     /// Right now, it is not recommended to use this method. Instead, use `get_attr` and `get_attrs` methods.
     /// We will deprecate this method in the future.
     ///
@@ -446,6 +391,10 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     /// You should store the result of this function call for further usage in the code rather than calling
     /// `attrs_lazy()` each time to get the `lazy_attrs` object. Note that if the `get()` is `None`,
     /// then any methods called on `None` will result in an error.
+    ///
+    /// `get()` also returns the special attributes (those that start with `buck.`, as in
+    /// `buck2 cquery -A`). `buck.exec_group_platforms` is present only for targets whose rule
+    /// declares named execution groups.
     ///
     /// Right now, it is not recommended to use this method. Instead, use `get_attr` and `get_attrs` methods.
     /// We will deprecate this method in the future.
@@ -659,9 +608,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneOr<StarlarkArtifact>> {
         let path = Path::new(path);
-        let fs = ctx.via_dice(eval, |ctx| {
-            ctx.global_data().get_io_provider().project_root().dupe()
-        });
+        let fs = ctx.project_root();
         let path = if path.is_absolute() {
             Cow::Owned(
                 fs.relativize_any(AbsPath::new(path)?)
@@ -748,6 +695,97 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
             this.0
                 .deps()
                 .iter()
+                .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
+        ))
+    }
+
+    /// Gets the target deps of this target: the deps in the target's own configuration (those of
+    /// `attrs.dep()` and the other dependency attributes, transitioned deps included), without
+    /// the exec deps, the toolchain deps and the configuration deps. The same set `target_deps()`
+    /// selects in a `deps()` query. Together with `exec_deps()`, `toolchain_deps()` and
+    /// `configuration_deps()` this partitions `deps()`.
+    /// The result is a list of `ConfiguredTargetNode`.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_get_target_deps(ctx):
+    ///     target_node = ctx.configured_targets("//foo:bar")
+    ///     ctx.output.print(target_node.target_deps())
+    /// ```
+    fn target_deps<'v>(
+        this: &'v StarlarkConfiguredTargetNode,
+    ) -> starlark::Result<AllocList<impl IntoIterator<Item = StarlarkConfiguredTargetNode> + 'v>>
+    {
+        Ok(AllocList(
+            this.0
+                .target_deps()
+                .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
+        ))
+    }
+
+    /// Gets the exec deps of this target: the deps of its `attrs.exec_dep()` attributes,
+    /// configured for the target's execution platform. The same set `exec_deps()` selects in a
+    /// `deps()` query.
+    /// The result is a list of `ConfiguredTargetNode`.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_get_exec_deps(ctx):
+    ///     target_node = ctx.configured_targets("//foo:bar")
+    ///     ctx.output.print(target_node.exec_deps())
+    /// ```
+    fn exec_deps<'v>(
+        this: &'v StarlarkConfiguredTargetNode,
+    ) -> starlark::Result<AllocList<impl IntoIterator<Item = StarlarkConfiguredTargetNode> + 'v>>
+    {
+        Ok(AllocList(
+            this.0
+                .exec_deps()
+                .iter()
+                .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
+        ))
+    }
+
+    /// Gets the toolchain deps of this target: the deps of its `attrs.toolchain_dep()`
+    /// attributes. The same set `toolchain_deps()` selects in a `deps()` query.
+    /// The result is a list of `ConfiguredTargetNode`.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_get_toolchain_deps(ctx):
+    ///     target_node = ctx.configured_targets("//foo:bar")
+    ///     ctx.output.print(target_node.toolchain_deps())
+    /// ```
+    fn toolchain_deps<'v>(
+        this: &'v StarlarkConfiguredTargetNode,
+    ) -> starlark::Result<AllocList<impl IntoIterator<Item = StarlarkConfiguredTargetNode> + 'v>>
+    {
+        Ok(AllocList(
+            this.0
+                .toolchain_deps()
+                .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
+        ))
+    }
+
+    /// Gets the configuration deps of this target: the configuration rules among its deps, such as
+    /// the `constraint_value`s a `platform` names. The keys of a `select()` and the compatibility
+    /// attributes are resolved while configuring the target and are not deps of the configured
+    /// node. The same set `configuration_deps()` selects in a `deps()` query.
+    /// The result is a list of `ConfiguredTargetNode`.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_get_configuration_deps(ctx):
+    ///     target_node = ctx.configured_targets("//foo:bar")
+    ///     ctx.output.print(target_node.configuration_deps())
+    /// ```
+    fn configuration_deps<'v>(
+        this: &'v StarlarkConfiguredTargetNode,
+    ) -> starlark::Result<AllocList<impl IntoIterator<Item = StarlarkConfiguredTargetNode> + 'v>>
+    {
+        Ok(AllocList(
+            this.0
+                .configuration_deps()
                 .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
         ))
     }
@@ -891,11 +929,9 @@ fn configured_attr_methods(builder: &mut MethodsBuilder) {
         this: &StarlarkConfiguredAttr,
         _heap: Heap<'v>,
     ) -> starlark::Result<StarlarkCoercedAttr> {
-        Ok(StarlarkCoercedAttr(
-            attr_with_stripped_cfg(&this.0)
-                .buck_error_context("Failed to strip configuration from attribute")?,
-            this.1.dupe(),
-        ))
+        let stripped = attr_with_stripped_cfg(&this.0)
+            .buck_error_context("Failed to strip configuration from attribute")?;
+        Ok(StarlarkCoercedAttr(stripped, this.1.dupe()))
     }
 }
 
@@ -1096,5 +1132,63 @@ fn lazy_resolved_attrs_methods(builder: &mut MethodsBuilder) {
                 }
             },
         )
+    }
+}
+
+fn unconfigure_macro(
+    macr: &buck2_node::attrs::attr_type::arg::ConfiguredMacro,
+) -> buck2_node::attrs::attr_type::arg::UnconfiguredMacro {
+    match macr {
+        buck2_node::attrs::attr_type::arg::MacroBase::Location { label, dep_kind } => {
+            buck2_node::attrs::attr_type::arg::MacroBase::Location {
+                label: label.unconfigured(),
+                dep_kind: *dep_kind,
+            }
+        }
+        buck2_node::attrs::attr_type::arg::MacroBase::Exe { label, exec_dep } => {
+            buck2_node::attrs::attr_type::arg::MacroBase::Exe {
+                label: label.unconfigured(),
+                exec_dep: *exec_dep,
+            }
+        }
+        buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(var_name) => {
+            buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(var_name.clone())
+        }
+        buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(box_value) => {
+            let (var_name, target, arg) = &**box_value;
+            buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(Box::new((
+                var_name.clone(),
+                target.unconfigured(),
+                arg.clone(),
+            )))
+        }
+        buck2_node::attrs::attr_type::arg::MacroBase::Query(query_macro) => {
+            buck2_node::attrs::attr_type::arg::MacroBase::Query(Box::new(
+                buck2_node::attrs::attr_type::query::QueryMacroBase {
+                    expansion_type: query_macro.expansion_type.clone(),
+                    query: buck2_node::attrs::attr_type::query::QueryAttrBase {
+                        query: query_macro.query.query.clone(),
+                        resolved_literals:
+                            buck2_node::attrs::attr_type::query::ResolvedQueryLiterals(
+                                query_macro
+                                    .query
+                                    .resolved_literals
+                                    .0
+                                    .iter()
+                                    .map(|(k, v)| (*k, v.unconfigured()))
+                                    .collect(),
+                            ),
+                    },
+                },
+            ))
+        }
+        buck2_node::attrs::attr_type::arg::MacroBase::Source(path) => {
+            buck2_node::attrs::attr_type::arg::MacroBase::Source(path.clone())
+        }
+        // The group comes from the attribute type at configuration, so the coerced macro is
+        // the ungrouped one.
+        buck2_node::attrs::attr_type::arg::MacroBase::InGroup(in_group) => {
+            unconfigure_macro(&in_group.0)
+        }
     }
 }

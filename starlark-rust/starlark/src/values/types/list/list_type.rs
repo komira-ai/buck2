@@ -15,17 +15,25 @@
  * limitations under the License.
  */
 
+use either::Either;
+
+use crate as starlark;
+use crate::any::ProvidesStaticType;
 use crate::typing::Ty;
-use crate::values::UnpackAndDiscard;
+use crate::values::Heap;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::list::UnpackList;
+use crate::values::ValueOf;
+use crate::values::list::AllocList;
+use crate::values::list::ListRef;
+use crate::values::tuple::TupleType;
 use crate::values::type_repr::StarlarkTypeRepr;
 
 /// A list type marker.
 ///
 /// [`StarlarkTypeRepr`] provides `list[T]`.
 /// [`UnpackValue`] implementation verifies the types of items.
+#[derive(ProvidesStaticType)]
 pub struct ListType<T> {
     _item: std::marker::PhantomData<T>,
 }
@@ -42,12 +50,83 @@ impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for ListType<T> {
     type Error = <T as UnpackValue<'v>>::Error;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        match UnpackList::<UnpackAndDiscard<T>>::unpack_value_impl(value) {
-            Ok(Some(_)) => Ok(Some(ListType {
-                _item: std::marker::PhantomData,
-            })),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        let Some(list) = ListRef::from_value(value) else {
+            return Ok(None);
+        };
+        for item in list.iter() {
+            if T::unpack_value_impl(item)?.is_none() {
+                return Ok(None);
+            }
         }
+        Ok(Some(ListType {
+            _item: std::marker::PhantomData,
+        }))
+    }
+}
+
+/// A type that `[]` belongs to: [`ListType`] and
+/// [`ListOrTupleType`](crate::values::list_or_tuple::ListOrTupleType).
+pub trait EmptyListType: sealed::Sealed {}
+
+impl<T> EmptyListType for ListType<T> {}
+impl<T> EmptyListType for Either<ListType<T>, TupleType<T>> {}
+
+mod sealed {
+    use either::Either;
+
+    use crate::values::list::ListType;
+    use crate::values::tuple::TupleType;
+
+    pub trait Sealed {}
+    impl<T> Sealed for ListType<T> {}
+    impl<T> Sealed for Either<ListType<T>, TupleType<T>> {}
+}
+
+impl<'v, T: UnpackValue<'v> + EmptyListType> ValueOf<'v, T> {
+    /// The empty list.
+    pub fn empty_list() -> Self {
+        Self::new_unchecked(Value::new_empty_list())
+    }
+}
+
+impl<'v, T: UnpackValue<'v>> ValueOf<'v, ListType<T>> {
+    /// A new list of these values.
+    pub fn alloc_list(heap: Heap<'v>, items: impl IntoIterator<Item = ValueOf<'v, T>>) -> Self {
+        Self::new_unchecked(heap.alloc(AllocList(items.into_iter().map(|x| x.to_value()))))
+    }
+
+    /// The list.
+    #[inline]
+    pub fn list(self) -> &'v ListRef<'v> {
+        ListRef::from_value(self.to_value()).expect("a value's type does not change")
+    }
+
+    /// The elements. Each is re-checked unless the list is frozen, since a mutable list may
+    /// have been changed after the check; for a frozen list every item is `Ok`.
+    pub fn iter(self) -> impl Iterator<Item = crate::Result<ValueOf<'v, T>>> + 'v {
+        let frozen = self.to_value().is_frozen();
+        self.list().iter().map(move |x| {
+            if frozen {
+                Ok(ValueOf::new_unchecked(x))
+            } else {
+                ValueOf::new_err(x)
+            }
+        })
+    }
+
+    /// The items, unpacked. Each is re-checked, as for [`iter`](Self::iter).
+    pub fn try_items(self) -> impl Iterator<Item = crate::Result<T>> + 'v
+    where
+        T: 'v,
+    {
+        self.list().iter().map(T::unpack_value_err)
+    }
+
+    /// The items, unpacked into a `Vec`, as [`try_items`](Self::try_items) gives them.
+    pub fn try_to_vec(self) -> crate::Result<Vec<T>>
+    where
+        T: 'v,
+    {
+        self.try_items().collect()
     }
 }

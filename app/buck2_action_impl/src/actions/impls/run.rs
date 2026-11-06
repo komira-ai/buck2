@@ -24,6 +24,7 @@ use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::actions::box_slice_set::BoxSliceSet;
+use buck2_build_api::actions::errors::error_handler::OutputArtifacts;
 use buck2_build_api::actions::errors::execute_error::ExecuteError;
 use buck2_build_api::actions::execute::action_execution_target::ActionExecutionTarget;
 use buck2_build_api::actions::execute::action_executor::ActionExecutionKind;
@@ -123,16 +124,14 @@ use starlark::values::NoSerialize;
 use starlark::values::OwnedFrozen;
 use starlark::values::ProvidesStaticType;
 use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkRepresentations;
+use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
 use starlark::values::Trace;
-use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueOf;
-use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTyped;
-use starlark::values::dict::AllocDict;
-use starlark::values::dict::DictRef;
 use starlark::values::dict::DictType;
 use starlark::values::starlark_value;
 use strong_hash::StrongHash;
@@ -336,13 +335,13 @@ impl UnregisteredAction for UnregisteredRunAction {
 pub(crate) struct StarlarkRunActionValues<'v> {
     pub(crate) exe: ValueTyped<'v, StarlarkCmdArgs<'v>>,
     pub(crate) args: ValueTyped<'v, StarlarkCmdArgs<'v>>,
-    pub(crate) dep_file_fingerprints: Vec<ValueTyped<'v, StarlarkDepFileFingerprint<'v>>>,
-    pub(crate) env: Option<ValueOfUnchecked<'v, DictType<String, ValueAsCommandLineLike<'static>>>>,
+    pub(crate) dep_file_fingerprints: MiniBoxSlice<ValueTyped<'v, StarlarkDepFileFingerprint<'v>>>,
+    pub(crate) env: Option<ValueOf<'v, DictType<StringValue<'v>, ValueAsCommandLineLike<'v>>>>,
     pub(crate) worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
     pub(crate) remote_worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
     pub(crate) category: StringValue<'v>,
     pub(crate) identifier: Option<StringValue<'v>>,
-    pub(crate) outputs_for_error_handler: Vec<ValueTyped<'v, StarlarkOutputArtifact<'v>>>,
+    pub(crate) outputs_for_error_handler: MiniBoxSlice<ValueTyped<'v, StarlarkOutputArtifact<'v>>>,
 }
 
 #[derive(
@@ -357,21 +356,34 @@ pub(crate) struct StarlarkRunActionValues<'v> {
 pub(crate) struct FrozenStarlarkRunActionValues<'v> {
     pub(crate) exe: ValueTyped<'v, FrozenStarlarkCmdArgs<'v>>,
     pub(crate) args: ValueTyped<'v, FrozenStarlarkCmdArgs<'v>>,
-    pub(crate) dep_file_fingerprints: Vec<ValueTyped<'v, StarlarkDepFileFingerprint<'v>>>,
-    pub(crate) env: Option<ValueOfUnchecked<'v, DictType<String, ValueAsCommandLineLike<'static>>>>,
+    pub(crate) dep_file_fingerprints: MiniBoxSlice<ValueTyped<'v, StarlarkDepFileFingerprint<'v>>>,
+    pub(crate) env: Option<ValueOf<'v, DictType<StringValue<'v>, ValueAsCommandLineLike<'v>>>>,
     pub(crate) worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
     pub(crate) remote_worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
     pub(crate) category: StringValue<'v>,
     pub(crate) identifier: Option<StringValue<'v>>,
-    pub(crate) outputs_for_error_handler: Vec<ValueTyped<'v, FrozenStarlarkOutputArtifact<'v>>>,
+    pub(crate) outputs_for_error_handler:
+        MiniBoxSlice<ValueTyped<'v, FrozenStarlarkOutputArtifact<'v>>>,
+}
+
+/// A `RunActionValues` in either of its representations.
+#[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+pub(crate) enum StarlarkRunActionValuesView<'v> {
+    Unfrozen(ValueTyped<'v, StarlarkRunActionValues<'v>>),
+    Frozen(ValueTyped<'v, FrozenStarlarkRunActionValues<'v>>),
 }
 
 #[starlark_value(type = "RunActionValues")]
-impl<'v> StarlarkValue<'v> for StarlarkRunActionValues<'v> {}
+impl<'v> StarlarkType<'v> for StarlarkRunActionValuesView<'v> {}
 
-#[starlark_value(type = "RunActionValues", frozen_vtable)]
+#[starlark_value]
+impl<'v> StarlarkValue<'v> for StarlarkRunActionValues<'v> {
+    type Type = StarlarkRunActionValuesView<'v>;
+}
+
+#[starlark_value(frozen_vtable)]
 impl<'v> StarlarkValue<'v> for FrozenStarlarkRunActionValues<'v> {
-    type Canonical = StarlarkRunActionValues<'v>;
+    type Type = StarlarkRunActionValuesView<'v>;
 }
 
 impl<'v> AllocValue<'v> for StarlarkRunActionValues<'v> {
@@ -405,36 +417,28 @@ impl<'v> Freeze<'v> for StarlarkRunActionValues<'v> {
             remote_worker: Freeze::freeze(remote_worker, freezer)?,
             category: category.freeze(freezer)?,
             identifier: identifier.map(|i| i.freeze(freezer)).transpose()?,
-            // N.B. collect::<Result<_>> sets the lower bound to zero,
-            // which can cause over-allocations in frozen containers.
-            outputs_for_error_handler: {
-                let mut frozen_outputs = Vec::with_capacity(outputs_for_error_handler.len());
-                for output in outputs_for_error_handler {
-                    frozen_outputs.push(Freeze::freeze(output, freezer)?);
-                }
-                frozen_outputs
-            },
+            outputs_for_error_handler: Freeze::freeze(outputs_for_error_handler, freezer)?,
         })
     }
 }
 
 impl<'v> FrozenStarlarkRunActionValues<'v> {
-    pub(crate) fn worker(&self) -> buck2_error::Result<Option<ValueOf<'v, &'v WorkerInfo<'v>>>> {
+    pub(crate) fn worker(&self) -> buck2_error::Result<Option<ValueTyped<'v, WorkerInfo<'v>>>> {
         let Some(worker) = self.worker else {
             return Ok(None);
         };
-        ValueOf::unpack_value_err(worker.to_value())
+        ValueTyped::new_err(worker.to_value())
             .map_err(buck2_error::Error::from)
             .map(Some)
     }
 
     pub(crate) fn remote_worker(
         &self,
-    ) -> buck2_error::Result<Option<ValueOf<'v, &'v WorkerInfo<'v>>>> {
+    ) -> buck2_error::Result<Option<ValueTyped<'v, WorkerInfo<'v>>>> {
         let Some(remote_worker) = self.remote_worker else {
             return Ok(None);
         };
-        ValueOf::unpack_value_err(remote_worker.to_value())
+        ValueTyped::new_err(remote_worker.to_value())
             .map_err(buck2_error::Error::from)
             .map(Some)
     }
@@ -593,40 +597,44 @@ impl RunAction {
         let args: &dyn CommandLineArgLike = values.args.as_ref();
         let env = match values.env {
             None => Vec::new(),
-            Some(env) => {
-                let d = DictRef::from_value(env.get()).internal_error("expecting dict")?;
-                let mut res = Vec::with_capacity(d.len());
-                for (k, v) in d.iter() {
-                    res.push((
-                        k.unpack_str().internal_error("expecting string")?,
-                        ValueAsCommandLineLike::unpack_value_err(v)?.0,
-                    ));
-                }
-                res
-            }
+            Some(env) => env
+                .iter()
+                .map(|entry| {
+                    let (k, v) = entry?;
+                    Ok((k.unpack().as_str(), v.unpack().0))
+                })
+                .collect::<buck2_error::Result<Vec<_>>>()?,
         };
-        let worker: Option<&WorkerInfo> = values.worker()?.map(|v| v.typed);
+        let worker: Option<&WorkerInfo> = values.worker()?.map(|v| v.as_ref());
 
-        let worker = worker.map(|worker| UnpackedWorkerValues {
-            exe: worker.exe_command_line(),
-            env: worker.env(),
-            id: WorkerId(worker.id),
-            concurrency: worker.concurrency(),
-            streaming: worker.streaming(),
-            supports_bazel_remote_persistent_worker_protocol: worker
-                .supports_bazel_remote_persistent_worker_protocol(),
-        });
+        let worker = worker
+            .map(|worker| {
+                buck2_error::Ok(UnpackedWorkerValues {
+                    exe: worker.exe_command_line(),
+                    env: worker.env()?,
+                    id: WorkerId(worker.id),
+                    concurrency: worker.concurrency(),
+                    streaming: worker.streaming(),
+                    supports_bazel_remote_persistent_worker_protocol: worker
+                        .supports_bazel_remote_persistent_worker_protocol(),
+                })
+            })
+            .transpose()?;
 
-        let remote_worker: Option<&WorkerInfo> = values.remote_worker()?.map(|v| v.typed);
+        let remote_worker: Option<&WorkerInfo> = values.remote_worker()?.map(|v| v.as_ref());
 
-        let remote_worker = remote_worker.map(|remote_worker| UnpackedWorkerValues {
-            exe: remote_worker.exe_command_line(),
-            env: remote_worker.env(),
-            id: WorkerId(remote_worker.id),
-            concurrency: remote_worker.concurrency(),
-            streaming: false,
-            supports_bazel_remote_persistent_worker_protocol: false,
-        });
+        let remote_worker = remote_worker
+            .map(|remote_worker| {
+                buck2_error::Ok(UnpackedWorkerValues {
+                    exe: remote_worker.exe_command_line(),
+                    env: remote_worker.env()?,
+                    id: WorkerId(remote_worker.id),
+                    concurrency: remote_worker.concurrency(),
+                    streaming: false,
+                    supports_bazel_remote_persistent_worker_protocol: false,
+                })
+            })
+            .transpose()?;
 
         Ok(UnpackedRunActionValues {
             exe,
@@ -1675,8 +1683,7 @@ impl Action for RunAction {
         artifact_fs: &ArtifactFs,
         heap: Heap<'v>,
         outputs: Option<&ActionOutputs>,
-    ) -> buck2_error::Result<ValueOfUnchecked<'v, DictType<StarlarkArtifact, StarlarkArtifactValue>>>
-    {
+    ) -> buck2_error::Result<Option<OutputArtifacts<'v>>> {
         let values = self.values();
         let mut artifact_value_dict = Vec::with_capacity(values.outputs_for_error_handler.len());
 
@@ -1728,9 +1735,15 @@ impl Action for RunAction {
             artifact_value_dict.push((artifact, artifact_value));
         }
 
-        Ok(heap
-            .alloc_typed_unchecked(AllocDict(artifact_value_dict))
-            .cast())
+        Ok(Some(ValueOf::alloc_dict(
+            heap,
+            artifact_value_dict.into_iter().map(|(artifact, value)| {
+                (
+                    ValueOf::from(heap.alloc_typed(artifact)),
+                    ValueOf::from(heap.alloc_typed(value)),
+                )
+            }),
+        )))
     }
 
     async fn execute(
@@ -1885,6 +1898,7 @@ mod tests {
     use starlark::environment::GlobalsBuilder;
     use starlark::syntax::AstModule;
     use starlark::syntax::Dialect;
+    use starlark::values::UnpackValue;
 
     use super::*;
 

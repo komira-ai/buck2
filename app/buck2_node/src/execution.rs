@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::execution_types::execution::ExecutionPlatformIncompatibleReason;
 use buck2_core::execution_types::execution::ExecutionPlatformResolutionPartial;
+use buck2_core::execution_types::execution_group::NamedExecutionGroup;
 use buck2_core::execution_types::execution_platforms::ExecutionPlatforms;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::target_configured_target_label::TargetConfiguredTargetLabel;
@@ -25,10 +25,20 @@ use futures::future::BoxFuture;
 use crate::configuration::calculation::CellNameForConfigurationResolution;
 use crate::configuration::resolved::ConfigurationSettingKey;
 
-pub const EXECUTION_PLATFORMS_BUCKCONFIG: BuckconfigKeyRef = BuckconfigKeyRef {
-    section: "build",
-    property: "execution_platforms",
-};
+/// The outcome of checking each candidate execution platform, by platform name.
+pub type ExecutionPlatformCandidateOutcomes =
+    Vec<(String, Result<(), ExecutionPlatformIncompatibleReason>)>;
+
+/// The candidate outcomes of every execution group of a target. Each group, the default one
+/// included, has its own result, so a group whose diagnosis fails does not hide the others'.
+pub struct ExecutionPlatformDiagnosis {
+    pub default: buck2_error::Result<ExecutionPlatformCandidateOutcomes>,
+    /// One entry per named execution group the rule declares, in declaration order.
+    pub execution_groups: Vec<(
+        NamedExecutionGroup,
+        buck2_error::Result<ExecutionPlatformCandidateOutcomes>,
+    )>,
+}
 
 #[async_trait]
 pub trait GetExecutionPlatformsImpl: 'static + Send + Sync {
@@ -49,7 +59,7 @@ pub trait GetExecutionPlatformsImpl: 'static + Send + Sync {
     ) -> buck2_error::Result<ExecutionPlatformResolutionPartial>;
 
     /// Re-traverses the candidates for a target, collecting the outcome of every candidate
-    /// execution platform. Used by `buck2 audit execution-platform-resolution` to reconstruct
+    /// execution platform for each of its execution groups. Used by `buck2 audit execution-platform-resolution` to reconstruct
     /// the reasons that `NoCompatiblePlatform` deliberately does not render. The per-candidate
     /// checks are DICE-cached, so for a target whose resolution just failed this mostly reads
     /// back the failed attempt.
@@ -57,7 +67,7 @@ pub trait GetExecutionPlatformsImpl: 'static + Send + Sync {
         &self,
         dice: &mut DiceComputations<'_>,
         target: &TargetConfiguredTargetLabel,
-    ) -> buck2_error::Result<Vec<(String, Result<(), ExecutionPlatformIncompatibleReason>)>>;
+    ) -> buck2_error::Result<ExecutionPlatformDiagnosis>;
 }
 
 pub static GET_EXECUTION_PLATFORMS: LateBinding<&'static dyn GetExecutionPlatformsImpl> =
@@ -65,7 +75,8 @@ pub static GET_EXECUTION_PLATFORMS: LateBinding<&'static dyn GetExecutionPlatfor
 
 pub trait GetExecutionPlatforms<'d>: Send {
     /// Returns a list of the configured execution platforms. This looks up the providers on the target
-    /// configured **in the root cell's buckconfig** with key `build.execution_platforms`. If there's no
+    /// the `execution_platforms.target` setting names (falling back to the root cell's
+    /// `build.execution_platforms` buckconfig). If there's no
     /// value configured, it will return `None` which indicates we should fallback to the legacy execution
     /// platform behavior.
     fn get_execution_platforms<'a>(

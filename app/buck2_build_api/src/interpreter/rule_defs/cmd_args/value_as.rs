@@ -16,8 +16,11 @@ use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProv
 use buck2_interpreter::types::project_root::StarlarkProjectRoot;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use dupe::Dupe;
+use starlark::any::IsStaticType;
+use starlark::any::ProvidesStaticType;
 use starlark::typing::Ty;
 use starlark::values::UnpackValue;
+use starlark::values::UnpackValueStable;
 use starlark::values::Value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
@@ -26,6 +29,15 @@ use crate::interpreter::rule_defs::cmd_args::command_line_arg_like_type::command
 use crate::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
 
 pub struct ValueAsCommandLineLike<'v>(pub &'v dyn CommandLineArgLike<'v>);
+
+// SAFETY: the static type is the same type with the heap lifetime erased.
+unsafe impl<'v> ProvidesStaticType<'v> for ValueAsCommandLineLike<'v> {
+    type StaticType = ValueAsCommandLineLike<'static>;
+}
+
+impl IsStaticType for ValueAsCommandLineLike<'static> {
+    type Reinfect<'lt> = ValueAsCommandLineLike<'lt>;
+}
 
 impl<'v> StarlarkTypeRepr for ValueAsCommandLineLike<'v> {
     type Canonical = ValueAsCommandLineLike<'static>;
@@ -65,6 +77,9 @@ impl<'v> ValueAsCommandLineLike<'v> {
         Some(ValueAsCommandLineLike(value.request_value()?))
     }
 }
+
+/// Whether a value provides `CommandLineArgLike` is a property of its type.
+impl<'v> UnpackValueStable<'v> for ValueAsCommandLineLike<'v> {}
 
 impl<'v> UnpackValue<'v> for ValueAsCommandLineLike<'v> {
     type Error = Infallible;

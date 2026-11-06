@@ -46,11 +46,15 @@ RIOT_USE_CASES = [
     "vr-diff",
     "wearables-diff",
     "wearables-human-lease",
+    "wearables-mqb",
     "wearables-other",
 ]
 SUPPORTED_POOLS = ["EUREKA_POOL", "HOLLYWOOD_POOL", "STAGE_DELPHI_POOL", "PANTHER_POOL", "SEACLIFF_POOL"]
 SUPPORTED_PLATFORMS = ["riot", "android-emulator", "rl-emulator"]
 SUPPORTED_USE_CASES = RIOT_USE_CASES + [DEFAULT_ANDROID_INSTRUMENTATION_TESTS_USE_CASE]
+
+_AOSP_REPLAY_OBI_BUILD = read_root_config("android_instrumentation", "aosp_replay_obi_build", None)
+_AOSP_REPLAY_OBI_BUILD_LABEL_PREFIX = "aosp_replay_obi_build="
 
 def android_instrumentation_test_impl(ctx: AnalysisContext):
     android_toolchain = ctx.attrs._android_toolchain[AndroidToolchainInfo]
@@ -189,9 +193,12 @@ def android_instrumentation_test_impl(ctx: AnalysisContext):
         ])
         env["TPX_LIST_TESTS_COMMAND"] = list_tests_command
 
-    labels = ctx.attrs.labels
+    labels = list(ctx.attrs.labels)
     if "tpx:supports-test-result-output-spec" not in labels:
         labels.append("tpx:supports-test-result-output-spec")
+    if _AOSP_REPLAY_OBI_BUILD:
+        labels = [label for label in labels if not label.startswith(_AOSP_REPLAY_OBI_BUILD_LABEL_PREFIX)]
+        labels.append(_AOSP_REPLAY_OBI_BUILD_LABEL_PREFIX + _AOSP_REPLAY_OBI_BUILD)
 
     test_info = ExternalRunnerTestInfo(
         type = "android_instrumentation",
@@ -256,6 +263,7 @@ def _compute_executor_overrides(ctx: AnalysisContext, instrumentation_test_can_r
         remote_enabled = True,
         remote_execution_properties = remote_execution_properties,
         remote_execution_use_case = _compute_re_use_case(ctx.attrs.labels or []),
+        meta_internal_extra_params = _meta_internal_extra_params_for(remote_execution_properties, None),
     )
     dynamic_listing_executor_override = default_executor_override
     test_execution_executor_override = default_executor_override
@@ -268,7 +276,7 @@ def _compute_executor_overrides(ctx: AnalysisContext, instrumentation_test_can_r
                 remote_enabled = True,
                 remote_execution_properties = ctx.attrs.re_caps["dynamic-listing"],
                 remote_execution_use_case = ctx.attrs.re_use_case["dynamic-listing"],
-                meta_internal_extra_params = ctx.attrs.meta_internal_extra_params,
+                meta_internal_extra_params = _meta_internal_extra_params_for(ctx.attrs.re_caps["dynamic-listing"], ctx.attrs.meta_internal_extra_params),
             )
         if "test-execution" in ctx.attrs.re_caps and "test-execution" in ctx.attrs.re_use_case:
             _validate_executor_override_re_config(ctx.attrs.re_caps["test-execution"], ctx.attrs.re_use_case["test-execution"])
@@ -277,7 +285,7 @@ def _compute_executor_overrides(ctx: AnalysisContext, instrumentation_test_can_r
                 remote_enabled = True,
                 remote_execution_properties = ctx.attrs.re_caps["test-execution"],
                 remote_execution_use_case = ctx.attrs.re_use_case["test-execution"],
-                meta_internal_extra_params = ctx.attrs.meta_internal_extra_params,
+                meta_internal_extra_params = _meta_internal_extra_params_for(ctx.attrs.re_caps["test-execution"], ctx.attrs.meta_internal_extra_params),
             )
 
     return {
@@ -342,6 +350,12 @@ def _compute_re_use_case(labels: list[str]) -> str:
         return DEFAULT_ANDROID_INSTRUMENTATION_TESTS_USE_CASE
     else:  # len(re_use_case_labels) == 1:
         return re_use_case_labels[0].replace("re_opts_use_case=", "")
+
+# A `riot` run holds a lab device until it ends, so have RE stop it once buck2 disconnects.
+def _meta_internal_extra_params_for(re_caps: dict[str, str], meta_internal_extra_params: dict[str, typing.Any] | None) -> dict[str, typing.Any] | None:
+    if re_caps.get("platform") != "riot":
+        return meta_internal_extra_params
+    return (meta_internal_extra_params or {}) | {"cancel_on_client_disconnect": True}
 
 def _validate_executor_override_re_config(re_caps: dict[str, str], re_use_case: str):
     expect(

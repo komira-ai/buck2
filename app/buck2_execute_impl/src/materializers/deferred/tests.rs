@@ -178,6 +178,7 @@ pub(crate) mod state_machine {
     use assert_matches::assert_matches;
     use buck2_common::file_ops::metadata::Symlink;
     use buck2_core::error::SoftErrorContext;
+    use buck2_core::error::with_soft_error_context;
     use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_error::BuckErrorContext;
@@ -232,6 +233,8 @@ pub(crate) mod state_machine {
         // If set, add a sleep when materializing to simulate a long materialization period
         materialization_config: BuckMutMap<ProjectRelativePathBuf, TokioDuration>,
         #[allocative(skip)]
+        pub(crate) block_materialization: Option<Arc<tokio::sync::Semaphore>>,
+        #[allocative(skip)]
         read_dir_barriers: Option<Arc<(Barrier, Barrier)>>,
         #[allocative(skip)]
         clean_barriers: Option<Arc<(Barrier, Barrier)>>,
@@ -257,7 +260,6 @@ pub(crate) mod state_machine {
     impl DeferredMaterializerAccessor<StubIoHandler> {
         // Ensure that the command thread ends so that the command processor is dropped,
         // and the sqlite connection is flushed and closed.
-        // Needed since the default destructor assumes the process is about to die and shouldn't need to block.
         fn abort(mut self) {
             self.command_sender
                 .send(MaterializerCommand::Abort)
@@ -300,6 +302,7 @@ pub(crate) mod state_machine {
                 fail_next_invalidated_cleans: Default::default(),
                 invalidated_clean_attempts: Default::default(),
                 materialization_config: BuckMutMap::default(),
+                block_materialization: None,
                 read_dir_barriers: None,
                 clean_barriers: None,
                 digest_config: DigestConfig::testing_default(),
@@ -408,6 +411,10 @@ pub(crate) mod state_machine {
             _event_dispatcher: EventDispatcher,
             _cancellations: &CancellationContext,
         ) -> Result<(), MaterializeEntryError> {
+            if let Some(started) = &self.block_materialization {
+                started.add_permits(1);
+                futures::future::pending::<()>().await;
+            }
             // Simulate a non-immediate materialization if configured
             if let Some(duration) = self.materialization_config.get(&path) {
                 sleep(*duration).await;
@@ -642,6 +649,7 @@ pub(crate) mod state_machine {
                 CleanStaleConfig::default(),
                 None,
                 background_cleanup_gate.dupe(),
+                Arc::new(CancellationScope::new()),
             ),
             command_sender,
             command_receiver,
@@ -678,6 +686,7 @@ pub(crate) mod state_machine {
         ) = make_processor_for_io(io.dupe());
         processor.clean_stale_config = clean_stale_config.unwrap_or_default();
         let stats = processor.stats.dupe();
+        let cancellation = processor.cancellation.clone();
 
         let command_thread = thread_spawn("buck2-dm", {
             move || {
@@ -703,6 +712,8 @@ pub(crate) mod state_machine {
         (
             DeferredMaterializerAccessor {
                 command_thread: Some(command_thread),
+                cancellation,
+                runtime: Handle::current(),
                 command_sender,
                 materialize_final_artifacts: true,
                 defer_write_actions: true,
@@ -715,6 +726,81 @@ pub(crate) mod state_machine {
             },
             daemon_dispatcher_events,
         )
+    }
+
+    #[tokio::test]
+    async fn dropping_materializer_stops_worker_and_releases_io() {
+        let io = Arc::new(StubIoHandler::new(temp_root()));
+        let weak_io = Arc::downgrade(&io);
+        let (mut materializer, _events) = make_materializer(io, None).await;
+        let sender = materializer.command_sender.dupe();
+        let worker = materializer.command_thread.take().unwrap();
+        drop(materializer);
+        let mut stopped = tokio::task::spawn_blocking(move || worker.join());
+        let outcome = tokio::time::timeout(TokioDuration::from_secs(5), &mut stopped).await;
+        if outcome.is_err() {
+            let _ignored = sender.send(MaterializerCommand::Abort);
+            stopped.await.unwrap().unwrap();
+            panic!("dropping the materializer did not stop its worker");
+        }
+        outcome.unwrap().unwrap().unwrap();
+        tokio::time::timeout(TokioDuration::from_secs(5), async {
+            while weak_io.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            weak_io.upgrade().is_none(),
+            "worker must release its I/O handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_materializer_cancels_background_materialization() -> buck2_error::Result<()> {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut io = StubIoHandler::new(temp_root());
+        io.block_materialization = Some(started.clone());
+        let io = Arc::new(io);
+        let weak_io = Arc::downgrade(&io);
+        let (mut materializer, _events) = make_materializer(io, None).await;
+        let path = make_path("cancelled/output");
+        materializer
+            .declare_write(Box::new(|| {
+                Ok(vec![WriteRequest {
+                    path: path.clone(),
+                    content: b"old".to_vec(),
+                    is_executable: false,
+                    path_kind: BuckOutPathKind::Configuration,
+                }])
+            }))
+            .await?;
+        let mut result = materializer.materialize_many(vec![path]).await?;
+        started.acquire().await.unwrap().forget();
+        let cancellation = materializer.cancellation.clone();
+        let worker = materializer.command_thread.take().unwrap();
+        drop(materializer);
+        tokio::time::timeout(TokioDuration::from_secs(5), cancellation.wait())
+            .await
+            .unwrap();
+        assert!(result.next().await.unwrap().is_err());
+        tokio::task::spawn_blocking(move || worker.join())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(TokioDuration::from_secs(5), async {
+            while weak_io.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            weak_io.upgrade().is_none(),
+            "cancelled materialization must release its I/O handler"
+        );
+        Ok(())
     }
 
     fn receive_clean_result(events: &mut ChannelEventSource) -> buck2_data::CleanStaleResult {
@@ -775,9 +861,8 @@ pub(crate) mod state_machine {
             let artifact = ArtifactValue::file(io.digest_config().empty_file());
             let (dm, _daemon_dispatcher_events) = make_materializer(io, None).await;
 
-            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
-            dm.as_dyn()
-                .declare_existing(&lease, vec![DeclareArtifactPayload { path, artifact }])
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            dm.declare_existing(&lease, vec![DeclareArtifactPayload { path, artifact }])
                 .await?;
 
             let source = dm.allocative().await?.flamegraph().write();
@@ -1256,20 +1341,18 @@ pub(crate) mod state_machine {
             });
             let (mut dm, _events) = make_materializer(io, None).await;
             dm.materialize_final_artifacts = false;
-            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
-            dm.as_dyn()
-                .declare_existing(
-                    &lease,
-                    vec![DeclareArtifactPayload {
-                        path: path.clone(),
-                        artifact: value.dupe(),
-                    }],
-                )
-                .await?;
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            dm.declare_existing(
+                &lease,
+                vec![DeclareArtifactPayload {
+                    path: path.clone(),
+                    artifact: value.dupe(),
+                }],
+            )
+            .await?;
             assert!(dm.has_artifact_at(path.clone()).await?);
 
             let response = dm
-                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value.dupe())],
                     MaterializationPurpose::FinalOutput { required: false },
@@ -1294,7 +1377,6 @@ pub(crate) mod state_machine {
 
             dm.materialize_final_artifacts = true;
             let response = dm
-                .as_dyn()
                 .materialize(request(
                     vec![(path, value)],
                     MaterializationPurpose::FinalOutput { required: true },
@@ -1574,6 +1656,41 @@ pub(crate) mod state_machine {
     }
 
     #[tokio::test]
+    async fn test_cleanup_finished_after_invalidation() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let (mut dm, mut channel) = make_processor(Default::default());
+            let path = make_path("foo/bar");
+            let value = ArtifactValue::file(dm.io.digest_config().empty_file());
+            dm.testing_declare(&path, value);
+
+            let pending = dm.tree.invalidate_paths_and_collect_futures(
+                vec![path.clone()],
+                dm.sqlite_db.as_mut(),
+                &dm.stats,
+            )?;
+            assert_eq!(pending.len(), 1);
+            join_all_existing_futs(pending).await?;
+            assert!(dm.tree.prefix_get(&mut path.iter()).is_none());
+
+            let completion = channel
+                .low_priority
+                .try_recv()
+                .expect("cleanup should have queued its completion");
+            assert_matches!(
+                completion,
+                LowPriorityMaterializerCommand::CleanupFinished { .. }
+            );
+            let context = Arc::new(SoftErrorContext::new("true", "")?);
+            with_soft_error_context(Some(context), || {
+                dm.testing_process_one_low_priority_command(completion);
+            });
+            assert!(dm.tree.prefix_get(&mut path.iter()).is_none());
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn test_retry() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let (mut dm, mut channel) = make_processor(Default::default());
@@ -1662,6 +1779,7 @@ pub(crate) mod state_machine {
                     },
                     dry_run: false,
                     tracked_only: false,
+                    origin: buck2_data::clean_stale_result::Origin::CleanallCommand,
                 },
             )
             .await;
@@ -1708,6 +1826,10 @@ pub(crate) mod state_machine {
             assert_eq!(
                 event.trigger,
                 buck2_data::clean_stale_result::Trigger::ManualExplicit as i32
+            );
+            assert_eq!(
+                event.origin,
+                buck2_data::clean_stale_result::Origin::CleanallCommand as i32
             );
             assert_eq!(
                 event.policy_mode,
@@ -1759,6 +1881,7 @@ pub(crate) mod state_machine {
                     },
                     dry_run: false,
                     tracked_only: false,
+                    origin: buck2_data::clean_stale_result::Origin::CleanCommand,
                 })
                 .await?;
             stats_update
@@ -1766,6 +1889,8 @@ pub(crate) mod state_machine {
                 .expect("materializer stats update should finish");
 
             let stats = res.stats.expect("clean-stale should return stats");
+            assert!(stats.used_disk_space_bytes_start.is_some());
+            assert!(stats.used_disk_space_bytes_end.is_some());
             assert_eq!(
                 (
                     stats.materialized_intermediate_only_bytes_before,
@@ -1802,6 +1927,7 @@ pub(crate) mod state_machine {
                     },
                     dry_run: false,
                     tracked_only: false,
+                    origin: buck2_data::clean_stale_result::Origin::CleanCommand,
                 },
             )
             .await;
@@ -1854,6 +1980,7 @@ pub(crate) mod state_machine {
                     },
                     dry_run: false,
                     tracked_only: false,
+                    origin: buck2_data::clean_stale_result::Origin::CleanCommand,
                 },
             )
             .await;
@@ -1888,7 +2015,6 @@ pub(crate) mod state_machine {
         .await
     }
 
-    #[cfg(unix)]
     fn explicit_clean_stale_args(tracked_only: bool) -> CleanStaleArtifactsArgs {
         CleanStaleArtifactsArgs {
             policy: CleanStaleArtifactsPolicy::Explicit {
@@ -1899,10 +2025,10 @@ pub(crate) mod state_machine {
             },
             dry_run: false,
             tracked_only,
+            origin: buck2_data::clean_stale_result::Origin::CleanCommand,
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_clean_stale_tracked_only_with_file_at_tracked_dir() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
@@ -1936,7 +2062,6 @@ pub(crate) mod state_machine {
         .await
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_clean_stale_tracked_only_with_symlink_at_tracked_dir() -> buck2_error::Result<()>
     {
@@ -1975,9 +2100,19 @@ pub(crate) mod state_machine {
         .await
     }
 
+    /// The tests remove the owner permissions of `path`. If the clean under test fails to
+    /// delete `path`, the temp dir can't be deleted until the permissions are restored.
+    #[cfg(unix)]
+    fn restore_permissions_if_exists(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
+        if fs_util::try_exists(path)? {
+            fs_util::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_clean_stale_skips_unreadable() -> buck2_error::Result<()> {
+    async fn test_clean_stale_deletes_unreadable() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let path = make_path(SAMPLE_BUCK_OUT_PATH);
             let project_root = temp_root();
@@ -2017,12 +2152,12 @@ pub(crate) mod state_machine {
                     },
                     dry_run: false,
                     tracked_only: false,
+                    origin: buck2_data::clean_stale_result::Origin::CleanCommand,
                 })
                 .await;
 
-            // Restore permissions so the temp dir can be deleted.
-            fs_util::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o755))?;
-            fs_util::set_permissions(&listable_dir, std::fs::Permissions::from_mode(0o755))?;
+            restore_permissions_if_exists(&unreadable_dir)?;
+            restore_permissions_if_exists(&listable_dir)?;
 
             let res = res?;
             let &buck2_data::CleanStaleStats {
@@ -2037,6 +2172,8 @@ pub(crate) mod state_machine {
                 .stats
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
+            assert!(!fs_util::try_exists(&untracked_dir)?);
+            assert!(!fs_util::try_exists(&listable_dir)?);
             assert_eq!(
                 (
                     stale_artifact_count,
@@ -2046,12 +2183,10 @@ pub(crate) mod state_machine {
                     scan_unreadable_count,
                     delete_permission_denied_artifact_count,
                 ),
-                (1, 1, 2, 4, 2, 2),
-                "clean should finish despite the unreadable entries: the stale artifact is \
-                 cleaned; neither untracked root can be fully deleted, so both are skipped \
-                 rather than failing the clean — four skips total: the scan reading the \
-                 unreadable dir, the scan statting the file in the non-traversable dir, and \
-                 the two failed deletions"
+                (1, 3, 2, 2, 2, 0),
+                "the scan skips reading the unreadable dir and statting the file in the \
+                 non-traversable dir, and the clean still deletes both untracked roots \
+                 because it adds owner permissions to the directories it deletes"
             );
             Ok(())
         })
@@ -2072,7 +2207,8 @@ pub(crate) mod state_machine {
             fs_util::create_dir_all(&dead)?;
             fs_util::write(&dead_file, b"xxxx")?;
 
-            // Unknown-age scratch (permission denied) is skipped, never deleted.
+            // The scan can't read `unreadable` or traverse `listable`. The sweep still deletes
+            // `unreadable` and `listable`.
             let unreadable = project_root.resolve(make_path("buck-out/v2/tmp/unreadable"));
             let unreadable_file =
                 project_root.resolve(make_path("buck-out/v2/tmp/unreadable/junk"));
@@ -2101,9 +2237,8 @@ pub(crate) mod state_machine {
             let dispatcher = EventDispatcher::new(TraceId::null(), DaemonId::new(), sink);
             let res = with_dispatcher_async(dispatcher, dm.clean_scratch()).await;
 
-            // Restore permissions so the temp dir can be deleted.
-            fs_util::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755))?;
-            fs_util::set_permissions(&listable, std::fs::Permissions::from_mode(0o755))?;
+            restore_permissions_if_exists(&unreadable)?;
+            restore_permissions_if_exists(&listable)?;
 
             let res = res?;
             let &buck2_data::CleanStaleStats {
@@ -2118,8 +2253,8 @@ pub(crate) mod state_machine {
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
             assert!(!fs_util::try_exists(&dead)?);
-            assert!(fs_util::try_exists(&unreadable_file)?);
-            assert!(fs_util::try_exists(&listable_file)?);
+            assert!(!fs_util::try_exists(&unreadable)?);
+            assert!(!fs_util::try_exists(&listable)?);
             #[cfg(not(target_os = "macos"))]
             assert!(fs_util::try_exists(&invalid_name)?);
             let expected_invalid_filename_count = if cfg!(target_os = "macos") { 0 } else { 1 };
@@ -2131,9 +2266,9 @@ pub(crate) mod state_machine {
                     skipped_unreadable_count,
                     scan_invalid_filename_count,
                 ),
-                (3, 1, 4, 4, expected_invalid_filename_count,),
-                "the sweep deletes dead scratch and records permission-denied and invalid-name \
-                 operations separately"
+                (3, 3, 4, 2, expected_invalid_filename_count,),
+                "the sweep deletes all scratch with a valid name and records the entries the \
+                 scan can't read and the invalid names separately"
             );
             assert!(
                 events.try_receive().is_none(),
@@ -2173,6 +2308,7 @@ pub(crate) mod state_machine {
                 },
                 dry_run: false,
                 tracked_only: false,
+                origin: buck2_data::clean_stale_result::Origin::CleanCommand,
             });
             thread::spawn(move || {
                 // Wait until a read_dir request is about to execute
@@ -2219,6 +2355,7 @@ pub(crate) mod state_machine {
                 },
                 dry_run: false,
                 tracked_only: false,
+                origin: buck2_data::clean_stale_result::Origin::CleanCommand,
             });
             thread::spawn(move || {
                 // Wait until a single clean request is about to execute
@@ -2295,6 +2432,10 @@ pub(crate) mod state_machine {
             assert_eq!(
                 res.trigger,
                 buck2_data::clean_stale_result::Trigger::Scheduled as i32
+            );
+            assert_eq!(
+                res.origin,
+                buck2_data::clean_stale_result::Origin::DaemonSchedule as i32
             );
             assert_eq!(
                 res.policy_mode,
@@ -2508,16 +2649,15 @@ pub(crate) mod state_machine {
 
             let existing = make_path("foo/existing");
             let existing_value = file_value(digest_config, b"existing");
-            let lease = dm.as_dyn().prepare_outputs(vec![existing.clone()]).await?;
-            dm.as_dyn()
-                .declare_existing(
-                    &lease,
-                    vec![DeclareArtifactPayload {
-                        path: existing.clone(),
-                        artifact: existing_value.dupe(),
-                    }],
-                )
-                .await?;
+            let lease = dm.prepare_outputs(vec![existing.clone()]).await?;
+            dm.declare_existing(
+                &lease,
+                vec![DeclareArtifactPayload {
+                    path: existing.clone(),
+                    artifact: existing_value.dupe(),
+                }],
+            )
+            .await?;
 
             let remote = make_path("foo/remote");
             let remote_value = file_value(digest_config, b"remote");
@@ -2538,7 +2678,6 @@ pub(crate) mod state_machine {
             let undeclared = make_path("foo/undeclared");
 
             let response = dm
-                .as_dyn()
                 .materialize(request(
                     vec![
                         (remote.clone(), remote_value),
@@ -2571,19 +2710,18 @@ pub(crate) mod state_machine {
 
             let path = make_path("foo/output");
             io.fs().write_file(&path, "previous", false)?;
-            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
-            dm.as_dyn()
-                .declare_existing(
-                    &lease,
-                    vec![DeclareArtifactPayload {
-                        path: path.clone(),
-                        artifact: file_value(digest_config, b"previous"),
-                    }],
-                )
-                .await?;
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            dm.declare_existing(
+                &lease,
+                vec![DeclareArtifactPayload {
+                    path: path.clone(),
+                    artifact: file_value(digest_config, b"previous"),
+                }],
+            )
+            .await?;
             assert!(dm.has_artifact_at(path.clone()).await?);
 
-            let _lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
+            let _lease = dm.prepare_outputs(vec![path.clone()]).await?;
             assert!(!dm.has_artifact_at(path.clone()).await?);
             assert!(
                 io.fs().resolve(&path).exists(),
@@ -2605,16 +2743,15 @@ pub(crate) mod state_machine {
 
             let src = make_path("foo/placeholder");
             let dest = make_path("foo/content");
-            let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
+            let lease = dm.prepare_outputs(vec![src.clone()]).await?;
             drop(
-                dm.as_dyn()
-                    .publish(
-                        &lease,
-                        src.clone(),
-                        dest.clone(),
-                        file_value(digest_config, b"published"),
-                    )
-                    .await?,
+                dm.publish(
+                    &lease,
+                    src.clone(),
+                    dest.clone(),
+                    file_value(digest_config, b"published"),
+                )
+                .await?,
             );
 
             // `dest` is on disk before `publish` returns, and `src` stays tracked because it is
@@ -2656,7 +2793,6 @@ pub(crate) mod state_machine {
                 .await?;
 
             let response = dm
-                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value.dupe())],
                     MaterializationPurpose::FinalOutput { required: false },
@@ -2665,7 +2801,6 @@ pub(crate) mod state_machine {
             assert_eq!(response.results.len(), 1);
 
             let response = dm
-                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value)],
                     MaterializationPurpose::FinalOutput { required: true },
@@ -2682,16 +2817,5 @@ pub(crate) mod state_machine {
             Ok(())
         })
         .await
-    }
-
-    /// The public API of the materializer under test, which lives on the trait object.
-    trait AsDyn {
-        fn as_dyn(&self) -> &dyn Materializer;
-    }
-
-    impl AsDyn for DeferredMaterializerAccessor<StubIoHandler> {
-        fn as_dyn(&self) -> &dyn Materializer {
-            self
-        }
     }
 }

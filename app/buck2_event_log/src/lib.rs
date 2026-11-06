@@ -8,14 +8,13 @@
  * above-listed licenses.
  */
 
-#![feature(used_with_arg)]
-
 use std::io;
 use std::process;
 use std::time::Duration;
 
 use buck2_core::buck2_env;
 use buck2_core::ci::is_ci;
+use buck2_core::soft_error_or_panic;
 use buck2_error::BuckErrorContext;
 use tokio::process::Child;
 use tokio::task::JoinHandle;
@@ -70,7 +69,10 @@ pub async fn wait_for_child_and_log(child: FutureChildOutput, reason: &str) {
     match inner(child).await {
         Ok(_) => {}
         Err(e) => {
-            tracing::warn!("Error uploading {}: {:#}", reason, e);
+            soft_error_or_panic!(
+                "log_upload_child_failed",
+                e.context(format!("Error uploading {}", reason))
+            );
         }
     }
 }

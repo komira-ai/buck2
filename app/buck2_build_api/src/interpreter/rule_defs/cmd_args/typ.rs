@@ -11,7 +11,6 @@
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
-use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -29,6 +28,7 @@ use display_container::fmt_container;
 use display_container::iter_display_chain;
 use dupe::Dupe;
 use either::Either;
+use mini_vec::MiniVec;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
@@ -46,6 +46,8 @@ use starlark::values::Freezer;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkRepresentations;
+use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::StaticFreezePlan;
 use starlark::values::StringValue;
@@ -53,11 +55,13 @@ use starlark::values::ThinBoxSliceValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::values::ValueError;
 use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::list::ListRef;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::starlark_value;
-use starlark::values::tuple::UnpackTuple;
+use starlark::values::tuple::TupleType;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::artifact_groups::ArtifactGroup;
@@ -232,8 +236,8 @@ impl<'v, F: Fields<'v>> Display for FieldsRef<'v, F> {
 impl<'v, F: Fields<'v>> FieldsRef<'v, F> {
     fn copy(&self) -> StarlarkCmdArgs<'v> {
         StarlarkCmdArgs(RefCell::new(StarlarkCommandLineData {
-            items: self.0.items().to_vec(),
-            hidden: self.0.hidden().to_vec(),
+            items: self.0.items().into(),
+            hidden: self.0.hidden().into(),
             options: self
                 .0
                 .options()
@@ -504,8 +508,8 @@ impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
 #[derive(Debug, Default, Clone, Trace, ProvidesStaticType, Allocative)]
 #[repr(C)]
 pub struct StarlarkCommandLineData<'v> {
-    items: Vec<CommandLineArg<'v>>,
-    hidden: Vec<CommandLineArg<'v>>,
+    items: MiniVec<CommandLineArg<'v>>,
+    hidden: MiniVec<CommandLineArg<'v>>,
     options: Option<Box<CommandLineOptions<'v>>>,
 }
 
@@ -617,7 +621,7 @@ impl<'v, A: Fields<'v>, B: Fields<'v>> Fields<'v> for Either<A, B> {
 }
 
 // These types show up a lot in the frozen heaps, so make sure they don't regress
-size_assert::words_of_type!(StarlarkCmdArgs<'static>, 8);
+size_assert::words_of_type!(StarlarkCmdArgs<'static>, 4);
 size_assert::words_of_type!(FrozenStarlarkCmdArgs<'static>, 3);
 size_assert::words_of_type!(CommandLineOptions<'static>, 10);
 
@@ -667,45 +671,51 @@ impl<'v> StarlarkCmdArgs<'v> {
     }
 }
 
-/// Unpack a `cmd_args` in either form, at the value's own heap brand.
-#[derive(StarlarkTypeRepr, UnpackValue)]
-pub enum StarlarkCmdArgsUnpack<'v> {
-    Unfrozen(&'v StarlarkCmdArgs<'v>),
-    Frozen(&'v FrozenStarlarkCmdArgs<'v>),
+/// A `cmd_args` in either of its representations: the receiver of the type's methods, and the
+/// binding for a native parameter of type `cmd_args`.
+#[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+pub enum StarlarkCmdArgsView<'v> {
+    Unfrozen(ValueTyped<'v, StarlarkCmdArgs<'v>>),
+    Frozen(ValueTyped<'v, FrozenStarlarkCmdArgs<'v>>),
 }
 
-impl<'v> StarlarkCmdArgsUnpack<'v> {
+impl<'v> StarlarkCmdArgsView<'v> {
     pub fn is_empty(&self) -> bool {
         match self {
-            StarlarkCmdArgsUnpack::Unfrozen(x) => x.is_empty(),
-            StarlarkCmdArgsUnpack::Frozen(x) => x.is_empty(),
+            StarlarkCmdArgsView::Unfrozen(x) => x.is_empty(),
+            StarlarkCmdArgsView::Frozen(x) => x.is_empty(),
+        }
+    }
+
+    pub fn as_command_line_arg_like(self) -> &'v dyn CommandLineArgLike<'v> {
+        match self {
+            StarlarkCmdArgsView::Unfrozen(x) => x.as_ref(),
+            StarlarkCmdArgsView::Frozen(x) => x.as_ref(),
         }
     }
 }
 
 starlark::methods_static!(CMD_ARGS_METHODS = cmd_args_methods);
-starlark::methods_static!(FROZEN_CMD_ARGS_METHODS = cmd_args_methods);
 
-#[starlark_value(type = "cmd_args", StarlarkTypeRepr, UnpackValue)]
-impl<'v> StarlarkValue<'v> for StarlarkCmdArgs<'v> {
+#[starlark_value(type = "cmd_args")]
+impl<'v> StarlarkType<'v> for StarlarkCmdArgsView<'v> {
     fn get_methods() -> Option<&'static Methods> {
         Some(CMD_ARGS_METHODS.methods())
     }
+}
+
+#[starlark_value]
+impl<'v> StarlarkValue<'v> for StarlarkCmdArgs<'v> {
+    type Type = StarlarkCmdArgsView<'v>;
 
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         demand.provide_value::<&dyn CommandLineArgLike>(self);
     }
 }
 
-#[starlark_value(type = "cmd_args", StarlarkTypeRepr, UnpackValue, frozen_vtable)]
+#[starlark_value(frozen_vtable)]
 impl<'v> StarlarkValue<'v> for FrozenStarlarkCmdArgs<'v> {
-    type Canonical = StarlarkCmdArgs<'v>;
-
-    fn get_methods() -> Option<&'static Methods> {
-        // We return the same methods for frozen command lines, even though some of them fail,
-        // so the methods remain consistent during freezing
-        Some(FROZEN_CMD_ARGS_METHODS.methods())
-    }
+    type Type = StarlarkCmdArgsView<'v>;
 
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         demand.provide_value::<&dyn CommandLineArgLike<'v>>(self);
@@ -816,7 +826,7 @@ impl<'v> Freeze<'v> for StarlarkCmdArgs<'v> {
         } = self.0.into_inner();
 
         fn freeze_elements<'v, 'fv>(
-            elements: Vec<CommandLineArg<'v>>,
+            elements: MiniVec<CommandLineArg<'v>>,
             freezer: &Freezer<'v, 'fv>,
         ) -> FreezeResult<ThinBoxSliceValue<'fv>> {
             elements
@@ -933,13 +943,20 @@ impl<'v> StarlarkTypeRepr for StarlarkCommandLineMut<'v> {
 }
 
 impl<'v> UnpackValue<'v> for StarlarkCommandLineMut<'v> {
-    type Error = Infallible;
+    type Error = starlark::Error;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(value.downcast_ref::<StarlarkCmdArgs>().map(|v| Self {
-            value,
-            borrow: v.0.borrow_mut(),
-        }))
+        match StarlarkCmdArgsView::unpack_value_opt(value) {
+            None => Ok(None),
+            Some(StarlarkCmdArgsView::Unfrozen(v)) => Ok(Some(Self {
+                value,
+                borrow: v.as_ref().0.borrow_mut(),
+            })),
+            // A `cmd_args` all the same; what fails is the mutation.
+            Some(StarlarkCmdArgsView::Frozen(_)) => Err(starlark::Error::new_other(
+                ValueError::CannotMutateImmutableValue,
+            )),
+        }
     }
 }
 
@@ -1001,7 +1018,7 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] directory: ValueOf<'v, RelativeOrigin<'v>>,
         #[starlark(require = named, default = 0u32)] parent: u32,
     ) -> starlark::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.options_mut().relative_to = Some((directory.as_unchecked(), parent));
+        this.borrow.options_mut().relative_to = Some((directory, parent));
         Ok(this)
     }
 
@@ -1178,7 +1195,7 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
     /// Replaces all parts matching pattern regular expression (or regular expressions)
     /// in each argument with replacement strings.
     fn cmd_args<'v>(
-        #[starlark(args)] args: UnpackTuple<StarlarkCommandLineValueUnpack<'v>>,
+        #[starlark(args)] args: ValueOf<'v, TupleType<StarlarkCommandLineValueUnpack<'v>>>,
         hidden: Option<StarlarkCommandLineValueUnpack<'v>>,
         delimiter: Option<StringValue<'v>>,
         format: Option<StringValue<'v>>,
@@ -1193,9 +1210,9 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
         relative_to: Option<
             Either<ValueOf<'v, RelativeOrigin<'v>>, (ValueOf<'v, RelativeOrigin<'v>>, u32)>,
         >,
-        #[starlark(default = Either::Right(UnpackList::default()))] replace_regex: Either<
+        #[starlark(default = Either::Right(ValueOf::empty_list()))] replace_regex: Either<
             (CmdArgsRegex<'v>, StringValue<'v>),
-            UnpackList<(CmdArgsRegex<'v>, StringValue<'v>)>,
+            ValueOf<'v, ListType<(CmdArgsRegex<'v>, StringValue<'v>)>>,
         >,
     ) -> starlark::Result<StarlarkCmdArgs<'v>> {
         let format = format.filter(|format| format.as_str() != "{}");
@@ -1224,20 +1241,20 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
             opts.parent = parent;
             opts.relative_to = relative_to.map(|either| {
                 let (relative_to, parent) = either.map_left(|o| (o, 0)).into_inner();
-                (relative_to.as_unchecked(), parent)
+                (relative_to, parent)
             });
         }
-        let replace_regex: Vec<(CmdArgsRegex, StringValue)> = replace_regex
-            .map_left(|x| vec![x])
-            .map_right(|x| x.items)
-            .into_inner();
+        let replace_regex: Vec<(CmdArgsRegex, StringValue)> = match replace_regex {
+            Either::Left(x) => vec![x],
+            Either::Right(xs) => xs.try_to_vec()?,
+        };
         if !replace_regex.is_empty() {
             for (pattern, _replacement) in &replace_regex {
                 pattern.validate()?;
             }
-            builder.options_mut().replacements = Some(Box::new(replace_regex));
+            builder.options_mut().replacements = replace_regex.into();
         }
-        for v in args.items {
+        for v in args.items() {
             builder.add_value_typed(v)?;
         }
         if let Some(hidden) = hidden {

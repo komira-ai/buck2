@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use buck2_cli_proto::client_context::ExitWhen;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_data::CommandPreempted;
 use buck2_data::DiceBlockConcurrentCommandEnd;
 use buck2_data::DiceBlockConcurrentCommandStart;
@@ -38,6 +39,8 @@ use buck2_data::ExclusiveCommandWaitEnd;
 use buck2_data::ExclusiveCommandWaitStart;
 use buck2_data::NoActiveDiceState;
 use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
+use buck2_error::buck2_error;
 use buck2_error::internal_error;
 use buck2_file_watcher::file_watcher::SyncOutcome;
 use buck2_hash::BuckMutInsertionMap;
@@ -175,6 +178,7 @@ pub struct ConcurrencyHandler {
     #[allocative(skip)]
     coordinator: AdmissionCoordinator,
     dice: Arc<Dice>,
+    owns_branch: bool,
     /// Used to prevent commands (clean --stale) from running in parallel with dice commands
     exclusive_command_lock: ExclusiveCommandLock,
     /// Source of `CommandId`s. Deliberately outside the coordinator so that a command has an
@@ -224,6 +228,7 @@ enum AdmissionEvent {
 }
 
 enum CoordinatorMessage {
+    Retire,
     Begin {
         request: AdmissionRequest,
         response: oneshot::Sender<buck2_error::Result<PreUpdateDecision>>,
@@ -241,6 +246,7 @@ enum CoordinatorMessage {
         command: CommandId,
         attempt: UpdateAttemptId,
         branch: BranchId,
+        retire_previous: bool,
         response: oneshot::Sender<buck2_error::Result<()>>,
     },
     AfterUpdate {
@@ -921,12 +927,17 @@ impl CoordinatorState {
 }
 
 impl AdmissionCoordinator {
-    fn new(dice: Arc<Dice>, branch: BranchId) -> Self {
+    fn with_branch_ownership(
+        dice: Arc<Dice>,
+        branch: BranchId,
+        owns_branch: bool,
+        lifetime_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let task = AdmissionCoordinatorTask::new(dice, branch, sender.downgrade());
+        let task = AdmissionCoordinatorTask::new(dice, branch, sender.downgrade(), lifetime_guard);
         #[cfg(test)]
         let active_commands = task.active_commands.dupe();
-        let task = tokio::task::spawn(task.run(receiver));
+        let task = tokio::task::spawn(task.run_with_branch_ownership(receiver, owns_branch));
         let _monitor = tokio::task::spawn(async move {
             if let Err(error) = task.await
                 && error.is_panic()
@@ -982,6 +993,7 @@ impl AdmissionCoordinator {
 
     /// Moves commands to `branch`, which later grants of the update lane return. Only the lane's
     /// holder may do this.
+    #[cfg(test)]
     async fn move_to_branch(
         &self,
         command: CommandId,
@@ -992,6 +1004,23 @@ impl AdmissionCoordinator {
             command,
             attempt,
             branch,
+            retire_previous: false,
+            response,
+        })
+        .await
+    }
+
+    async fn replace_root(
+        &self,
+        command: CommandId,
+        attempt: UpdateAttemptId,
+        branch: BranchId,
+    ) -> buck2_error::Result<()> {
+        self.request(|response| CoordinatorMessage::MoveToBranch {
+            command,
+            attempt,
+            branch,
+            retire_previous: true,
             response,
         })
         .await
@@ -1062,6 +1091,7 @@ struct AdmissionCoordinatorTask {
     blocked_waiters: BuckMutInsertionMap<CommandId, oneshot::Sender<()>>,
     #[cfg(test)]
     active_commands: Arc<AtomicUsize>,
+    _lifetime_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 struct UpdateWaiter {
@@ -1075,6 +1105,7 @@ impl AdmissionCoordinatorTask {
         dice: Arc<Dice>,
         branch: BranchId,
         sender: mpsc::WeakUnboundedSender<CoordinatorMessage>,
+        lifetime_guard: Option<Arc<dyn Send + Sync>>,
     ) -> Self {
         Self {
             data: CoordinatorState {
@@ -1086,6 +1117,7 @@ impl AdmissionCoordinatorTask {
                 previously_tainted: false,
             },
             dice,
+            _lifetime_guard: lifetime_guard,
             sender,
             branch,
             update_in_flight: None,
@@ -1096,12 +1128,25 @@ impl AdmissionCoordinatorTask {
         }
     }
 
-    async fn run(mut self, mut receiver: mpsc::UnboundedReceiver<CoordinatorMessage>) {
+    async fn run_with_branch_ownership(
+        mut self,
+        mut receiver: mpsc::UnboundedReceiver<CoordinatorMessage>,
+        owns_branch: bool,
+    ) {
+        let mut retiring = false;
         while let Some(message) = receiver.recv().await {
             match message {
+                CoordinatorMessage::Retire => retiring = true,
                 CoordinatorMessage::Begin { request, response } => {
                     let command = request.command_id;
-                    let result = self.data.begin_admission(request);
+                    let result = if retiring {
+                        Err(buck2_error!(
+                            ErrorTag::Input,
+                            "Tenant concurrency coordinator was retired"
+                        ))
+                    } else {
+                        self.data.begin_admission(request)
+                    };
                     let owns_command = result.is_ok();
                     self.respond(command, owns_command, response, result);
                 }
@@ -1119,9 +1164,21 @@ impl AdmissionCoordinatorTask {
                     command,
                     attempt,
                     branch,
+                    retire_previous,
                     response,
                 } => {
+                    let previous = self.branch;
                     let result = self.move_to_branch(command, attempt, branch);
+                    if retire_previous {
+                        let retired = if result.is_ok() { previous } else { branch };
+                        let dice = self.dice.dupe();
+                        let lifetime_guard = self._lifetime_guard.clone();
+                        tokio::spawn(async move {
+                            let _ownership = lifetime_guard;
+                            dice.wait_for_idle_on(retired).await;
+                            dice.delete_branch(retired);
+                        });
+                    }
                     let owns_command = self.data.pending_commands.contains_key(&command);
                     self.respond(command, owns_command, response, result);
                 }
@@ -1170,6 +1227,18 @@ impl AdmissionCoordinatorTask {
             }
             #[cfg(test)]
             self.publish_active_commands();
+            if retiring
+                && self.data.active_commands.is_empty()
+                && self.data.pending_commands.is_empty()
+                && self.update_in_flight.is_none()
+            {
+                break;
+            }
+        }
+        if owns_branch {
+            self.data.dice_status = DiceStatus::idle();
+            self.dice.wait_for_idle_on(self.branch).await;
+            self.dice.delete_branch(self.branch);
         }
     }
 
@@ -1511,9 +1580,47 @@ impl ExclusiveCommandLock {
 impl ConcurrencyHandler {
     /// A handler whose commands run on `branch`.
     pub fn new(dice: Arc<Dice>, branch: BranchId) -> Arc<Self> {
+        Self::with_branch_ownership(dice, branch, false, None)
+    }
+
+    /// Retains disk ownership until the admission task and its DICE handle have shut down.
+    pub fn new_with_lifetime_guard(
+        dice: Arc<Dice>,
+        branch: BranchId,
+        lifetime_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Arc<Self> {
+        Self::with_branch_ownership(dice, branch, false, lifetime_guard)
+    }
+
+    /// Own an isolated root, releasing it after retirement and all admitted commands drain.
+    pub fn new_owned(dice: Arc<Dice>, branch: BranchId) -> Arc<Self> {
+        Self::new_owned_with_lifetime_guard(dice, branch, None)
+    }
+
+    /// Retains disk ownership through root retirement and admitted-command cleanup.
+    pub fn new_owned_with_lifetime_guard(
+        dice: Arc<Dice>,
+        branch: BranchId,
+        lifetime_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Arc<Self> {
+        Self::with_branch_ownership(dice, branch, true, lifetime_guard)
+    }
+
+    fn with_branch_ownership(
+        dice: Arc<Dice>,
+        branch: BranchId,
+        owns_branch: bool,
+        lifetime_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Arc<Self> {
         Arc::new(ConcurrencyHandler {
-            coordinator: AdmissionCoordinator::new(dice.dupe(), branch),
+            coordinator: AdmissionCoordinator::with_branch_ownership(
+                dice.dupe(),
+                branch,
+                owns_branch,
+                lifetime_guard,
+            ),
             dice,
+            owns_branch,
             exclusive_command_lock: ExclusiveCommandLock::new(),
             next_command_id: AtomicUsize::new(0),
         })
@@ -1806,13 +1913,9 @@ impl ConcurrencyHandler {
         {
             soft_error!(
                 "nested_invocation_same_dice_state",
-                ConcurrencyHandlerError::NestedInvocationWithSameStates(
-                    running,
-                    display_command
-                )
-                .into(),
-                error_on_oss: true
-            )?;
+                ConcurrencyHandlerError::NestedInvocationWithSameStates(running, display_command)
+                    .into(),
+            );
         }
 
         transaction_observer
@@ -2032,22 +2135,21 @@ impl ConcurrencyHandler {
         updater: &mut DiceTransactionUpdater,
         old: BranchId,
     ) -> buck2_error::Result<()> {
-        let fresh = self.dice.new_root().await;
-        if let Err(error) = self
-            .coordinator
-            .move_to_branch(command, attempt, fresh)
-            .await
-        {
-            self.dice.delete_branch(fresh);
-            return Err(error);
-        }
+        let fresh = if self.owns_branch {
+            self.dice.new_root_from(old).await
+        } else {
+            self.dice.new_root().await
+        };
+        self.coordinator
+            .replace_root(command, attempt, fresh)
+            .await?;
         updater.retarget(fresh);
-        let dice = self.dice.dupe();
-        tokio::spawn(async move {
-            dice.wait_for_idle_on(old).await;
-            dice.delete_branch(old);
-        });
         Ok(())
+    }
+
+    /// Stop admission and release the root after cancelled commands and their work terminate.
+    pub fn retire(&self) {
+        let _ignored = self.coordinator.sender.send(CoordinatorMessage::Retire);
     }
 
     /// Access dice without locking for dumps.
@@ -2136,10 +2238,7 @@ impl CommandLease {
             .take()
             .expect("a command lease can only be released once");
         if let Err(error) = self.coordinator.release_and_wait(command).await {
-            tracing::warn!(
-                ?error,
-                "failed to release command from concurrency coordinator"
-            );
+            soft_error_or_panic!("command_lease_release_failed", error);
         }
     }
 }
@@ -2212,6 +2311,7 @@ mod tests {
     use parking_lot::Mutex;
     use tokio::sync::Barrier;
     use tokio::sync::RwLock;
+    use tokio::sync::Semaphore;
 
     use super::*;
 
@@ -2793,9 +2893,9 @@ mod tests {
             updater.commit().await.version()
         };
         let (sender, receiver) = mpsc::unbounded_channel();
-        let task = AdmissionCoordinatorTask::new(dice, root, sender.downgrade());
+        let task = AdmissionCoordinatorTask::new(dice, root, sender.downgrade(), None);
         let active_commands = task.active_commands.dupe();
-        let task = tokio::spawn(task.run(receiver));
+        let task = tokio::spawn(task.run_with_branch_ownership(receiver, false));
         let coordinator = AdmissionCoordinator {
             sender,
             active_commands,
@@ -7106,6 +7206,173 @@ mod tests {
             };
             Ok((ctx, Default::default(), outcome))
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owned_root_resets_preserve_tenant_data_and_retire_the_current_branch()
+    -> buck2_error::Result<()> {
+        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let mut data = dice::DiceData::new();
+        data.set(7usize);
+        let root = dice.new_root_with_data(data).await;
+        let concurrency = ConcurrencyHandler::new_owned(dice.dupe(), root);
+        let updater = FreshInstanceWhenArmed {
+            armed: AtomicBool::new(true),
+        };
+        let (fresh, _) = run_counting(&concurrency, &updater).await?;
+        assert_ne!(fresh.branch(), root);
+        let transaction = dice.updater(fresh.branch()).commit().await;
+        assert_eq!(7, *transaction.global_data().get::<usize>().unwrap());
+        drop(transaction);
+        concurrency.retire();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dice.metrics().branch_count != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both the discarded and current roots should be released");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_root_replacement_releases_both_roots_on_retirement()
+    -> buck2_error::Result<()> {
+        let (dice, root) = make_default_dice().await;
+        let concurrency = ConcurrencyHandler::new_owned(dice.dupe(), root);
+        let command = concurrency.allocate_command_id();
+        let PreUpdateDecision::Update { attempt, .. } = concurrency
+            .coordinator
+            .begin(AdmissionRequest {
+                command_id: command,
+                command: CommandData {
+                    trace_id: TraceId::new(),
+                    display_command: "buck2 build".to_owned(),
+                    preemption_setting: PreemptibleWhen::Never,
+                    preempt: None,
+                },
+                is_nested: false,
+                exit_when: ExitWhen::ExitNever,
+            })
+            .await?
+        else {
+            panic!("an idle coordinator should prepare the update");
+        };
+        concurrency
+            .coordinator
+            .acquire_update(command, attempt)
+            .await?;
+        let fresh = dice.new_root_from(root).await;
+        let (response, receiver) = oneshot::channel();
+        drop(receiver);
+        assert!(
+            concurrency
+                .coordinator
+                .sender
+                .send(CoordinatorMessage::MoveToBranch {
+                    command,
+                    attempt,
+                    branch: fresh,
+                    retire_previous: true,
+                    response,
+                })
+                .is_ok(),
+            "the coordinator should still accept the cancelled replacement"
+        );
+        concurrency.retire();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dice.metrics().branch_count != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retirement should release the old root and the unobserved replacement");
+        Ok(())
+    }
+
+    fn retirement_request(command_id: CommandId) -> AdmissionRequest {
+        AdmissionRequest {
+            command_id,
+            command: CommandData {
+                trace_id: TraceId::new(),
+                display_command: "buck2 build".to_owned(),
+                preemption_setting: PreemptibleWhen::Never,
+                preempt: None,
+            },
+            is_nested: false,
+            exit_when: ExitWhen::ExitNever,
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_coordinators_reject_admission_before_existing_commands_release()
+    -> buck2_error::Result<()> {
+        let (dice, root) = make_default_dice().await;
+        let concurrency = ConcurrencyHandler::new_owned(dice, root);
+        let existing = concurrency.allocate_command_id();
+        concurrency
+            .coordinator
+            .begin(retirement_request(existing))
+            .await?;
+        concurrency.retire();
+        let rejected = concurrency
+            .coordinator
+            .begin(retirement_request(concurrency.allocate_command_id()))
+            .await;
+        assert!(
+            rejected.is_err(),
+            "retirement must reject admission while existing work drains"
+        );
+        concurrency.coordinator.release_and_wait(existing).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discarded_root_cleanup_retains_disk_ownership_after_coordinator_retirement()
+    -> buck2_error::Result<()> {
+        let (dice, root) = make_default_dice().await;
+        let held = dice.updater(root).commit().await;
+        let gate = Arc::new(Semaphore::new(1));
+        let ownership = Arc::new(gate.clone().acquire_owned().await?);
+        let concurrency = ConcurrencyHandler::new_owned_with_lifetime_guard(
+            dice.dupe(),
+            root,
+            Some(ownership.clone()),
+        );
+        drop(ownership);
+        let command = concurrency.allocate_command_id();
+        let PreUpdateDecision::Update { attempt, .. } = concurrency
+            .coordinator
+            .begin(retirement_request(command))
+            .await?
+        else {
+            panic!("an idle coordinator should grant an update");
+        };
+        concurrency
+            .coordinator
+            .acquire_update(command, attempt)
+            .await?;
+        let fresh = dice.new_root_from(root).await;
+        concurrency
+            .coordinator
+            .replace_root(command, attempt, fresh)
+            .await?;
+        concurrency.coordinator.release_and_wait(command).await?;
+        let sender = concurrency.coordinator.sender.clone();
+        concurrency.retire();
+        drop(concurrency);
+        tokio::time::timeout(Duration::from_secs(5), sender.closed())
+            .await
+            .expect("the current root should retire while the discarded root is still held");
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "discarded-root work must retain ownership after the current coordinator stops"
+        );
+        drop(held);
+        let _replacement = tokio::time::timeout(Duration::from_secs(5), gate.acquire())
+            .await
+            .expect("ownership should release after discarded-root work terminates")?;
+        Ok(())
     }
 
     /// A computed value with nothing behind it, whose value tells one computation from another.

@@ -9,8 +9,11 @@
  */
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use buck2_build_api::build_signals::HasBuildSignals;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::error::FileReadErrorContext;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
@@ -20,15 +23,16 @@ use buck2_core::bzl::ImportPath;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::name::CellName;
 use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_core::deprecation;
 use buck2_core::package::PackageLabel;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::soft_error;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_error::BuckErrorContext;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::BuckMutMap;
+use buck2_hash::BuckMutSet;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::nodes::unconfigured::TargetNode;
@@ -58,7 +62,6 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use ref_cast::RefCast;
-use tracing::warn;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Tier0)]
@@ -91,9 +94,8 @@ pub(crate) trait UqueryDelegate: Send + Sync {
 
     async fn eval_file_literal(&self, literal: &str) -> buck2_error::Result<FileSet>;
 
-    // Get all enclosing packages needed to compute owner function.
-    // This always includes the immediate enclosing package of the path but can also include
-    // all parent packages if the package matches `project.package_boundary_exceptions` buckconfig.
+    // Every package enclosing the path, not only the nearest one, since a target may name
+    // sources from a directory that is itself a package.
     async fn get_enclosing_packages(
         &self,
         path: &CellPath,
@@ -117,6 +119,10 @@ pub(crate) struct UqueryEnvironment<'c> {
     delegate: &'c dyn UqueryDelegate,
     literals: Arc<dyn QueryLiterals<TargetNode> + 'c>,
     allow_partial_graph: bool,
+    /// Packages whose load this environment has already credited to a
+    /// requester, or that a literal loaded; only the first request for a
+    /// package is the one that started its load.
+    reported_loads: Mutex<BuckMutSet<PackageLabel>>,
 }
 
 pub(crate) struct PreresolvedQueryLiterals<T: QueryTarget> {
@@ -157,6 +163,29 @@ impl<T: QueryTarget> PreresolvedQueryLiterals<T> {
     }
 }
 
+impl PreresolvedQueryLiterals<TargetNode> {
+    /// Packages of the targets the literals resolved to.
+    pub(crate) fn packages(&self) -> BuckMutSet<PackageLabel> {
+        let mut packages = BuckMutSet::default();
+        let mut last: Option<PackageLabel> = None;
+        for targets in self
+            .resolved_literals
+            .values()
+            .filter_map(|r| r.as_ref().ok())
+        {
+            for target in targets.iter() {
+                let pkg = target.label().pkg();
+                // Targets of one package are adjacent; skip rehashing them.
+                if last.as_ref() != Some(&pkg) {
+                    packages.insert(pkg.dupe());
+                    last = Some(pkg);
+                }
+            }
+        }
+        packages
+    }
+}
+
 #[async_trait]
 impl<T: QueryTarget> QueryLiterals<T> for PreresolvedQueryLiterals<T> {
     async fn eval_literals(
@@ -184,12 +213,14 @@ impl<'c> UqueryEnvironment<'c> {
     pub(crate) fn new(
         delegate: &'c dyn UqueryDelegate,
         literals: Arc<dyn QueryLiterals<TargetNode> + 'c>,
+        literal_packages: BuckMutSet<PackageLabel>,
         allow_partial_graph: bool,
     ) -> Self {
         Self {
             delegate,
             literals,
             allow_partial_graph,
+            reported_loads: Mutex::new(literal_packages),
         }
     }
 
@@ -222,6 +253,28 @@ impl QueryEnvironment for UqueryEnvironment<'_> {
 
     async fn get_node(&self, node_ref: &TargetLabel) -> buck2_error::Result<Self::Target> {
         UqueryEnvironment::get_node(self, node_ref).await
+    }
+
+    async fn get_node_from(
+        &self,
+        node_ref: &TargetLabel,
+        requester: Option<&TargetLabel>,
+    ) -> buck2_error::Result<Self::Target> {
+        // The traversal, not a tracked computation, is what asks for this package, so
+        // tell build signals which node's expansion requested it, once the request returns.
+        let report = requester.filter(|from| {
+            from.pkg() != node_ref.pkg()
+                && self.reported_loads.lock().unwrap().insert(node_ref.pkg())
+        });
+        let requested_at = Instant::now();
+        let node = UqueryEnvironment::get_node(self, node_ref).await;
+        if let Some(from) = report {
+            let ctx = self.delegate.ctx();
+            if let Some(signals) = ctx.per_transaction_data().get_build_signals() {
+                signals.load_discovered(node_ref.pkg(), from.pkg(), requested_at);
+            }
+        }
+        node
     }
 
     async fn get_node_for_default_configured_target(
@@ -299,7 +352,6 @@ impl QueryEnvironment for UqueryEnvironment<'_> {
         for path in paths.iter() {
             // need to explicitly track this rather than checking for changes to result set since the owner might
             // already be in the set.
-            let mut found_owner = false;
             match self.delegate.get_enclosing_packages(path).await {
                 Ok(packages) => {
                     let package_futs = packages
@@ -332,7 +384,6 @@ impl QueryEnvironment for UqueryEnvironment<'_> {
 
                     for nodes in buck2_util::future::join_all(package_futs).await.into_iter() {
                         for node in nodes?.into_iter() {
-                            found_owner = true;
                             result.insert(node);
                         }
                     }
@@ -342,9 +393,6 @@ impl QueryEnvironment for UqueryEnvironment<'_> {
                     // just wants to know the target owning the file if it exists.
                 }
             };
-            if !found_owner {
-                warn!("No owner was found for {}", path);
-            }
         }
         Ok(result)
     }
@@ -406,7 +454,7 @@ pub(crate) async fn validate_owner_paths(
             .await
             .without_package_context_information()
         {
-            soft_error!("owner_invalid_path", error, deprecation: true)?;
+            deprecation!("owner_invalid_path", error, owner: "ianc", started: "2026-10-12");
         }
     }
     Ok(())

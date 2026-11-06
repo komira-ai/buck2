@@ -153,6 +153,7 @@ message ClientContext {
   bool skip_targets_with_duplicate_names = 82;
   string trace_id = 9;
   bool reuse_current_config = 10;
+  bool reuse_current_config_implicitly = 85;
   optional string daemon_uuid = 11;
   repeated string sanitized_argv = 12;
   enum HostArchOverride {
@@ -211,6 +212,14 @@ message ClientContext {
 
   // Stable address of the repository state selected by this client.
   optional TenantIdentity tenant_identity = 28;
+
+  // JSON containing only InvocationBuckSettings. Missing overrides use the
+  // setting's defaults for this command.
+  optional string invocation_settings = 29;
+
+  // JSON containing only DiceBuckSettings, the per-invocation sections the
+  // daemon injects into DICE. Missing overrides use the setting's defaults.
+  optional string dice_settings = 30;
 }
 
 message TargetsRequest {
@@ -884,6 +893,26 @@ message UnstableListTenantsResponse {
   repeated UnstableTenantInfo tenants = 1;
 }
 
+message EvictTenantRequest {
+  ClientContext context = 1;
+}
+
+message EvictTenantResponse {
+  bool evicted = 1;
+  uint64 generation = 2;
+  bool shutting_down = 3;
+}
+
+message EvictProjectTenantsRequest {
+  ClientContext context = 1;
+  optional string isolation = 2;
+}
+
+message EvictProjectTenantsResponse {
+  repeated uint64 generations = 1;
+  bool shutting_down = 2;
+}
+
 message UnstableDiceDumpRequest {
   enum DiceDumpFormat {
     TSV = 0;
@@ -1004,6 +1033,8 @@ message CleanStaleRequest {
   // Resolve the cleanup TTL and low-disk behavior from the daemon's clean-stale
   // buckconfig. Explicit cleanup policy fields above are ignored when set.
   bool use_configured_policy = 8;
+  // What issued the request; logged on the resulting `CleanStaleResult`.
+  buck.data.CleanStaleResult.Origin origin = 9;
 }
 
 message CleanStaleResponse {
@@ -1150,6 +1181,9 @@ service DaemonApi {
       returns (UnstableAllocatorStatsResponse);
   rpc Unstable_ListTenants(UnstableListTenantsRequest)
       returns (UnstableListTenantsResponse);
+  rpc EvictTenant(EvictTenantRequest) returns (EvictTenantResponse);
+  rpc EvictProjectTenants(EvictProjectTenantsRequest)
+      returns (EvictProjectTenantsResponse);
 
   /// Requests the daemon dump the DICE graph to a directory.
   rpc Unstable_DiceDump(UnstableDiceDumpRequest)

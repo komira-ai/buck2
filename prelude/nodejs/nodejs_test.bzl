@@ -76,7 +76,7 @@ def _staged_srcs(ctx: AnalysisContext) -> (dict[str, Artifact], dict[str, str]):
         src for src in ctx.attrs.srcs if _emitted_path(src.short_path) != None or (src.short_path.endswith(".json") and src.short_path != "package.json")
     ]
     package_json = [src for src in ctx.attrs.srcs if src.short_path == "package.json"]
-    dep_infos = get_nodejs_dep_infos(ctx.attrs.deps, consumer_label = ctx.label)
+    dep_infos = get_nodejs_dep_infos(ctx.attrs.deps, consumer_label = ctx.label, allow_data = True)
     emit = compile_typescript(
         actions = ctx.actions,
         label = ctx.label,
@@ -113,8 +113,17 @@ def _jest_install(ctx: AnalysisContext) -> Artifact:
         fail('{}: framework = "jest" requires `jest` on the nodejs toolchain, or `test_runner`'.format(ctx.label))
     return jest
 
+def _vitest_install(ctx: AnalysisContext) -> Artifact:
+    if ctx.attrs.test_runner != None:
+        return get_nodejs_tree_info(ctx.attrs.test_runner, consumer_label = ctx.label, attr = "test_runner").node_modules
+    vitest = ctx.attrs._nodejs_toolchain[NodejsToolchainInfo].vitest
+    if vitest == None:
+        fail('{}: framework = "vitest" requires `vitest` on the nodejs toolchain, or `test_runner`'.format(ctx.label))
+    return vitest
+
 def _framework_command(ctx: AnalysisContext) -> struct:
     jest = None
+    vitest = None
     if ctx.attrs.framework == "jest":
         if ctx.attrs.library != None:
             fail(
@@ -123,19 +132,30 @@ def _framework_command(ctx: AnalysisContext) -> struct:
                 )
             )
         jest = _jest_install(ctx)
+    if ctx.attrs.framework == "vitest":
+        if ctx.attrs.library != None:
+            fail(
+                '{}: `library` cannot be combined with framework = "vitest", which ignores test files under `node_modules`, where `library` stages `entry_point`; list the test files in `srcs` and the library in `deps`'.format(
+                    ctx.label
+                )
+            )
+        vitest = _vitest_install(ctx)
     if ctx.attrs.main != None:
         fail('{}: `main` requires framework = "none"; list the test files in `srcs`'.format(ctx.label))
-    if ctx.attrs.args and jest == None:
+    if ctx.attrs.args and jest == None and vitest == None:
         fail(
             '{}: `args` cannot be combined with framework = "{}", which takes no script arguments; use framework = "none" to pass `args` to `main`'.format(
                 ctx.label, ctx.attrs.framework
             )
         )
+    for attr in ("coverage_prefix", "coverage_paths"):
+        if getattr(ctx.attrs, attr) != None and jest == None and vitest == None:
+            fail('{}: `{}` requires framework = "jest" or "vitest"'.format(ctx.label, attr))
     for reserved in ("LIST_COMMAND", "TEST_COMMAND"):
         if reserved in ctx.attrs.env:
             fail('{}: `env` cannot set `{}` with framework = "{}", which uses it to list and run tests'.format(ctx.label, reserved, ctx.attrs.framework))
     by_path, sources = _staged_srcs(ctx)
-    if jest != None:
+    if jest != None or vitest != None:
         mains = by_path
         srcs = dict(by_path)
         if ctx.attrs.config != None:
@@ -147,8 +167,9 @@ def _framework_command(ctx: AnalysisContext) -> struct:
         mains = _node_test_files(ctx, by_path)
         srcs = by_path
 
-    # Jest looks for tests under a root directory, and emitted files exist only in the staged directory.
-    staged = stage_nodejs_entries(ctx, mains, mains_attr = "`srcs`", staged_attrs = "`srcs`", srcs = srcs, stage = jest != None or ctx.attrs.tsconfig != None)
+    staged = stage_nodejs_entries(
+        ctx, mains, mains_attr = "`srcs`", staged_attrs = "`srcs`", srcs = srcs, stage = jest != None or vitest != None or ctx.attrs.tsconfig != None
+    )
     args = cmd_args(ctx.attrs._test_adapter, "--framework", ctx.attrs.framework, hidden = staged.hidden)
     for arg in ctx.attrs.node_args:
         args.add("--node-arg", arg)
@@ -156,6 +177,20 @@ def _framework_command(ctx: AnalysisContext) -> struct:
         args.add("--jest", jest, "--root", staged.runtime)
         if ctx.attrs.config != None:
             args.add("--config", cmd_args(staged.runtime, format = "{}/" + ctx.attrs.config.short_path))
+        if ctx.attrs.coverage_prefix != None:
+            args.add("--coverage-prefix", ctx.attrs.coverage_prefix)
+        if ctx.attrs.coverage_paths != None:
+            args.add("--coverage-paths", json.encode(ctx.attrs.coverage_paths))
+        for arg in ctx.attrs.args:
+            args.add("--arg", arg)
+    if vitest != None:
+        args.add("--vitest", vitest, "--root", staged.runtime)
+        if ctx.attrs.config != None:
+            args.add("--config", cmd_args(staged.runtime, format = "{}/" + ctx.attrs.config.short_path))
+        if ctx.attrs.coverage_prefix != None:
+            args.add("--coverage-prefix", ctx.attrs.coverage_prefix)
+        if ctx.attrs.coverage_paths != None:
+            args.add("--coverage-paths", json.encode(ctx.attrs.coverage_paths))
         for arg in ctx.attrs.args:
             args.add("--arg", arg)
     for entry in staged.entries:
@@ -163,12 +198,12 @@ def _framework_command(ctx: AnalysisContext) -> struct:
     return struct(dir = staged.dir, merged = staged.runtime, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
 
 def nodejs_test_impl(ctx: AnalysisContext) -> list[Provider]:
-    if ctx.attrs.framework != "jest":
+    if ctx.attrs.framework not in ("jest", "vitest"):
         for attr in ("config", "test_runner"):
             if getattr(ctx.attrs, attr) != None:
-                fail('{}: `{}` requires framework = "jest"'.format(ctx.label, attr))
+                fail('{}: `{}` requires framework = "jest" or "vitest"'.format(ctx.label, attr))
     if ctx.attrs.tsconfig != None and ctx.attrs.framework == "none":
-        fail('{}: `tsconfig` requires framework = "node" or "jest"; framework = "none" runs `main` as it is'.format(ctx.label))
+        fail('{}: `tsconfig` requires framework = "node", "jest" or "vitest"; framework = "none" runs `main` as it is'.format(ctx.label))
     command = build_nodejs_command(ctx) if ctx.attrs.framework == "none" else _framework_command(ctx)
     cmd = cmd_args(command.output.cmd, hidden = command.resources)
     if ctx.attrs.framework == "none":
@@ -230,16 +265,56 @@ nodejs_test = prelude_rule(
     staged directory. `args` are passed to Jest, except the watch modes,
     the flags the adapter sets (`--ci`, `--watchman`, `--config`,
     `--json`, `--outputFile`, `--listTests`, `--runTestsByPath`,
-    `--testNamePattern`) and the flags that change which test files run
-    (`--onlyChanged`, `--onlyFailures`, `--changedSince`,
-    `--changedFilesWithAncestor`, `--lastCommit`, `--findRelatedTests`,
-    `--shard`), which fail the test.
+    `--testNamePattern`, `--coverage`/`--collectCoverage`,
+    `--coverageReporters`, `--coverageDirectory`) and the flags that change
+    which test files run (`--onlyChanged`, `--onlyFailures`,
+    `--changedSince`, `--changedFilesWithAncestor`, `--lastCommit`,
+    `--findRelatedTests`, `--shard`), which fail the test. Coverage is
+    collected as for `"vitest"` below, with Jest's
+    `--coverage --coverageReporters=json`; the Jest config decides which
+    files are instrumented (`collectCoverageFrom`,
+    `coveragePathIgnorePatterns`).
 
-    `tsconfig`, with `"node"` or `"jest"`, compiles the `.ts`, `.tsx`, `.mts`
+    `"vitest"` runs the test files with Vitest from `test_runner` (a
+    `nodejs_node_modules` target), or the nodejs toolchain's `vitest`. Its
+    test files are the `srcs` that the Vitest config selects, as
+    `vitest list --filesOnly` reports them; `library` cannot be set.
+    `config`, a Vitest config file, is staged at its short path and passed
+    with `--config`; without it, Vitest's own config discovery under the
+    staged directory applies. `args` are passed to Vitest, except the
+    flags the adapter sets (`run`, `--root`, `--config`, `--reporter`,
+    `--outputFile`, `--testNamePattern`, the `--coverage*` flags, and
+    `list`/`--filesOnly`/`--json`) and
+    the flags that change which test files run (`--changed`, `--related`,
+    `--shard`, `--dir`, `--exclude`), which fail the test. Without
+    `tsconfig`, the `srcs` are staged as they are and Vitest transpiles
+    TypeScript itself; a type error then fails the test, not the build.
+    When TPX coverage collection is active
+    (`COVERAGE_COLLECTION_OUTPUT_FILE` is set, as it is for targets with
+    the `tpx:supports_coverage` label), the adapter runs Vitest with
+    `--coverage --coverage.reporter=json`, writing each Vitest run's
+    report to a directory of its own under `COVERAGE_COLLECTION_TMPDIR`
+    (or a temporary directory), then merges the reports and writes TPX coverage
+    JSONL to `COVERAGE_COLLECTION_OUTPUT_FILE`: one
+    `{"filepath", "covered_lines", "executable_lines"}` object per file
+    (0-based lines, from the Istanbul `statementMap`), for files under
+    the staged directory outside `node_modules`. `filepath` is the path
+    relative to the staged directory, prefixed with `coverage_prefix`
+    when it is set, so a caller whose staged files mirror a project
+    subtree (for example `coverage_prefix =
+    "xplat/wearable/tools/js/core_utils_common"`) gets paths relative
+    to the repository root. `coverage_paths`, when set, keeps only the
+    files whose `filepath` is one of its entries or under one of them, as
+    for selective coverage, where the `fb_native` wrapper sets it from
+    `code_coverage.file_path_filter` and `folder_path_filter`; `[]` keeps
+    none. A missing or unreadable coverage report is a run failure.
+
+    `tsconfig`, with `"node"`, `"jest"` or `"vitest"`, compiles the `.ts`, `.tsx`, `.mts`
     and `.cts` `srcs` (not declarations) together with the toolchain's
-    `tsc`, as `nodejs_library` compiles its `srcs`, against `deps`, the
-    third-party trees and the `.json` `srcs` they import, then stages each
-    TypeScript source as the file `tsc` emits for it:
+    `tsc`, as `nodejs_library` compiles its `srcs`, against the
+    `nodejs_library` `deps`, the third-party trees and the `.json` `srcs`
+    they import, then stages each TypeScript source as the file `tsc`
+    emits for it:
     its short path with the extension `.js`, `.mjs` or `.cjs` (`.js` for
     `.tsx`, so `jsx` must not be `preserve`). A `package.json` in `srcs`
     decides the emitted module format. Test files are then selected among
@@ -249,7 +324,7 @@ nodejs_test = prelude_rule(
 
     The other `srcs` are helpers, not run, and `main` cannot be set.
     Without `library`, the test fails if no `srcs` entry is a test file: at
-    analysis with `"node"`, when listing or running with `"jest"`.
+    analysis with `"node"`, when listing or running with `"jest"` or `"vitest"`.
     `node_args` go to the Node processes running the test files. Each test
     file gets a result named by its short path (by the `entry_point` for
     `library`), and each test that finishes gets one named
@@ -257,13 +332,14 @@ nodejs_test = prelude_rule(
     `describe` block gets one only when it is skipped or fails on its own,
     and a test that fails only because a subtest failed gets none.
     Same-named sibling tests share a result name. A test file
-    fails if any of its tests fails. With `"jest"`, it also fails if it
-    fails to load or Jest reports no result for it. With `"node"`, it also
+    fails if any of its tests fails. With `"jest"` or `"vitest"`, it also fails if it
+    fails to load or the runner reports no result for it. With `"node"`, it also
     fails if its process exits non-zero or before node:test reports the
     end of the run, or its events cannot be read in full, naming tests
     that never finished. With `"jest"`, an unsuccessful Jest run with no
     failed test file, as for a missed coverage threshold, is a run
-    failure.
+    failure. With `"vitest"`, an unsuccessful Vitest run with no failed
+    test file is likewise a run failure.
 
     The test is an external runner test of type `js_test`. `LIST_COMMAND`
     writes one JSON line `{"testcase": <test file>}` per test file to the
@@ -273,7 +349,8 @@ nodejs_test = prelude_rule(
     set, writes results there in the test result output spec. A filter
     names a test file, a `describe` block (every test in it) or a test, and
     fails if it matches no test. With `"jest"`, a filter below a test file
-    ignores case. With `"node"`, filtering below a test file
+    ignores case. With `"vitest"`, a filter below a test file is matched
+    as a regular expression against the full test name, case-sensitively. With `"node"`, filtering below a test file
     needs Node 22 or later and cannot select a subtest of a `test()`. Run
     on its own, as by `buck2 run`, the test writes no results and exits non-zero
     on failure.
@@ -286,7 +363,7 @@ nodejs_test = prelude_rule(
     a composed `node_modules`, `srcs` and `main` beside it at their short
     paths, which must not collide, and a root `package.json`. When
     `library`, `deps`, a third-party tree or a `resources` dict is
-    involved, or with `"jest"`, the test runs from `[dir]`; with
+    involved, or with `"jest"` or `"vitest"`, the test runs from `[dir]`; with
     `library`, the `entry_point` runs in the library's package under
     `node_modules`. Otherwise, the test files run in place, and files they
     import relatively must be in `srcs` to be build inputs. `NODE_PATH` is
@@ -295,7 +372,9 @@ nodejs_test = prelude_rule(
     that sets `env` on Unix and Windows. `library`, `entry_point` (and its
     default) and `node_modules` (unset inherits the trees of `library` and
     `deps`; a list replaces them; `[]` means none) follow the same rules as
-    `nodejs_binary`, as do package staging and `.d.ts` stripping.
+    `nodejs_binary`, as do package staging, `.d.ts` stripping and `deps`
+    that are not `nodejs_library` targets, which are data deps staged in
+    `[dir]`.
     `resources`, and with `"none"` a directory `main` with `entry_point`,
     also follow `nodejs_binary`. `resources` that are not staged are hidden
     inputs of the test command.""",
@@ -307,10 +386,12 @@ nodejs_test = prelude_rule(
             "main": attrs.option(attrs.source(allow_directory = True), default = None),
             "srcs": attrs.list(attrs.source(), default = []),
             "resources": attrs.named_set(attrs.source(allow_directory = True), sorted = False, default = []),
-            "framework": attrs.enum(["node", "jest", "none"], default = "node"),
+            "framework": attrs.enum(["node", "jest", "vitest", "none"], default = "node"),
             "config": attrs.option(attrs.source(allow_directory = False), default = None),
             "tsconfig": attrs.option(attrs.source(allow_directory = False), default = None),
             "test_runner": attrs.option(attrs.dep(), default = None),
+            "coverage_prefix": attrs.option(attrs.string(), default = None),
+            "coverage_paths": attrs.option(attrs.list(attrs.string()), default = None),
             "args": attrs.list(attrs.arg(), default = []),
             "node_args": attrs.list(attrs.string(), default = []),
             "env": attrs.dict(attrs.string(), attrs.arg(), default = {}),
@@ -318,7 +399,7 @@ nodejs_test = prelude_rule(
             "library": attrs.option(attrs.dep(), default = None),
             "entry_point": attrs.option(attrs.string(), default = None),
             "node_modules": attrs.option(attrs.list(attrs.dep()), default = None),
-            "supports_test_execution_caching": attrs.bool(default = False),
+            "supports_test_execution_caching": attrs.bool(default = True),
             "_nodejs_toolchain": toolchains_common.nodejs(),
             "_target_os_type": buck.target_os_type_arg(),
             "_test_adapter": attrs.default_only(attrs.source(default = "prelude//nodejs/tools:nodejs_test_adapter.cjs")),

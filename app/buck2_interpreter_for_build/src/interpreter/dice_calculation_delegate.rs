@@ -17,7 +17,6 @@ use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::error::FileReadErrorContext;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::dice::OpaqueLegacyBuckConfigOnDice;
-use buck2_common::package_boundary::HasPackageBoundaryExceptions;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
@@ -103,6 +102,13 @@ pub trait HasCalculationDelegate<'c, 'd> {
         &'c mut self,
         path: OwnedStarlarkPath,
     ) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>>;
+
+    /// Get calculator for evaluating a `package`'s files: its `BUCK` file and
+    /// its `PACKAGE` file, whichever name the latter uses.
+    async fn get_interpreter_calculator_for_package(
+        &'c mut self,
+        package: PackageLabel,
+    ) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>>;
 }
 
 #[async_trait]
@@ -111,6 +117,37 @@ impl<'c, 'd> HasCalculationDelegate<'c, 'd> for DiceComputations<'d> {
         &'c mut self,
         path: OwnedStarlarkPath,
     ) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>> {
+        let build_file_cell = path.borrow().build_file_cell();
+        let dir = path
+            .borrow()
+            .path()
+            .parent()
+            .expect("starlark path to have parent")
+            .to_owned();
+        calculator_for_dir(self, dir, build_file_cell).await
+    }
+
+    async fn get_interpreter_calculator_for_package(
+        &'c mut self,
+        package: PackageLabel,
+    ) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>> {
+        calculator_for_dir(
+            self,
+            package.as_cell_path().to_owned(),
+            BuildFileCell::new(package.cell_name()),
+        )
+        .await
+    }
+}
+
+/// The interpreter configuration is per directory and build-file cell; see
+/// `InterpreterConfigForDirKey`.
+async fn calculator_for_dir<'c, 'd>(
+    ctx: &'c mut DiceComputations<'d>,
+    dir: CellPath,
+    build_file_cell: BuildFileCell,
+) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>> {
+    {
         #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
         #[display("{}@{}", _0, _1)]
         #[pagable_typetag(dice::DiceKeyDyn)]
@@ -155,23 +192,15 @@ impl<'c, 'd> HasCalculationDelegate<'c, 'd> for DiceComputations<'d> {
             }
         }
 
-        let build_file_cell = path.borrow().build_file_cell();
-        let configs = self
-            .compute(&InterpreterConfigForDirKey(
-                path.borrow()
-                    .path()
-                    .parent()
-                    .expect("starlark path to have parent")
-                    .to_owned(),
-                build_file_cell,
-            ))
+        let configs = ctx
+            .compute(&InterpreterConfigForDirKey(dir, build_file_cell))
             .await?
             .as_ref()
             .duped_err()?;
 
         Ok(DiceCalculationDelegate {
             build_file_cell,
-            ctx: self,
+            ctx,
             configs,
         })
     }
@@ -432,12 +461,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 _cancellation: &CancellationContext,
             ) -> Self::Value {
                 for package_file_path in PackageFilePath::for_dir(self.0.as_cell_path()) {
-                    if DiceFileComputations::exists_matching_exact_case(
-                        ctx,
-                        *package_file_path.path(),
-                    )
-                    .await?
-                    {
+                    if DiceFileComputations::exists(ctx, *package_file_path.path()).await? {
                         return Ok(Some(package_file_path));
                     }
                 }
@@ -539,11 +563,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 ctx: &mut DiceComputations,
                 cancellation: &CancellationContext,
             ) -> Self::Value {
-                let mut interpreter = ctx
-                    .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-                        PackageFilePath::package_file_for_dir(self.0.as_cell_path()),
-                    ))
-                    .await?;
+                let mut interpreter = ctx.get_interpreter_calculator_for_package(self.0).await?;
                 interpreter
                     .eval_package_file_uncached(self.0.dupe(), cancellation)
                     .await
@@ -659,10 +679,6 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 .eval_package_file_for_build_file(package.dupe(), &listing)
                 .await?;
 
-            let package_boundary_exception = self
-                .ctx
-                .has_package_boundary_exception(package.as_cell_path())
-                .await?;
             let buckconfig = self.get_legacy_buck_config_for_starlark().await?;
             let root_buckconfig = self.ctx.get_legacy_root_config_on_dice().await?;
             let module_id = build_file_path.to_string();
@@ -687,7 +703,6 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                         &mut buckconfigs,
                         listing,
                         super_package,
-                        package_boundary_exception,
                         ast,
                         deps.get_loaded_modules(),
                         provider,

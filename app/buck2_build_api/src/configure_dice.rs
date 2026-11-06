@@ -14,17 +14,21 @@ use std::sync::Arc;
 
 use buck2_common::dice::cells::SetCellResolver;
 use buck2_common::dice::data::SetIoProvider;
+use buck2_common::ignores::ignore_set::IgnoreSet;
+use buck2_common::ignores::ignore_set::SetIgnoreSet;
 use buck2_common::io::IoProvider;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::dice::SetLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
-use buck2_common::settings::BuckSettings;
-use buck2_common::settings::dice::SetBuckSettings;
 use buck2_common::tenting::SetTentingAclProvider;
 use buck2_common::tenting::TentingAclProvider;
 use buck2_core::rollout_percentage::RolloutPercentage;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::SetDigestConfig;
+use buck2_settings::DaemonBuckSettings;
+use buck2_settings::DiceBuckSettings;
+use buck2_settings::dice::SetBuckSettings;
+use buck2_settings::dice::SetDiceBuckSettings;
 use dice::BranchId;
 use dice::DetectCycles;
 use dice::Dice;
@@ -43,7 +47,8 @@ use crate::build::detailed_aggregated_metrics::events::DetailedAggregatedMetrics
 /// Configuration which is fixed for the lifetime of a DICE engine.
 ///
 /// Every repository root attached to a shared engine must resolve to the same
-/// values. Root-specific inputs belong in [`DiceData`] instead.
+/// values. Root-specific facilities belong in [`DiceData`]; inputs that affect
+/// cached values must be tracked through injected keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiceEngineConfiguration {
     dice_state_path: Option<PathBuf>,
@@ -108,6 +113,42 @@ impl DiceEngineConfiguration {
         })
     }
 
+    /// Resolved paging path, including any environment override.
+    pub fn dice_state_path(&self) -> Option<&Path> {
+        self.dice_state_path.as_deref()
+    }
+
+    /// Open storage and construct an engine with default root data.
+    pub fn build(&self, data: DiceData) -> buck2_error::Result<Arc<Dice>> {
+        let mut dice = DiceDataBuilder::from(data);
+
+        // Opt-in pagable storage, enabling `Dice::page_out()` to serialize node
+        // values to disk (backend chosen by `pagable_storage_backend`) via `buck2
+        // debug hydration`. `dice_state_path` is `Some` when
+        // `hydration.enable_paging` is set (its value is the default path,
+        // under buck-out). The `BUCK2_DICE_DB_PATH` override (used by benchmarks)
+        // takes precedence and picks the path.
+        if let Some(path) = &self.dice_state_path {
+            let mut storage =
+                DiceStorage::open(path, self.pagable_storage_backend).map_err(|e| {
+                    buck2_error::conversion::from_any_with_tag(
+                        e,
+                        buck2_error::ErrorTag::Environment,
+                    )
+                })?;
+            storage.set_page_out_policy(self.page_out_policy);
+            storage.set_eviction_policy(self.eviction_policy);
+            if self.defer_field_reads {
+                storage
+                    .storage_context()
+                    .get_or_init(|| DeferredFieldReadsEnabled);
+            }
+            dice.set_pagable_storage(storage);
+        }
+
+        Ok(dice.build(DetectCycles::Enabled))
+    }
+
     /// Reject a root whose settings would change an already-running engine.
     pub fn ensure_compatible(&self, other: &Self) -> buck2_error::Result<()> {
         if self != other {
@@ -124,9 +165,10 @@ impl DiceEngineConfiguration {
 pub struct DiceRootConfiguration<'a> {
     pub io: Arc<dyn IoProvider>,
     pub digest_config: DigestConfig,
+    pub ignore_set: Arc<IgnoreSet>,
     pub root_config: Option<&'a LegacyBuckConfig>,
     pub tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
-    pub buck_settings: BuckSettings,
+    pub buck_settings: DaemonBuckSettings,
 }
 
 /// Construct the immutable data associated with one repository root tree.
@@ -136,6 +178,7 @@ pub fn configure_dice_data_for_buck(
     let DiceRootConfiguration {
         io,
         digest_config,
+        ignore_set,
         root_config,
         tenting_acl_provider,
         buck_settings,
@@ -143,6 +186,7 @@ pub fn configure_dice_data_for_buck(
     let mut data = DiceData::new();
     data.set_io_provider(io);
     data.set_digest_config(digest_config);
+    data.set_ignore_set(ignore_set);
     data.set_buck_settings(buck_settings);
     data.set_tenting_acl_provider(tenting_acl_provider);
     let invalidation_tracking_enabled = match root_config {
@@ -165,12 +209,13 @@ pub fn configure_dice_data_for_buck(
 pub async fn configure_dice_for_buck(
     io: Arc<dyn IoProvider>,
     digest_config: DigestConfig,
+    ignore_set: Arc<IgnoreSet>,
     root_config: Option<&LegacyBuckConfig>,
     tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
-    buck_settings: BuckSettings,
+    buck_settings: DaemonBuckSettings,
     // Path to open pagable DICE storage at, or `None` to leave paging disabled.
     dice_state_path: Option<&Path>,
-    // On-disk backend for pagable storage (`buck2_hydration.pagable_storage_backend`).
+    // On-disk backend for pagable storage (`hydration.pagable_storage_backend`).
     pagable_storage_backend: PagableStorageBackend,
     // Which values a page-out writes (`hydration.page_out_policy`).
     page_out_policy: PageOutPolicy,
@@ -189,38 +234,19 @@ pub async fn configure_dice_for_buck(
     let data = configure_dice_data_for_buck(DiceRootConfiguration {
         io,
         digest_config,
+        ignore_set,
         root_config,
         tenting_acl_provider,
         buck_settings,
     })?;
-    let mut dice = DiceDataBuilder::from(data);
-
-    // Opt-in pagable storage, enabling `Dice::page_out()` to serialize node
-    // values to disk (backend chosen by `pagable_storage_backend`) via `buck2
-    // debug hydration`. `dice_state_path` is `Some` when
-    // `buck2_hydration.enable_paging` is set (its value is the default path,
-    // under buck-out). The `BUCK2_DICE_DB_PATH` override (used by benchmarks)
-    // takes precedence and picks the path.
-    if let Some(path) = &engine_config.dice_state_path {
-        let mut storage =
-            DiceStorage::open(path, engine_config.pagable_storage_backend).map_err(|e| {
-                buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment)
-            })?;
-        storage.set_page_out_policy(engine_config.page_out_policy);
-        storage.set_eviction_policy(engine_config.eviction_policy);
-        if engine_config.defer_field_reads {
-            storage
-                .storage_context()
-                .get_or_init(|| DeferredFieldReadsEnabled);
-        }
-        dice.set_pagable_storage(storage);
-    }
-
-    let dice = dice.build(DetectCycles::Enabled);
+    let dice = engine_config.build(data)?;
     let root = dice.new_root().await;
     let mut dice_ctx = dice.updater(root);
     dice_ctx.set_none_cell_resolver()?;
     dice_ctx.set_none_legacy_config_external_data()?;
+    // Defaults until the first command injects its own, so that nothing
+    // computes against an uninjected key.
+    dice_ctx.set_dice_buck_settings(DiceBuckSettings::default())?;
     dice_ctx.commit().await;
 
     Ok((dice, root))

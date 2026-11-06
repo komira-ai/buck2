@@ -18,6 +18,7 @@ use buck2_client_ctx::daemon::client::connect::BootstrapBuckdClient;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_common::manifold::Bucket;
 use buck2_common::manifold::ManifoldClient;
+use buck2_core::warn_user_or_panic;
 use buck2_error::BuckErrorContext;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
@@ -39,7 +40,7 @@ pub async fn upload_dice_dump(
     let manifold_bucket = Bucket::RAGE_DUMPS;
     let manifold_filename = format!("flat/{manifold_id}_dice-dump.tar");
     let this_dump_folder_name = jiff::Timestamp::now()
-        .strftime("%Y-%m-%dT%H:%M:%S")
+        .strftime("%Y-%m-%dT%H-%M-%S")
         .to_string();
     DiceDump::new(buck_out_dice, &this_dump_folder_name)
         .upload(
@@ -158,7 +159,7 @@ impl Drop for DiceDump {
                 )
             })
         {
-            tracing::warn!("{:#}", e);
+            warn_user_or_panic!("rage_dice_dump_not_removed", e);
         };
     }
 }

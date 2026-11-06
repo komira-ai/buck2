@@ -20,11 +20,11 @@ use dice_core::CoreState;
 use dice_core::Env;
 use dice_core::KeyMap;
 use dice_core::Lookup;
-use dice_core::ValidSource;
 use dupe::Dupe;
 use pagable::DataKey;
 use smallvec::SmallVec;
 
+use crate::api::invalidation_tracking::InvalidationSources;
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::arc::Arc;
@@ -45,10 +45,8 @@ use crate::updater::ChangeType;
 use crate::value::DiceValidValue;
 use crate::value::MaybeResident;
 use crate::value::MaybeResidentComputedValue;
-use crate::value::MaybeValidDiceValue;
 use crate::value::PageOutResult;
 use crate::value::ResidentComputedValue;
-use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
 
 pub(crate) mod introspection;
@@ -59,22 +57,31 @@ mod tests;
 pub(crate) mod types;
 
 /// Dice's environment for the core state: the deps of a certificate keep their series-parallel
-/// shape, a claim carries the invalidation paths of its compute, and every assertion its
-/// invalidation source priority.
+/// shape, every assertion carries its invalidation source priority, and the attribute of a
+/// derivation is its invalidation sources.
 #[derive(Allocative)]
 pub(crate) struct DiceEnv;
 
 impl Env for DiceEnv {
     type Premises = SeriesParallelDeps;
-    type ClaimData = TrackedInvalidationPaths;
     type AssertionData = InvalidationSourcePriority;
+    type Attribute = InvalidationSources;
+    const EMPTY: InvalidationSources = InvalidationSources::NONE;
+
+    fn assertion(at: VersionNumber, priority: InvalidationSourcePriority) -> InvalidationSources {
+        InvalidationSources::source(priority, at)
+    }
+
+    fn combine(a: InvalidationSources, b: InvalidationSources) -> InvalidationSources {
+        a.merge(b)
+    }
 }
 
 pub(crate) type DiceCert = Cert<SeriesParallelDeps>;
 
 mini_vec::size_assert::words_of_type!(DiceCert, 4);
-mini_vec::size_assert::words_of_type!(dice_core::Claim<DiceEnv>, 3);
-mini_vec::size_assert::words_of_type!(dice_core::Slot<DiceEnv>, 5);
+mini_vec::size_assert::words_of_type!(dice_core::Claim<DiceEnv>, 4);
+mini_vec::size_assert::words_of_type!(dice_core::Slot<DiceEnv>, 6);
 mini_vec::size_assert::words_of_type!(KeyValues, 6);
 mini_vec::size_assert::words_of_type!(Candidate, 5);
 
@@ -108,6 +115,14 @@ impl KeyValues {
             .find_map(|(r, v)| (*r == revision).then_some(v))
     }
 
+    fn values(&self) -> impl Iterator<Item = &PagableValue> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut PagableValue> {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
+
     fn lifecycle(&self) -> fn(DiceValidValue) -> PagableValue {
         PagableValue::lifecycle_after(self.entries.last().map(|(_, v)| v))
     }
@@ -127,7 +142,7 @@ impl KeyValues {
     ) -> DiceValidValue {
         match self.entry_mut(revision) {
             Some(stored) => {
-                stored.make_resident(value, policy);
+                stored.make_resident(value, 0, policy);
                 stored.as_hydrated().expect("made resident above").dupe()
             }
             None => {
@@ -183,7 +198,7 @@ impl KeyValues {
         match self.entry_mut(revision) {
             Some(stored) => {
                 if let MaybeResident::Resident(value) = value {
-                    stored.make_resident(value, policy);
+                    stored.make_resident(value, 0, policy);
                 }
                 stored.as_maybe_resident()
             }
@@ -204,7 +219,7 @@ impl KeyValues {
         if self.injected {
             return c;
         }
-        for (_, value) in &self.entries {
+        for value in self.values() {
             match value {
                 PagableValue::PagedOut(_) => c.paged_out += 1,
                 PagableValue::NeverPagedOut(_) | PagableValue::Recomputed(_) => {
@@ -213,9 +228,10 @@ impl KeyValues {
                         c.candidates += 1;
                     }
                 }
-                PagableValue::Backed(_) => {
+                PagableValue::Backed(backed) => {
                     c.resident += 1;
                     c.backed += 1;
+                    c.backed_bytes += backed.serialized_bytes;
                 }
                 PagableValue::NonPageable(_) => c.resident += 1,
             }
@@ -231,6 +247,7 @@ struct Contribution {
     paged_out: usize,
     candidates: usize,
     backed: usize,
+    backed_bytes: u64,
 }
 
 /// The page-out candidate and backed-value indexes and the resident / paged-out tallies, kept
@@ -243,6 +260,7 @@ struct PagableIndex {
     /// Keys with at least one backed value, by `DiceKey::index`.
     backed: BitSet,
     backed_count: usize,
+    backed_bytes: u64,
     resident_count: usize,
     paged_out_count: usize,
 }
@@ -256,6 +274,7 @@ impl PagableIndex {
         self.paged_out_count = self.paged_out_count + after.paged_out - before.paged_out;
         self.candidate_count = self.candidate_count + after.candidates - before.candidates;
         self.backed_count = self.backed_count + after.backed - before.backed;
+        self.backed_bytes = self.backed_bytes + after.backed_bytes - before.backed_bytes;
         Self::track(
             &mut self.candidates,
             key,
@@ -276,6 +295,13 @@ impl PagableIndex {
             _ => {}
         }
     }
+}
+
+/// The keys with a backed value at one point, and a residency cutoff that excludes values
+/// backed after it.
+pub(crate) struct BackedSnapshot {
+    pub(crate) keys: Vec<DiceKey>,
+    pub(crate) cutoff: u64,
 }
 
 /// The core state with its values: what the actor thread operates on.
@@ -434,35 +460,25 @@ impl VersionedGraph {
             return VersionedGraphResult::Unknown {
                 candidate: None,
                 epsilon: EpsilonToken::INITIAL,
+                sources: InvalidationSources::NONE,
             };
         }
         match self.core.lookup(key, v) {
-            Lookup::Valid { revision, source } => {
-                let invalidation_paths = match &source {
-                    ValidSource::Claim { data, dirtied, .. } => {
-                        let mut paths = data.at_version(v);
-                        if let Some(dirtied) = dirtied {
-                            paths.update(&TrackedInvalidationPaths::new(
-                                dirtied.data,
-                                key,
-                                dirtied.version,
-                            ));
-                        }
-                        paths
-                    }
-                    ValidSource::Asserted { assertion } => {
-                        TrackedInvalidationPaths::new(assertion.data, key, assertion.version)
-                    }
-                };
-                VersionedGraphResult::Match {
-                    value: MaybeResidentComputedValue::new(
-                        self.stored(key, revision).into_payload(),
-                        invalidation_paths,
-                        revision,
-                    ),
-                }
-            }
-            Lookup::Unknown { candidate, epsilon } => {
+            Lookup::Valid {
+                revision,
+                attribute,
+            } => VersionedGraphResult::Match {
+                value: MaybeResidentComputedValue::new(
+                    self.stored(key, revision).into_payload(),
+                    attribute,
+                    revision,
+                ),
+            },
+            Lookup::Unknown {
+                candidate,
+                epsilon,
+                untracked,
+            } => {
                 let (cert, revalidatable) = match candidate {
                     Some(cert) => (Some(cert), true),
                     None => (self.core.nearest_certificate(key, v), false),
@@ -474,22 +490,28 @@ impl VersionedGraph {
                         revalidatable,
                     }),
                     epsilon,
+                    sources: untracked,
                 }
             }
         }
     }
 
-    /// Inputs for demand recovery, without returning the unreadable cached value again.
-    /// Asserted keys, including ordinary `Key`s set with `changed_to`, cannot be repaired by
-    /// a compute: their asserted value is authoritative and the core forbids writing a claim.
-    pub(crate) fn recovery_epsilon(&self, at: VersionedGraphKey) -> Option<EpsilonToken> {
+    /// Inputs for demand recovery, without returning the unreadable cached value again: the
+    /// untracked-input revision to stamp the recomputed certificate with, and the sources its
+    /// result starts from. Asserted keys, including ordinary `Key`s set with `changed_to`,
+    /// cannot be repaired by a compute: their asserted value is authoritative and the core
+    /// forbids writing a claim.
+    pub(crate) fn recovery_untracked(
+        &self,
+        at: VersionedGraphKey,
+    ) -> Option<(EpsilonToken, InvalidationSources)> {
         if self.core.is_asserted(at.k) {
             return None;
         }
         Some(if self.core.is_live(at.v.branch()) {
-            self.core.epsilon(at.k, at.v)
+            self.core.untracked(at.k, at.v)
         } else {
-            EpsilonToken::INITIAL
+            (EpsilonToken::INITIAL, InvalidationSources::NONE)
         })
     }
 
@@ -499,7 +521,7 @@ impl VersionedGraph {
         &mut self,
         at: VersionedGraphKey,
         update: ComputedValueUpdate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> ResidentComputedValue {
         let ComputedValueUpdate {
             value,
@@ -508,13 +530,10 @@ impl VersionedGraph {
         } = update;
         let key = at.k;
         if !self.core.is_live(at.v.branch()) {
-            // The revision is minted for the value but never stored; see `unretained`.
+            // The core knows nothing about the branch any more, so the certificate cannot be
+            // placed: the revision is minted for the value but nothing is retained.
             let revision = self.with_values(key, |kv| kv.mint.mint());
-            return ResidentComputedValue::new(
-                value,
-                invalidation_paths.for_dependent(key),
-                revision,
-            );
+            return ResidentComputedValue::new(value, invalidation_sources, revision);
         }
         debug_assert_eq!(
             epsilon,
@@ -539,8 +558,8 @@ impl VersionedGraph {
             }
         };
         let revision = cert.revision;
-        let paths = self.finish_update(at, cert, invalidation_paths);
-        ResidentComputedValue::new(value, paths, revision)
+        let sources = self.finish_update(at, cert, invalidation_sources);
+        ResidentComputedValue::new(value, sources, revision)
     }
 
     /// Reissues a candidate whose dependencies still hold; its value may remain paged out.
@@ -548,58 +567,49 @@ impl VersionedGraph {
         &mut self,
         at: VersionedGraphKey,
         candidate: Candidate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> MaybeResidentComputedValue {
         let revision = candidate.cert.revision;
         if !self.core.is_live(at.v.branch()) {
-            return Self::unretained(
-                at.k,
+            // The core knows nothing about the branch any more, so the certificate cannot be
+            // placed: the value goes back to the transaction as it is, and nothing is retained.
+            return MaybeResidentComputedValue::new(
                 candidate.entry.into_payload(),
-                invalidation_paths,
+                invalidation_sources,
                 revision,
             );
         }
         let policy = self.page_out_policy;
         let value = self.with_values(at.k, |kv| kv.restore(revision, candidate.entry, policy));
-        let paths = self.finish_update(at, candidate.cert, invalidation_paths);
-        MaybeResidentComputedValue::new(value.into_payload(), paths, revision)
+        let sources = self.finish_update(at, candidate.cert, invalidation_sources);
+        MaybeResidentComputedValue::new(value.into_payload(), sources, revision)
     }
 
+    /// Writes `cert` and returns the sources of the key at `at.v`: those of the claim now
+    /// covering it, or `invalidation_sources`, the transaction's own, if the write installed no
+    /// claim covering `at.v`.
     fn finish_update(
         &mut self,
         at: VersionedGraphKey,
         cert: Arc<DiceCert>,
-        invalidation_paths: TrackedInvalidationPaths,
-    ) -> TrackedInvalidationPaths {
+        invalidation_sources: InvalidationSources,
+    ) -> InvalidationSources {
         let key = at.k;
-        let invalidation_paths = invalidation_paths.for_dependent(key);
-        self.core.write(cert, invalidation_paths.dupe());
+        debug_assert_eq!(
+            invalidation_sources.merge(self.core.untracked(key, at.v).1),
+            invalidation_sources,
+            "a transaction's sources start from its key's own dirty"
+        );
+        self.core.write(cert);
         let core = &self.core;
         let policy = self.page_out_policy;
         Self::with_values_of(&mut self.values, &mut self.index, policy, key, |kv| {
             kv.entries.retain(|(r, _)| core.is_referenced(key, *r));
         });
-        let mut paths = invalidation_paths;
-        if let Some(dirtied) = self.core.dirtied_at(key, at.v) {
-            paths.update(&TrackedInvalidationPaths::new(
-                dirtied.data,
-                key,
-                dirtied.version,
-            ));
+        match self.core.lookup(key, at.v) {
+            Lookup::Valid { attribute, .. } => attribute,
+            Lookup::Unknown { .. } => invalidation_sources,
         }
-        paths
-    }
-
-    /// A write from a transaction on a deleted branch. The core knows nothing about the branch
-    /// any more, so the certificate cannot be placed: the value goes back to the transaction as
-    /// it is, and nothing is retained.
-    fn unretained(
-        key: DiceKey,
-        value: MaybeResident<MaybeValidDiceValue>,
-        invalidation_paths: TrackedInvalidationPaths,
-        revision: Revision,
-    ) -> MaybeResidentComputedValue {
-        MaybeResidentComputedValue::new(value, invalidation_paths.for_dependent(key), revision)
     }
 
     /// The number of keys the state holds anything for.
@@ -615,7 +625,7 @@ impl VersionedGraph {
                 index: index as u32,
             };
             if let Some(kv) = self.values.get(&key) {
-                for (_, value) in &kv.entries {
+                for value in kv.values() {
                     if value.is_page_out_candidate(self.page_out_policy) {
                         out.push((
                             key,
@@ -635,7 +645,7 @@ impl VersionedGraph {
             if kv.injected {
                 continue;
             }
-            for (_, value) in &kv.entries {
+            for value in kv.values() {
                 if let Some(data_key) = value.data_key() {
                     out.push((*key, data_key));
                 }
@@ -654,7 +664,7 @@ impl VersionedGraph {
             if kv.injected {
                 continue;
             }
-            for (_, value) in &kv.entries {
+            for value in kv.values() {
                 match value {
                     PagableValue::PagedOut(_) => paged_out.push(*key),
                     PagableValue::Backed(_) => {
@@ -674,6 +684,7 @@ impl VersionedGraph {
             paged_out: self.index.paged_out_count,
             candidates: self.index.candidate_count,
             backed: self.index.backed_count,
+            backed_bytes: self.index.backed_bytes,
         }
     }
 
@@ -692,16 +703,19 @@ impl VersionedGraph {
             PageOutResult {
                 serialized_value,
                 data_key,
+                serialized_bytes,
             },
         ) in keys
         {
             self.with_values(key, |kv| {
-                for (_, value) in kv.entries.iter_mut() {
+                for value in kv.values_mut() {
                     if value
                         .as_hydrated()
                         .is_some_and(|current| current.ptr_eq(&serialized_value))
                     {
-                        if value.row_committed(data_key, eviction_policy) == RowCommitted::Evicted {
+                        if value.row_committed(data_key, serialized_bytes, eviction_policy)
+                            == RowCommitted::Evicted
+                        {
                             evicted += 1;
                         }
                     }
@@ -711,24 +725,30 @@ impl VersionedGraph {
         evicted
     }
 
-    /// Evicts the backed values of up to `limit` keys, leaving their rows. Returns how many
-    /// values were evicted: zero only once no key has a backed value.
-    pub(crate) fn evict_backed(&mut self, limit: usize) -> u64 {
-        // Collected first: evicting a key's values takes it out of the index.
-        let keys: Vec<DiceKey> = self
-            .index
-            .backed
-            .iter()
-            .take(limit)
-            .map(|index| DiceKey {
-                index: index as u32,
-            })
-            .collect();
+    /// What is backed now, for an eviction sweep that must leave alone values backed after it
+    /// starts.
+    pub(crate) fn backed_snapshot(&self) -> BackedSnapshot {
+        BackedSnapshot {
+            keys: self
+                .index
+                .backed
+                .iter()
+                .map(|index| DiceKey {
+                    index: index as u32,
+                })
+                .collect(),
+            cutoff: lifecycle::residency_cutoff(),
+        }
+    }
+
+    /// Evicts the values of `keys` backed no later than `cutoff`,
+    /// leaving their rows. Returns how many values were evicted.
+    pub(crate) fn evict_backed(&mut self, keys: &[DiceKey], cutoff: u64) -> u64 {
         let mut evicted = 0u64;
-        for key in keys {
+        for &key in keys {
             self.with_values(key, |kv| {
-                for (_, value) in kv.entries.iter_mut() {
-                    if value.evict_backed() {
+                for value in kv.values_mut() {
+                    if value.evict_backed(cutoff) {
                         evicted += 1;
                     }
                 }
@@ -742,7 +762,7 @@ impl VersionedGraph {
     pub(crate) fn mark_non_pageable(&mut self, keys: Vec<(DiceKey, DiceValidValue)>) {
         for (key, inspected) in keys {
             self.with_values(key, |kv| {
-                for (_, value) in kv.entries.iter_mut() {
+                for value in kv.values_mut() {
                     if value
                         .as_hydrated()
                         .is_some_and(|current| current.ptr_eq(&inspected))
@@ -754,9 +774,15 @@ impl VersionedGraph {
         }
     }
 
-    /// Makes the value paged out at `data_key` resident again. No-op if no such value is
-    /// retained any more.
-    pub(crate) fn rehydrate(&mut self, key: DiceKey, data_key: DataKey, value: DiceValidValue) {
+    /// Makes the value paged out at `data_key`, read back from a row of `serialized_bytes`,
+    /// resident again. No-op if no such value is retained any more.
+    pub(crate) fn rehydrate(
+        &mut self,
+        key: DiceKey,
+        data_key: DataKey,
+        value: DiceValidValue,
+        serialized_bytes: u64,
+    ) {
         let policy = self.page_out_policy;
         self.with_values(key, |kv| {
             if let Some((_, stored)) = kv
@@ -764,7 +790,7 @@ impl VersionedGraph {
                 .iter_mut()
                 .find(|(_, v)| v.data_key() == Some(data_key))
             {
-                stored.make_resident(value, policy);
+                stored.make_resident(value, serialized_bytes, policy);
             }
         });
     }
@@ -785,6 +811,7 @@ impl VersionedGraph {
             total.paged_out += c.paged_out;
             total.candidates += c.candidates;
             total.backed += c.backed;
+            total.backed_bytes += c.backed_bytes;
             if c.candidates > 0 {
                 candidates.push(key.index as usize);
             }
@@ -811,6 +838,7 @@ impl VersionedGraph {
         assert_eq!(self.index.candidate_count, total.candidates);
         assert_eq!(self.index.backed.iter().collect::<Vec<_>>(), backed);
         assert_eq!(self.index.backed_count, total.backed);
+        assert_eq!(self.index.backed_bytes, total.backed_bytes);
         assert_eq!(self.index.resident_count, total.resident);
         assert_eq!(self.index.paged_out_count, total.paged_out);
     }

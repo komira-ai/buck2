@@ -21,10 +21,11 @@ use std::sync::OnceLock;
 
 use regex::RegexSet;
 
+use crate::deprecation;
+use crate::is_open_source;
 use crate::provider::label::NonDefaultProvidersName;
 use crate::provider::label::ProviderName;
 use crate::provider::label::ProvidersName;
-use crate::soft_error;
 
 /// Families of buck1 platform flavors, in the order of [`PLATFORM_REGEX_SET`].
 ///
@@ -292,7 +293,8 @@ fn classify_flavors(flavors: &str) -> ClassifiedFlavors {
 ///
 /// Every use is reported as a soft error under one of three categories (`platform_flavor`,
 /// `legacy_flavor_subtarget`, `legacy_flavor_unrecognized`) so each family can be migrated and
-/// then turned into a hard error on its own.
+/// then turned into a hard error on its own. Open source never had buck1 build files to keep
+/// working, so there a flavor is an error.
 pub fn map_flavors(flavors: &str, full_target: &str) -> buck2_error::Result<ProvidersName> {
     let ClassifiedFlavors {
         providers,
@@ -301,6 +303,13 @@ pub fn map_flavors(flavors: &str, full_target: &str) -> buck2_error::Result<Prov
         fix,
     } = classify_flavors(flavors);
 
+    if is_open_source() {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "buck1 flavor `#{flavors}` on `{full_target}` is not supported: {fix}"
+        ));
+    }
+
     let err = buck2_error::buck2_error!(
         buck2_error::ErrorTag::Input,
         "buck1 flavor `#{flavors}` on `{full_target}` is deprecated and will become an error: {fix}"
@@ -308,22 +317,18 @@ pub fn map_flavors(flavors: &str, full_target: &str) -> buck2_error::Result<Prov
     // We log the target with the offending flavor here, though in practice we'll have to
     // rely on the wrapping span in order to find it.
     match category {
-        FlavorCategory::Platform => soft_error!(
+        FlavorCategory::Platform => deprecation!(
             "platform_flavor",
             err,
-            deprecation: true,
-            quiet: true,
-            error_on_oss: true,
+            owner: "drollman", started: "2023-03-09",
             low_cardinality_key_for_additional_logview_samples: Some(Box::new(key))
-        )?,
-        // Not `error_on_oss` until the subtarget spelling has been announced to OSS users.
-        FlavorCategory::Subtarget | FlavorCategory::Unrecognized => soft_error!(
+        ),
+        FlavorCategory::Subtarget | FlavorCategory::Unrecognized => deprecation!(
             category.name(),
             err,
-            deprecation: true,
-            quiet: true,
+            owner: "drollman", started: "2023-03-09",
             low_cardinality_key_for_additional_logview_samples: Some(Box::new(key))
-        )?,
+        ),
     };
 
     Ok(providers)

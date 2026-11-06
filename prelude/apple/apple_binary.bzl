@@ -29,6 +29,7 @@ load(
     "get_swift_dependency_info",
     "get_swiftmodule_linkable",
 )
+load("@prelude//apple/swift:swift_dynamic_replacement_targets.bzl", "swift_dynamic_replacement_targets_info")
 load("@prelude//apple/swift:swift_helpers.bzl", "uses_explicit_modules")
 load(
     "@prelude//apple/swift:swift_incremental_support.bzl",
@@ -164,6 +165,10 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
                 ),
             ],
         }
+        if xcode_data_enabled():
+            # The objects of the binary's own Swift sources, which the link takes as
+            # `extra_link_input` and `[objects]` (the C-family objects) does not list.
+            binary_subtargets["swift-objects"] = [DefaultInfo(default_outputs = swift_object_files)]
 
         validation_deps_outputs = get_validation_deps_outputs(ctx)
         stripped = get_apple_stripped_attr_value_with_default_fallback(ctx)
@@ -352,6 +357,10 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
 
         if cxx_output.xplugins_debug_artifacts_info:
             providers.append(cxx_output.xplugins_debug_artifacts_info)
+
+        targets_info = swift_dynamic_replacement_targets_info(ctx, cxx_attr_deps(ctx) + cxx_attr_exported_deps(ctx), False)
+        if targets_info:
+            providers.append(targets_info)
 
         return providers
 

@@ -12,14 +12,17 @@
 Generate a __manifest__.py module containing build metadata for a Python package.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import re
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=__file__.__doc__,
+        description=__doc__,
         fromfile_prefix_chars="@",
     )
     parser.add_argument(
@@ -50,10 +53,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# The ABI tag of an extension (`.cpython-312-x86_64-linux-gnu`, `.abi3`) is not
+# part of its module name.
+_SOABI_TAG = re.compile(r"\.(cpython-[^./\\]+|abi3)$")
+
+# Marks an extension linked into the executable. It isn't an importable file,
+# but its package is.
+_STATIC_EXTENSION_STUB_SUFFIX = ".empty_stub"
+
+
 def path_to_module(path: str) -> str | None:
     for suffix in (".py", ".so", ".pyd"):
         if path.endswith(suffix):
-            return path[: -len(suffix)].replace("/", ".").replace("\\", ".")
+            stem = path[: -len(suffix)]
+            if suffix != ".py":
+                stem = _SOABI_TAG.sub("", stem)
+            return stem.replace("/", ".").replace("\\", ".")
 
 
 def merge_entries(entries: dict[str, object], overlay: dict[str, object]) -> None:
@@ -93,6 +108,8 @@ def main() -> None:
                     module = path_to_module(pkg_path)
                     if module:
                         modules[module] = origin_desc
+                    elif not pkg_path.endswith(_STATIC_EXTENSION_STUB_SUFFIX):
+                        continue
                     # Add artificial __init__.py files like in make_py_package_modules.py
                     for parent in Path(pkg_path).parents:
                         if parent == Path("") or parent == Path("."):

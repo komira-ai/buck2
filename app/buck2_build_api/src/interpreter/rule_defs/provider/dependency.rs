@@ -32,15 +32,15 @@ use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
 use starlark_map::StarlarkHasher;
 
+use crate::interpreter::rule_defs::provider::ValueAsProviderLike;
 use crate::interpreter::rule_defs::provider::collection::ProviderCollection;
 use crate::interpreter::rule_defs::provider::execution_platform::StarlarkExecutionPlatformResolution;
-use crate::interpreter::rule_defs::provider::ty::abstract_provider::AbstractProvider;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -64,9 +64,9 @@ enum DependencyError {
 )]
 #[repr(C)]
 pub struct Dependency<'v> {
-    label: ValueOfUnchecked<'v, StarlarkConfiguredProvidersLabel>,
+    label: ValueTyped<'v, StarlarkConfiguredProvidersLabel>,
     provider_collection: ValueTyped<'v, ProviderCollection<'v>>,
-    execution_platform: ValueOfUnchecked<'v, NoneOr<StarlarkExecutionPlatformResolution>>,
+    execution_platform: Option<ValueTyped<'v, StarlarkExecutionPlatformResolution>>,
 }
 
 starlark_complex_value!(pub Dependency);
@@ -81,7 +81,7 @@ impl<'v> Display for Dependency<'v> {
 
 impl<'v> Dependency<'v> {
     pub fn label(&self) -> &'v StarlarkConfiguredProvidersLabel {
-        StarlarkConfiguredProvidersLabel::from_value(self.label.get()).unwrap()
+        self.label.as_ref()
     }
 
     fn collection(&self) -> &ProviderCollection<'v> {
@@ -94,27 +94,16 @@ impl<'v> Dependency<'v> {
         provider_collection: ValueTyped<'v, ProviderCollection<'v>>,
         execution_platform: Option<&ExecutionPlatformResolution>,
     ) -> Self {
-        let execution_platform: ValueOfUnchecked<NoneOr<StarlarkExecutionPlatformResolution>> =
-            match execution_platform {
-                Some(e) => ValueOfUnchecked::new(
-                    heap.alloc(StarlarkExecutionPlatformResolution(e.clone())),
-                ),
-                None => ValueOfUnchecked::new(Value::new_none()),
-            };
         Dependency {
-            label: heap.alloc_typed_unchecked(StarlarkConfiguredProvidersLabel::new(label)),
+            label: heap.alloc_typed(StarlarkConfiguredProvidersLabel::new(label)),
             provider_collection,
-            execution_platform,
+            execution_platform: execution_platform
+                .map(|e| heap.alloc_typed(StarlarkExecutionPlatformResolution(e.clone()))),
         }
     }
 
-    pub fn execution_platform(&self) -> buck2_error::Result<Option<&ExecutionPlatformResolution>> {
-        let execution_platform: ValueOfUnchecked<NoneOr<&StarlarkExecutionPlatformResolution>> =
-            self.execution_platform.cast();
-        match execution_platform.unpack()? {
-            NoneOr::None => Ok(None),
-            NoneOr::Other(e) => Ok(Some(&e.0)),
-        }
+    pub fn execution_platform(&self) -> Option<&'v ExecutionPlatformResolution> {
+        self.execution_platform.map(|e| &e.as_ref().0)
     }
 }
 
@@ -194,7 +183,7 @@ fn dependency_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
     fn label<'v>(
         this: &Dependency<'v>,
-    ) -> starlark::Result<ValueOfUnchecked<'v, StarlarkConfiguredProvidersLabel>> {
+    ) -> starlark::Result<ValueTyped<'v, StarlarkConfiguredProvidersLabel>> {
         Ok(this.label)
     }
 
@@ -233,13 +222,11 @@ fn dependency_methods(builder: &mut MethodsBuilder) {
         let providers = this
             .collection()
             .default_info()?
-            .get_sub_target_providers(subtarget)
+            .get_sub_target_providers(subtarget)?
             .ok_or_else(|| {
                 buck2_error::Error::from(DependencyError::UnknownSubtarget(subtarget.to_owned()))
             })?;
-        let lbl = StarlarkConfiguredProvidersLabel::from_value(this.label.get())
-            .unwrap()
-            .inner();
+        let lbl = this.label.as_ref().inner();
         let lbl = ConfiguredProvidersLabel::new(
             lbl.target().dupe(),
             lbl.name().push(ProviderName::new(subtarget.to_owned())?),
@@ -272,7 +259,7 @@ fn dependency_methods(builder: &mut MethodsBuilder) {
     fn get<'v>(
         this: &Dependency<'v>,
         index: Value<'v>,
-    ) -> starlark::Result<NoneOr<ValueOfUnchecked<'v, AbstractProvider>>> {
+    ) -> starlark::Result<NoneOr<ValueOf<'v, ValueAsProviderLike<'v>>>> {
         Ok(this.collection().get(index).with_buck_error_context(|| {
             format!("Error accessing dependencies of `{}`", this.label)
         })?)

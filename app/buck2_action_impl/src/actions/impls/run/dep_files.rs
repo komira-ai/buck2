@@ -46,6 +46,7 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_hasher::DirectoryDigester;
 use buck2_directory::directory::directory_ref::DirectoryRef;
@@ -102,6 +103,7 @@ use buck2_hash::BuckMutSet;
 use buck2_util::strong_hasher::Blake3StrongHasher;
 use dupe::Dupe;
 use either::Either;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use parking_lot::MappedMutexGuard;
 use parking_lot::Mutex;
@@ -137,13 +139,11 @@ fn encode_config_key(cfg: Option<Configuration>) -> Vec<u8> {
 /// configuration (and always occupy their own single-entry slot).
 /// Most logical actions are only ever
 /// seen under a single configuration, so that common case is stored inline (`One`) to avoid
-/// allocating a map for a single entry; a second configuration promotes the slot to `Many`. The
-/// `Many` map is boxed so this enum stays pointer-sized -- single-configuration `One` slots (the
-/// common case) then don't pay for the map's larger inline footprint.
+/// allocating a map for a single entry; a second configuration promotes the slot to `Many`.
 #[derive(Allocative)]
 enum ConfigActionSlot {
     One(Option<Configuration>, Arc<DepFileState>),
-    Many(Box<BuckMutInsertionMap<Option<Configuration>, Arc<DepFileState>>>),
+    Many(BuckMutInsertionMap<Option<Configuration>, Arc<DepFileState>>),
 }
 
 impl ConfigActionSlot {
@@ -173,10 +173,9 @@ impl ConfigActionSlot {
                 *s = state;
             }
             _ => {
-                let ConfigActionSlot::One(c, s) = std::mem::replace(
-                    self,
-                    ConfigActionSlot::Many(Box::new(BuckMutInsertionMap::new())),
-                ) else {
+                let ConfigActionSlot::One(c, s) =
+                    std::mem::replace(self, ConfigActionSlot::Many(BuckMutInsertionMap::new()))
+                else {
                     unreachable!("the arms above cover Many and the matching One");
                 };
                 let ConfigActionSlot::Many(m) = self else {
@@ -406,7 +405,7 @@ enum DepFileDeclaration {
     },
     /// Reloaded from disk: only the configuration-independent identities survived.
     Reloaded {
-        identities: Box<[DeclaredDepFileIdentity]>,
+        identities: MiniBoxSlice<DeclaredDepFileIdentity>,
     },
 }
 
@@ -454,7 +453,7 @@ struct LoadedEntry {
     /// held in full; directory values hold only a fingerprint and are rehydrated from the
     /// materializer at reuse time (see `resolve_loaded_outputs`). The real `BuildArtifactPath` is
     /// reconstructed from the live action's declared outputs on reuse.
-    outputs: Box<[StoredOutput]>,
+    outputs: MiniBoxSlice<StoredOutput>,
     was_produced_locally: bool,
     declared: DepFileDeclaration,
 }
@@ -620,7 +619,7 @@ impl LoadedEntry {
         // Validate paths loaded from disk rather than trusting them: a corrupt or
         // differently-versioned row surfaces as a `from_stored` error, which the lookup path drops
         // and reports, instead of constructing an invalid path that misbehaves later.
-        let identities: Box<[DeclaredDepFileIdentity]> = stored
+        let identities: MiniBoxSlice<DeclaredDepFileIdentity> = stored
             .declared
             .into_iter()
             .map(|i| {
@@ -641,7 +640,7 @@ impl LoadedEntry {
         };
         Ok(LoadedEntry {
             digests,
-            outputs: stored.outputs.into_boxed_slice(),
+            outputs: stored.outputs.into(),
             was_produced_locally: stored.was_produced_locally,
             declared,
         })
@@ -1315,14 +1314,13 @@ pub(crate) async fn match_if_identical_action(
         // changes, so a row that fails to decode means that version was not bumped, and the drift
         // would otherwise disable the cache silently.
         let drop_malformed = |config_key: Vec<u8>, e: buck2_error::Error| {
-            let _unused = soft_error!(
+            soft_error_or_panic!(
                 "malformed_dep_file_db_entry",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Tier0,
                     "Dropping malformed persisted dep-file entry. {}",
                     e
-                ),
-                quiet: true
+                )
             );
             store.delete(logical_key.clone(), config_key);
         };
@@ -2481,7 +2479,7 @@ impl DeclaredDepFiles {
                                 "Dep file is missing at {}",
                                 dep_file_path
                             )
-                        )?;
+                        );
                         return Ok(None);
                     }
                 };
@@ -2559,7 +2557,7 @@ impl ConcreteDepFiles {
                 .buck_error_context("Invalid line encountered in dep file")?;
 
             if let Err(e) = Self::add_path_to_selector(path, &mut selector, fs, builder) {
-                soft_error!("failed_to_add_dep_file_path_to_selector", e, error_on_oss: true)?;
+                soft_error!("failed_to_add_dep_file_path_to_selector", e);
                 return Ok(None);
             }
         }

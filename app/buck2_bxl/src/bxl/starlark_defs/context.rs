@@ -21,7 +21,6 @@ use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::analysis::registry::AnalysisRegistry;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisActions;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::data::HasIoProvider;
 use buck2_common::target_aliases::BuckConfigTargetAliasResolver;
 use buck2_common::target_aliases::HasTargetAliasResolver;
 use buck2_core::cells::CellAliasResolver;
@@ -54,7 +53,7 @@ use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
 use starlark::values::structs::StructRef;
@@ -112,7 +111,7 @@ struct TargetPlatformInAnalysis;
 #[derive(ProvidesStaticType, Trace, NoSerialize, Allocative, Debug, Derivative)]
 pub(crate) struct RootBxlContextData<'v> {
     output_stream: ValueTyped<'v, StarlarkOutputStream>,
-    cli_args: ValueOfUnchecked<'v, StructRef<'v>>,
+    cli_args: ValueOf<'v, StructRef<'v>>,
 }
 
 /// Data object for `BxlContextType::Dynamic`.
@@ -222,7 +221,7 @@ impl BxlContextCoreData {
         let target_alias_resolver = dice.target_alias_resolver().await?.dupe();
         let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?.dupe();
         let artifact_fs = dice.get_artifact_fs().await?;
-        let project_fs = dice.global_data().get_io_provider().project_root().dupe();
+        let project_fs = artifact_fs.fs().dupe();
 
         let cell_root_abs = project_fs.root().join(
             cell_resolver
@@ -341,7 +340,7 @@ impl<'v> BxlContext<'v> {
         heap: Heap<'v>,
         core: Arc<BxlContextCoreData>,
         stream_state: OutputStreamState,
-        cli_args: ValueOfUnchecked<'v, StructRef<'v>>,
+        cli_args: ValueOf<'v, StructRef<'v>>,
         digest_config: DigestConfig,
     ) -> buck2_error::Result<Self> {
         let root_data = RootBxlContextData {
@@ -390,7 +389,7 @@ impl<'v> BxlContext<'v> {
         core: Arc<BxlContextCoreData>,
         digest_config: DigestConfig,
         analysis_registry: AnalysisRegistry<'v>,
-        attributes: ValueOfUnchecked<'v, StructRef<'static>>,
+        attributes: ValueOf<'v, StructRef<'v>>,
     ) -> buck2_error::Result<Self> {
         Ok(Self {
             state: heap.alloc_typed(AnalysisActions {

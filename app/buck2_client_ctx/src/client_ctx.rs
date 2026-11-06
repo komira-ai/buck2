@@ -24,13 +24,14 @@ use buck2_common::argv::Argv;
 use buck2_common::init::LogDownloadMethod;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::invocation_paths_result::InvocationPathsResult;
-use buck2_common::settings::BuckSettings;
 use buck2_core::error::buck2_hard_error_env;
 use buck2_core::error::buck2_show_soft_errors_env;
 use buck2_error::BuckErrorContext;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
+use buck2_settings::BuckSettings;
+use buck2_settings::ResolvedSettings;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
 use superconsole::Stdin;
@@ -75,6 +76,41 @@ pub struct ClientCommandContext<'a> {
     pub(crate) client_metadata: Vec<ClientMetadata>,
     pub(crate) isolation: FileNameBuf,
     agent_invocation_info: AgentInvocationInfo,
+}
+
+/// A client-side guard's verdict on one operation, together with what to record about it.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentAdvice {
+    advice: Advice,
+    decision: Decision,
+    /// Whether the guard is on, for a direct call in a repository. `None` for every other call,
+    /// which is outside the guards' A/B tests and records nothing.
+    enabled: Option<bool>,
+}
+
+impl AgentAdvice {
+    /// For an operation the guard does not cover, such as starting the default isolation's daemon.
+    pub(crate) fn not_applicable(advice: Advice) -> Self {
+        Self {
+            advice,
+            decision: Decision::Inactive,
+            enabled: None,
+        }
+    }
+
+    pub(crate) fn decision(self) -> Decision {
+        self.decision
+    }
+
+    /// The guard's state, recorded in both arms of its A/B test, followed by its decision when it
+    /// acted.
+    pub(crate) fn tags(self) -> Vec<String> {
+        self.enabled
+            .map(|enabled| self.advice.state_tag(enabled))
+            .into_iter()
+            .chain(self.decision.tag().map(str::to_owned))
+            .collect()
+    }
 }
 
 impl<'a> ClientCommandContext<'a> {
@@ -156,27 +192,50 @@ impl<'a> ClientCommandContext<'a> {
             .buck_settings(self.paths()?.project_root())
     }
 
+    /// Like [`buck_settings`](Self::buck_settings), with where each value came from.
+    pub fn resolved_settings(&self) -> buck2_error::Result<ResolvedSettings> {
+        self.immediate_config
+            .resolved_settings(self.paths()?.project_root())
+    }
+
+    /// The report `buck2 audit settings` and `buck2 rage` show, with the
+    /// buckconfig fallbacks read from the root config as the client reads them.
+    pub fn settings_report(&self) -> buck2_error::Result<buck2_settings::SettingsReport> {
+        let resolved = self.resolved_settings()?;
+        let mut buckconfig = self.immediate_config.root_config()?;
+        buck2_settings::SettingsReport::new(&resolved, &mut buckconfig)
+    }
+
     /// Evaluates repository-scoped advice without loading build configuration.
     /// Callers apply the decision only when the guarded operation will actually run.
-    pub fn agent_advice(&self, advice: Advice) -> buck2_error::Result<Decision> {
+    pub fn agent_advice(&self, advice: Advice) -> buck2_error::Result<AgentAdvice> {
         let agent = self.agent_context();
         if !agent.is_direct_call() || self.maybe_paths()?.is_none() {
-            return Ok(Decision::Inactive);
+            return Ok(AgentAdvice::not_applicable(advice));
         }
-        let settings = &self.buck_settings()?.agent_interactive;
+        let settings = &self.buck_settings()?.invocation;
         let enabled = match advice {
-            Advice::Killall => settings.killall_enabled(),
-            Advice::Clean => settings.clean_enabled(),
-            Advice::NewIsolationDir => settings.new_isolation_dir_enabled(),
+            Advice::Killall => settings.agent_interactive.killall_enabled(),
+            Advice::Clean => settings.agent_interactive.clean_enabled(),
+            Advice::NewIsolationDir => settings.agent_interactive.new_isolation_dir_enabled(),
+            // These policies need daemon configuration or resolved target rule types.
+            Advice::Build(_) | Advice::ConfigChange => {
+                return Ok(AgentAdvice::not_applicable(advice));
+            }
         };
-        Ok(advice.evaluate(
+        let decision = advice.evaluate(
             &Invocation {
                 enabled,
                 direct_call: agent.is_direct_call(),
                 reason: agent.reason(),
             },
             agent.is_advice_acknowledged(advice.id()),
-        ))
+        );
+        Ok(AgentAdvice {
+            advice,
+            decision,
+            enabled: Some(enabled),
+        })
     }
 
     pub fn with_runtime<Fut, F>(self, func: F) -> <Fut as Future>::Output
@@ -286,6 +345,10 @@ impl<'a> ClientCommandContext<'a> {
             }
             .into(),
             profile_pattern_opts: starlark_opts.profile_pattern_opts(&self.working_dir),
+            invocation_settings: Some(serde_json::to_string(&self.buck_settings()?.invocation)?),
+            dice_settings: Some(serde_json::to_string(
+                self.buck_settings()?.dice_sections(),
+            )?),
             ..self.empty_client_context(cmd.logging_name())?
         })
     }
@@ -320,6 +383,7 @@ impl<'a> ClientCommandContext<'a> {
             skip_targets_with_duplicate_names: false,
             trace_id: format!("{}", self.trace_id),
             reuse_current_config: false,
+            reuse_current_config_implicitly: false,
             daemon_uuid: get_possibly_nested_invocation_daemon_uuid(),
             sanitized_argv: Vec::new(),
             argfiles: Vec::new(),
@@ -337,6 +401,8 @@ impl<'a> ClientCommandContext<'a> {
             profile_pattern_opts: None,
             agent_context: self.agent_context().to_proto(),
             tenant_identity,
+            invocation_settings: None,
+            dice_settings: None,
         })
     }
 
@@ -351,6 +417,7 @@ impl<'a> ClientCommandContext<'a> {
         Ok(self
             .immediate_config
             .daemon_startup_config()?
+            .startup_options
             .log_download_method
             .clone())
     }

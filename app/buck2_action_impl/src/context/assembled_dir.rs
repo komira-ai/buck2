@@ -9,7 +9,7 @@
  */
 
 use allocative::Allocative;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use derive_more::Display;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
@@ -61,11 +61,11 @@ fn assembled_dir_members(globals: &mut GlobalsBuilder) {
     /// lookup must resolve inside it (a symlinked executable resolves those
     /// against its realpath, outside the directory).
     fn copy<'v>(
-        #[starlark(require = pos)] artifact: ValueOf<'v, ValueAsInputArtifactLike<'v>>,
+        #[starlark(require = pos)] artifact: ValueOf<'v, StarlarkArtifactView<'v>>,
     ) -> starlark::Result<StarlarkAssembledDirEntry<'v>> {
         Ok(StarlarkAssembledDirEntry {
             copy: true,
-            artifact: artifact.value,
+            artifact: artifact.to_value(),
         })
     }
 
@@ -73,11 +73,11 @@ fn assembled_dir_members(globals: &mut GlobalsBuilder) {
     /// inputs that are pure content -- especially large ones already living
     /// at an immutable (content-based) path -- to avoid duplicating bytes.
     fn symlink<'v>(
-        #[starlark(require = pos)] artifact: ValueOf<'v, ValueAsInputArtifactLike<'v>>,
+        #[starlark(require = pos)] artifact: ValueOf<'v, StarlarkArtifactView<'v>>,
     ) -> starlark::Result<StarlarkAssembledDirEntry<'v>> {
         Ok(StarlarkAssembledDirEntry {
             copy: false,
-            artifact: artifact.value,
+            artifact: artifact.to_value(),
         })
     }
 }

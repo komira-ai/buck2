@@ -8,6 +8,9 @@ Note there's also `buck2 killall` and `buck2 clean`.
 
 `buck2 clean` kills the buck2 daemon and also deletes the buck2 state files.
 
+With `BUCK2_SHARE_DAEMON=true`, this evicts the current tenant from the shared daemon instead; the
+daemon exits after its final tenant is evicted.
+
 Usage: buck2 kill [OPTIONS]
 
 Options:
@@ -68,6 +71,6 @@ Universal Options:
 
       --agent-context <AGENT_CONTEXT>
           Agent context key=value pairs for telemetry. Used by AI agents to pass structured
-          metadata. Schema is defined via buckconfig. Entries can be comma-separated or passed as
-          separate flags. Examples: --agent-context intent=fix,attempt=2,prior_error=missing_target
-          --agent-context intent=build --agent-context attempt=1
+          metadata. Schema is defined via buckconfig. Examples: --agent-context
+          intent=fix,attempt=2,prior_error=missing_target --agent-context intent=build
+          --agent-context attempt=1 --agent-context "reason=fix the build, then test"

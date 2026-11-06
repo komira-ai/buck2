@@ -210,9 +210,7 @@ struct SimpleData {
 starlark_simple_value!(SimpleData);
 
 #[starlark_value(type = "SimpleData")]
-impl<'v> StarlarkValue<'v> for SimpleData {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for SimpleData {}
 
 /// A value that cannot be paged, as a heap holding one must say so without panicking.
 #[derive(
@@ -229,9 +227,7 @@ struct Unpagable;
 starlark_simple_value!(Unpagable);
 
 #[starlark_value(type = "Unpagable")]
-impl<'v> StarlarkValue<'v> for Unpagable {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for Unpagable {}
 
 #[test]
 fn unsupported_value_fails_page_out_instead_of_panicking() {
@@ -471,9 +467,7 @@ struct HeapData {
 starlark_simple_value!(HeapData);
 
 #[starlark_value(type = "HeapData")]
-impl<'v> StarlarkValue<'v> for HeapData {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for HeapData {}
 
 #[test]
 fn test_simple_value_round_trip() -> crate::Result<()> {
@@ -535,9 +529,7 @@ struct BrandedData<'v> {
 }
 
 #[starlark_value(type = "BrandedData", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for BrandedData<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for BrandedData<'v> {}
 
 #[test]
 fn test_frozen_vtable_flag_round_trip() -> crate::Result<()> {
@@ -579,9 +571,7 @@ struct RefData<'v> {
 }
 
 #[starlark_value(type = "RefData", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for RefData<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for RefData<'v> {}
 
 #[test]
 fn test_frozen_value_ref_round_trip() -> crate::Result<()> {
@@ -620,9 +610,7 @@ struct DropRefData<'v> {
 }
 
 #[starlark_value(type = "DropRefData", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for DropRefData<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for DropRefData<'v> {}
 
 #[test]
 fn test_frozen_value_drop_to_undrop_round_trip() -> crate::Result<()> {
@@ -1263,9 +1251,7 @@ struct SmallMapData<'v> {
 }
 
 #[starlark_value(type = "SmallMapData", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for SmallMapData<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for SmallMapData<'v> {}
 
 /// A test type with `SmallMap<Value, Value>`.
 #[derive(
@@ -1282,9 +1268,7 @@ struct SmallMapFvData<'v> {
 }
 
 #[starlark_value(type = "SmallMapFvData", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for SmallMapFvData<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for SmallMapFvData<'v> {}
 
 #[test]
 fn test_small_map_string_key_round_trip() -> crate::Result<()> {
@@ -1573,9 +1557,7 @@ struct TestStackFrame {
 starlark_simple_value!(TestStackFrame);
 
 #[starlark_value(type = "TestStackFrame")]
-impl<'v> StarlarkValue<'v> for TestStackFrame {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for TestStackFrame {}
 
 #[test]
 fn test_stack_frame_data_round_trip() -> crate::Result<()> {
@@ -1858,6 +1840,118 @@ fn test_frozen_record_type_round_trip() -> crate::Result<()> {
     assert!(
         Arc::ptr_eq(data_a, data_b),
         "pagable Arc dedup should round-trip the shared Arc<TyRecordData> as a single allocation",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_frozen_record_round_trip() -> crate::Result<()> {
+    use std::sync::Arc;
+
+    use starlark_map::small_map::SmallMap;
+
+    use crate::eval::ParametersSpec;
+    use crate::eval::ParametersSpecParam;
+    use crate::typing::Ty;
+    use crate::values::layout::avalue::TrailingValues;
+    use crate::values::record::Record;
+    use crate::values::record::field::Field;
+    use crate::values::record::record_type::FrozenRecordType;
+    use crate::values::record::record_type::RecordVariantFrozen;
+    use crate::values::record::ty_record_type::TyRecordData;
+    use crate::values::types::type_instance_id::TypeInstanceId;
+    use crate::values::typing::type_compiled::compiled::TypeCompiled;
+
+    let heap = ErasingHeap::new();
+
+    let id = TypeInstanceId::for_test(&"frozen_record_instance_type");
+    let record_type_fv = heap.with(|heap| {
+        let mut fields: SmallMap<String, Field> = SmallMap::new();
+        for name in ["x", "y"] {
+            fields.insert(
+                name.to_owned(),
+                Field {
+                    typ: TypeCompiled::any(),
+                    default: None,
+                },
+            );
+        }
+        erase(
+            heap.alloc_simple(FrozenRecordType {
+                id,
+                ty_record_data: RecordVariantFrozen {
+                    ty: Some(Arc::new(TyRecordData {
+                        name: "Point".to_owned(),
+                        ty_record: Ty::any(),
+                        ty_record_type: Ty::any(),
+                        parameter_spec_prototype: ParametersSpec::<()>::new_named_only(
+                            "Point",
+                            [
+                                ("x", ParametersSpecParam::Required),
+                                ("y", ParametersSpecParam::Required),
+                            ],
+                        )
+                        .prototype(),
+                    })),
+                },
+                fields,
+            }),
+        )
+    });
+    let x = heap.alloc_simple(SimpleData {
+        flag: true,
+        count: 7,
+    });
+    let y = heap.alloc_str("seven");
+    // Two instances of one type, so the type must round-trip as a single value.
+    let (first, second) = heap.with(|heap| {
+        let typ = ErasingHeap::restore_one(heap, record_type_fv);
+        let values = ErasingHeap::restore(heap, &[x, y]);
+        (
+            erase(heap.alloc_record(typ, &values)),
+            erase(heap.alloc_record(typ, &values[..1].repeat(2))),
+        )
+    });
+    let root = heap.alloc_tuple(&[first, second]);
+
+    let heap_ref = heap.into_ref_named(TestHeapName::heap_name("test_frozen_record"));
+    // SAFETY: heap_ref owns the arena hosting root.
+    let owned = unsafe { OwnedFrozen::from_erased(heap_ref, root) };
+    let restored = round_trip_owned_pagable_ser_de_impl(owned)?;
+
+    let tuple: &crate::values::types::tuple::value::Tuple = restored
+        .as_ref()
+        .value()
+        .downcast_ref::<crate::values::types::tuple::value::Tuple>()
+        .unwrap();
+    let content = tuple.content();
+    let first = Record::from_value(content[0]).expect("first element is a record");
+    let second = Record::from_value(content[1]).expect("second element is a record");
+
+    assert_eq!(first.record_type_id(), id);
+    assert!(
+        first.typ.ptr_eq(second.typ),
+        "both instances should share the single restored record type"
+    );
+    let typ: &FrozenRecordType = first.typ.downcast_ref::<FrozenRecordType>().unwrap();
+    assert_eq!(
+        typ.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["x", "y"]
+    );
+
+    assert_eq!(first.content().len(), 2);
+    let first_x: &SimpleData = first.content()[0].downcast_ref::<SimpleData>().unwrap();
+    assert_eq!(first_x.count, 7);
+    assert_eq!(first.content()[1].unpack_str(), Some("seven"));
+
+    let fields: Vec<(&str, Value)> = second.iter().collect();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].0, "x");
+    assert_eq!(fields[1].0, "y");
+    assert!(
+        fields[0].1.ptr_eq(fields[1].1),
+        "a value stored twice in one record should round-trip as one allocation"
     );
 
     Ok(())
@@ -2191,9 +2285,7 @@ struct ArcBlanketOuter {
 starlark_simple_value!(ArcBlanketOuter);
 
 #[starlark_value(type = "ArcBlanketOuter")]
-impl<'v> StarlarkValue<'v> for ArcBlanketOuter {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for ArcBlanketOuter {}
 
 #[test]
 fn test_arc_blanket_round_trip() -> crate::Result<()> {
@@ -2393,9 +2485,7 @@ impl std::fmt::Debug for AtomicHost<'_> {
 }
 
 #[starlark_value(type = "AtomicHost", frozen_vtable)]
-impl<'v> StarlarkValue<'v> for AtomicHost<'v> {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for AtomicHost<'v> {}
 
 #[test]
 fn test_atomic_value_typed_option_some_round_trip() -> crate::Result<()> {
@@ -2682,9 +2772,7 @@ struct FieldErrorTestData {
 starlark_simple_value!(FieldErrorTestData);
 
 #[starlark_value(type = "FieldErrorTestData")]
-impl<'v> StarlarkValue<'v> for FieldErrorTestData {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for FieldErrorTestData {}
 
 #[test]
 fn test_deserialize_field_error_includes_field_name() {
@@ -2724,9 +2812,7 @@ struct DropFieldErrorTestData {
 starlark_simple_value!(DropFieldErrorTestData);
 
 #[starlark_value(type = "DropFieldErrorTestData")]
-impl<'v> StarlarkValue<'v> for DropFieldErrorTestData {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for DropFieldErrorTestData {}
 
 /// A value that fails to deserialize leaves its slot without a payload; the
 /// heap, dropped on the way out of the failed page-in, must still walk past it.
@@ -3003,9 +3089,7 @@ mod claim_unwind {
     starlark_simple_value!(PanicDeserData);
 
     #[starlark_value(type = "PanicDeserData")]
-    impl<'v> StarlarkValue<'v> for PanicDeserData {
-        type Canonical = Self;
-    }
+    impl<'v> StarlarkValue<'v> for PanicDeserData {}
 
     #[test]
     fn test_panicking_deserializer_fails_claim_and_wakes_waiter() -> crate::Result<()> {
@@ -3164,9 +3248,7 @@ impl Allocative for ParkedData {
 starlark_simple_value!(ParkedData);
 
 #[starlark_value(type = "ParkedData")]
-impl<'v> StarlarkValue<'v> for ParkedData {
-    type Canonical = Self;
-}
+impl<'v> StarlarkValue<'v> for ParkedData {}
 
 /// Walk an unfinished slot, then let its writer finish and claim another slot
 /// inside a profiling callback. The snapshot must exclude the later allocation
@@ -5900,8 +5982,6 @@ starlark_simple_value!(GateKey);
 
 #[starlark_value(type = "GateKey")]
 impl<'v> StarlarkValue<'v> for GateKey {
-    type Canonical = Self;
-
     fn write_hash(&self, hasher: &mut crate::collections::StarlarkHasher) -> crate::Result<()> {
         use std::hash::Hasher;
         hasher.write_u32(self.id);

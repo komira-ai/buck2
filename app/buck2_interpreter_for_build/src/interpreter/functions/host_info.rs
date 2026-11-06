@@ -23,7 +23,7 @@ use starlark::values::FrozenHeap;
 use starlark::values::FrozenHeapName;
 use starlark::values::OwnedFrozen;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::structs::AllocStruct;
 use starlark::values::structs::StructRef;
 
@@ -97,9 +97,8 @@ fn new_host_info(
             &[
                 ("os", os),
                 ("arch", arch),
-                // TODO(cjhopman): Remove in favour of version_info() in Buck v1 and v2
-                // We want to be able to determine if we are on Buck v2 or not, this mechanism
-                // is quick, cheap and Buck v1 compatible.
+                // Always true. Kept because user Starlark probes it to tell Buck2 apart
+                // from other evaluators of the same files.
                 ("buck2", Value::new_bool(true)),
                 ("xcode", xcode),
             ],
@@ -139,14 +138,12 @@ pub(crate) fn register_host_info(builder: &mut GlobalsBuilder) {
     #[starlark(speculative_exec_safe)]
     fn host_info<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<ValueOfUnchecked<'v, StructRef<'v>>> {
+    ) -> starlark::Result<ValueOf<'v, StructRef<'v>>> {
         // Keeping this `speculative_exec_safe` is safe because BuildContext's `HostInfo`,
         // even when evaluated speculatively, is going to be the same across all interpreters
         // that might reuse each other's output.
         let host_info = &BuildContext::from_context(eval)?.host_info;
-        Ok(ValueOfUnchecked::new(
-            host_info.value.as_ref().add_to_heap(eval.heap()),
-        ))
+        ValueOf::new_err(host_info.value.as_ref().add_to_heap(eval.heap()))
     }
 }
 

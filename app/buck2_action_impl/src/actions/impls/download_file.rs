@@ -49,6 +49,7 @@ use buck2_execute::re::presence::NegativeCache;
 use buck2_hash::BuckMutInsertionSet;
 use buck2_http::HttpClient;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use starlark::values::OwnedFrozen;
@@ -138,7 +139,7 @@ impl UnregisteredAction for UnregisteredDownloadFileAction {
 
 #[derive(Debug, Allocative, Pagable)]
 struct DownloadFileAction {
-    outputs: Box<[BuildArtifact]>,
+    outputs: MiniBoxSlice<BuildArtifact>,
     inner: UnregisteredDownloadFileAction,
 }
 
@@ -307,10 +308,11 @@ impl DownloadFileAction {
                 // Falling back to the download is correct for this action, but a CAS that cannot
                 // answer this query would silently turn every download into an origin fetch,
                 // which should be visible somewhere.
-                let _ignored = buck2_core::soft_error!(
+                buck2_core::soft_error!(
                     "download_file_cas_probe_failed",
-                    e.context(format!("CAS lookup for `{digest}` failed; downloading instead")),
-                    quiet: true
+                    e.context(format!(
+                        "CAS lookup for `{digest}` failed; downloading instead"
+                    ))
                 );
                 return Ok(None);
             }
@@ -368,62 +370,57 @@ impl DownloadFileAction {
         // the materializer's record of it, so the disk has to be cleared to match. The lease is
         // held until that report is in.
         let output_lease = materializer.prepare_outputs(vec![path.clone()]).await?;
-        let downloaded = async {
-            ctx.blocking_executor()
-                .execute_io(
-                    Box::new(CleanOutputPaths {
-                        paths: vec![path.clone()],
-                    }),
-                    ctx.cancellation_context(),
-                )
-                .await?;
-
-            let digest = http_download(
-                client,
-                ctx.fs().fs(),
-                ctx.digest_config(),
-                &path,
-                url,
-                &self.inner.checksum,
-                self.inner.is_executable,
+        ctx.blocking_executor()
+            .execute_io(
+                Box::new(CleanOutputPaths {
+                    paths: vec![path.clone()],
+                }),
+                ctx.cancellation_context(),
             )
             .await?;
 
-            // RE knows this file by the digest (checksum, size), where the size came from
-            // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
-            // every remote consumer unable to find its input, so it is caught here. `size_bytes` is
-            // checked even when no digest could be declared up front (for example a sha512-only
-            // download), where it is the only thing that can catch a wrong size.
-            check_downloaded_size(
-                expected_size(metadata, self.inner.size_bytes),
-                digest.size(),
-            )?;
+        let digest = http_download(
+            client,
+            ctx.fs().fs(),
+            ctx.digest_config(),
+            &path,
+            url,
+            &self.inner.checksum,
+            self.inner.is_executable,
+        )
+        .await?;
 
-            // The declared metadata, when there is any, is the value: the checksum verified the
-            // content and the size was checked above, and a content-based output path was resolved
-            // from it. The digest the download computed is under the digest config's preferred
-            // algorithm, which need not be the checksum's, so it only stands in when nothing was
-            // declared.
-            let value = match metadata {
-                Some(metadata) => ArtifactValue::file(metadata.dupe()),
-                None => ArtifactValue::file(FileMetadata {
-                    digest,
-                    is_executable: self.inner.is_executable,
-                }),
-            };
-            materializer
-                .declare_existing(
-                    &output_lease,
-                    vec![DeclareArtifactPayload {
-                        path,
-                        artifact: value.dupe(),
-                    }],
-                )
-                .await?;
-            buck2_error::Ok(value)
-        }
-        .await;
-        let value = output_lease.abandon_on_err(downloaded)?;
+        // RE knows this file by the digest (checksum, size), where the size came from
+        // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
+        // every remote consumer unable to find its input, so it is caught here. `size_bytes` is
+        // checked even when no digest could be declared up front (for example a sha512-only
+        // download), where it is the only thing that can catch a wrong size.
+        check_downloaded_size(
+            expected_size(metadata, self.inner.size_bytes),
+            digest.size(),
+        )?;
+
+        // The declared metadata, when there is any, is the value: the checksum verified the
+        // content and the size was checked above, and a content-based output path was resolved
+        // from it. The digest the download computed is under the digest config's preferred
+        // algorithm, which need not be the checksum's, so it only stands in when nothing was
+        // declared.
+        let value = match metadata {
+            Some(metadata) => ArtifactValue::file(metadata.dupe()),
+            None => ArtifactValue::file(FileMetadata {
+                digest,
+                is_executable: self.inner.is_executable,
+            }),
+        };
+        materializer
+            .declare_existing(
+                &output_lease,
+                vec![DeclareArtifactPayload {
+                    path,
+                    artifact: value.dupe(),
+                }],
+            )
+            .await?;
 
         Ok((value, ActionExecutionKind::Simple))
     }

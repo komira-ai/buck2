@@ -22,6 +22,7 @@ use allocative::Allocative;
 use anyhow::Context;
 use derive_more::Display;
 use starlark_derive::StarlarkPagable;
+use starlark_derive::StarlarkRepresentations;
 use starlark_derive::starlark_module;
 use starlark_derive::starlark_value;
 use starlark_syntax::golden_test_template::golden_test_template;
@@ -44,12 +45,17 @@ use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::Heap;
 use crate::values::NoSerialize;
+use crate::values::StarlarkType;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueError;
+use crate::values::ValueOf;
+use crate::values::ValueTyped;
+use crate::values::dict::DictType;
 use crate::values::layout::heap::name::StarlarkTestHeapName;
-use crate::values::list_or_tuple::UnpackListOrTuple;
+use crate::values::list_or_tuple::ListOrTupleType;
 use crate::values::none::NoneType;
 
 #[test]
@@ -309,10 +315,10 @@ fn test_radd() {
             match Select::from_value(value) {
                 Some(x) => Ok(Some(x.clone())),
                 None => {
-                    let Some(list_or_tuple) = UnpackListOrTuple::unpack_value(value)? else {
+                    let Some(list_or_tuple) = ValueOf::<ListOrTupleType<i32>>::new(value) else {
                         return Ok(None);
                     };
-                    Ok(Some(Select(list_or_tuple.items)))
+                    Ok(Some(Select(list_or_tuple.try_to_vec()?)))
                 }
             }
         }
@@ -342,8 +348,8 @@ fn test_radd() {
 
     #[starlark_module]
     fn module(build: &mut GlobalsBuilder) {
-        fn select(xs: UnpackListOrTuple<i32>) -> anyhow::Result<Select> {
-            Ok(Select(xs.items))
+        fn select<'v>(xs: ValueOf<'v, ListOrTupleType<i32>>) -> anyhow::Result<Select> {
+            Ok(Select(xs.try_to_vec().map_err(|e| e.into_anyhow())?))
         }
     }
 
@@ -766,16 +772,37 @@ fn test_label_assign() {
     #[display("{:?}", self)]
     struct Wrapper<'v>(RefCell<SmallMap<String, Value<'v>>>);
 
+    #[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+    enum WrapperView<'v> {
+        Unfrozen(ValueTyped<'v, Wrapper<'v>>),
+        Frozen(ValueTyped<'v, FrozenWrapper>),
+    }
+
     #[starlark_value(type = "wrapper")]
-    impl<'v> StarlarkValue<'v> for Wrapper<'v> {
+    impl<'v> StarlarkType<'v> for WrapperView<'v> {
         fn get_attr(&self, attribute: &str, _heap: Heap<'v>) -> Option<Value<'v>> {
-            Some(*self.0.borrow().get(attribute).unwrap())
+            match self {
+                WrapperView::Unfrozen(this) => Some(*this.0.borrow().get(attribute).unwrap()),
+                WrapperView::Frozen(_) => None,
+            }
         }
 
         fn set_attr(&self, attribute: &str, new_value: Value<'v>) -> starlark::Result<()> {
-            self.0.borrow_mut().insert(attribute.to_owned(), new_value);
-            Ok(())
+            match self {
+                WrapperView::Unfrozen(this) => {
+                    this.0.borrow_mut().insert(attribute.to_owned(), new_value);
+                    Ok(())
+                }
+                WrapperView::Frozen(_) => Err(starlark::Error::new_other(
+                    ValueError::CannotMutateImmutableValue,
+                )),
+            }
         }
+    }
+
+    #[starlark_value]
+    impl<'v> StarlarkValue<'v> for Wrapper<'v> {
+        type Type = WrapperView<'v>;
     }
 
     #[derive(
@@ -789,9 +816,9 @@ fn test_label_assign() {
     #[display("FrozenWrapper")]
     struct FrozenWrapper;
 
-    #[starlark_value(type = "wrapper")]
+    #[starlark_value]
     impl<'v> StarlarkValue<'v> for FrozenWrapper {
-        type Canonical = Wrapper<'v>;
+        type Type = WrapperView<'v>;
     }
 
     impl<'v> Freeze<'v> for Wrapper<'v> {
@@ -1005,7 +1032,11 @@ animal("Joe")
         let mut eval = Evaluator::new(&m);
         let ast = AstModule::parse("code.bzl", code.to_owned(), &Dialect::Standard).unwrap();
         let res: Value = eval.eval_module(ast, &globals).unwrap();
-        let animal = SmallMap::<String, Value>::unpack_value(res).unwrap();
+        let animal: SmallMap<String, Value> = ValueOf::<DictType<String, Value>>::new_err(res)
+            .unwrap()
+            .try_items()
+            .collect::<crate::Result<_>>()
+            .unwrap();
         println!("animal = {animal:?}");
         crate::Result::Ok(())
     })

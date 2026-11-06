@@ -44,6 +44,7 @@ use buck2_interpreter_for_build::rule::StarlarkRuleCallable;
 use buck2_interpreter_for_build::rule::frozen_rule_attribute_spec;
 use buck2_node::attrs::spec::AttributeSpec;
 use buck2_node::bzl_or_bxl_path::BzlOrBxlPath;
+use buck2_node::rule_type::RuleType;
 use dice::DiceComputations;
 use dice_futures::cancellation::CancellationObserver;
 use dupe::Dupe;
@@ -57,11 +58,10 @@ use starlark::typing::ParamSpec;
 use starlark::util::ArcStr;
 use starlark::values::StringValue;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
-use starlark::values::list::UnpackList;
 use starlark::values::structs::StructRef;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::StarlarkCallable;
@@ -113,12 +113,15 @@ pub(crate) fn register_anon_rule(globals: &mut GlobalsBuilder) {
             BxlAnonCallbackParamSpec,
             ListType<AbstractProvider>,
         >,
-        #[starlark(require = named)] attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
+        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
         #[starlark(require = named, default = "")] doc: &str,
-        #[starlark(require = named, default = BuckMutInsertionMap::default())]
-        artifact_promise_mappings: BuckMutInsertionMap<
-            StringValue<'v>,
-            StarlarkCallable<'v, (Value<'static>,), UnpackList<Value<'static>>>,
+        #[starlark(require = named, default = ValueOf::empty_dict())]
+        artifact_promise_mappings: ValueOf<
+            'v,
+            DictType<
+                StringValue<'v>,
+                StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
+            >,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkRuleCallable<'v>> {
@@ -163,10 +166,10 @@ impl AnonImpl {
         &self,
         eval: &mut Evaluator<'v, '_, '_>,
         bxl_ctx: ValueTyped<'v, BxlContext<'v>>,
-        attrs: ValueOfUnchecked<'v, StructRef<'static>>,
+        attrs: ValueOf<'v, StructRef<'v>>,
     ) -> buck2_error::Result<Value<'v>> {
         let anon_impl = get_rule_impl(eval, &self.module, &self.name)?;
-        eval.eval_function(anon_impl, &[bxl_ctx.to_value(), attrs.get()], &[])
+        eval.eval_function(anon_impl, &[bxl_ctx.to_value(), attrs.to_value()], &[])
             .map_err(|e| e.into())
     }
 
@@ -354,7 +357,8 @@ async fn eval_bxl_for_anon_target_inner(
                 num_declared_artifacts,
                 validations,
                 requested_anon_targets,
-            ),
+                RuleType::Starlark(anon_target.rule_type().dupe()),
+            )?,
         ))
     })
 }

@@ -9,9 +9,9 @@
 load(":manifest.bzl", "ManifestInfo")
 load(":toolchain.bzl", "PythonToolchainInfo")
 
-def compile_manifests(ctx: AnalysisContext, manifests: list[ManifestInfo]) -> ManifestInfo:
-    mode = "UNCHECKED_HASH"
-    has_content_based_path = ctx.attrs._python_toolchain[PythonToolchainInfo].supports_content_based_paths == True
+def compile_manifests(ctx: AnalysisContext, manifests: list[ManifestInfo], mode: str = "UNCHECKED_HASH") -> ManifestInfo:
+    # packagers only resolve content-based paths under `bytecode_UNCHECKED_HASH`
+    has_content_based_path = mode == "UNCHECKED_HASH" and ctx.attrs._python_toolchain[PythonToolchainInfo].supports_content_based_paths == True
     output = ctx.actions.declare_output("bytecode_{}".format(mode), dir = True, has_content_based_path = has_content_based_path)
     bytecode_manifest = ctx.actions.declare_output("bytecode_{}.manifest".format(mode), has_content_based_path = has_content_based_path)
     cmd = [
@@ -32,16 +32,10 @@ def compile_manifests(ctx: AnalysisContext, manifests: list[ManifestInfo]) -> Ma
     # support invalidating cached pyc compile actions by bumping the env var.
     # the value itself is meaningless, just the fact it changes is meaningful.
     # using the PYC magic number for *convenience* only
-    version = ctx.attrs._python_toolchain[PythonToolchainInfo].version
-    if version and "cinder" in version:
-        # for Cinder, this is a workaround...
-        # this action *should* use the bundled (in-repo) runtime for compilation
-        # (and then the change in the Cinder codebase would be sufficient to invalidate caches)
-        # currently though, the action uses the platform Cinder for PYC compilation,
-        # and these are deployed in-place (no change to toolchain paths),
-        # so we need to force cache invalidation when needed (e.g. for S411091)
-        env["CINDER_DUMMY_PYC_CACHE_BUSTER"] = "3451"
-    elif version and "3.12" in version:
+    toolchain = ctx.attrs._python_toolchain[PythonToolchainInfo]
+    python_version = toolchain.python_version
+    is_python312 = python_version.version_tuple == (3, 12) if python_version else (toolchain.version and "3.12" in toolchain.version)
+    if is_python312:
         # for CPython, the magic number *shouldn't* change during the lifetime of a feature release
         # but internally we do make more significant changes (rarely),
         # so for those cases we support forced invalidation using this env var

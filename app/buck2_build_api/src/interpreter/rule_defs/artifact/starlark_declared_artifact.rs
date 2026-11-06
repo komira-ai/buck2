@@ -25,8 +25,6 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::codemap::FileSpan;
-use starlark::collections::StarlarkHasher;
-use starlark::environment::Methods;
 use starlark::values::AllocValue;
 use starlark::values::Demand;
 use starlark::values::Freeze;
@@ -39,8 +37,9 @@ use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::starlark_value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
@@ -48,12 +47,11 @@ use crate::artifact_groups::ArtifactGroup;
 use crate::interpreter::rule_defs::artifact::ArtifactError;
 use crate::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use crate::interpreter::rule_defs::artifact::methods::EitherStarlarkInputArtifact;
-use crate::interpreter::rule_defs::artifact::methods::artifact_methods;
 use crate::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ArtifactFingerprint;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
-use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
 use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
 use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
@@ -227,13 +225,12 @@ impl<'v> StarlarkInputArtifactLike<'v> for StarlarkDeclaredArtifact<'v> {
 
     fn with_associated_artifacts(
         &'v self,
-        artifacts: UnpackList<ValueAsInputArtifactLike<'v>>,
+        artifacts: ValueOf<'v, ListType<StarlarkArtifactView<'v>>>,
     ) -> buck2_error::Result<EitherStarlarkInputArtifact<'v>> {
         let artifacts = artifacts
-            .items
-            .iter()
-            .map(|a| a.0.get_artifact_group())
-            .collect::<Result<Vec<_>, _>>()?;
+            .try_items()
+            .map(|a| a?.as_input_artifact_like().get_artifact_group())
+            .collect::<buck2_error::Result<Vec<_>>>()?;
 
         let artifacts = AssociatedArtifacts::from(artifacts);
 
@@ -327,23 +324,9 @@ impl<'v> AllocValue<'v> for StarlarkDeclaredArtifact<'v> {
     }
 }
 
-starlark::methods_static!(STARLARK_DECLARED_ARTIFACT_METHODS = artifact_methods);
-
-#[starlark_value(type = "Artifact", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value]
 impl<'v> StarlarkValue<'v> for StarlarkDeclaredArtifact<'v> {
-    type Canonical = StarlarkArtifact;
-
-    fn get_methods() -> Option<&'static Methods> {
-        Some(STARLARK_DECLARED_ARTIFACT_METHODS.methods())
-    }
-
-    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
-        StarlarkArtifactLike::equals(self, other)
-    }
-
-    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
-        StarlarkArtifactLike::write_hash(self, hasher)
-    }
+    type Type = StarlarkArtifactView<'v>;
 
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         demand.provide_value::<&dyn CommandLineArgLike>(self);

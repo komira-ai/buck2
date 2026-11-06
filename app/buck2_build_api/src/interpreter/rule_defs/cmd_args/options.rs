@@ -21,16 +21,11 @@ use derive_more::Display;
 use display_container::fmt_container;
 use dupe::Dupe;
 use mini_vec::MiniBoxSlice;
+use mini_vec::MiniVec;
 use pagable::Pagable;
-use pagable::PagableDeserialize;
-use pagable::PagableSerialize;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
-use starlark::pagable::StarlarkDeserialize;
-use starlark::pagable::StarlarkDeserializeContext;
-use starlark::pagable::StarlarkSerialize;
-use starlark::pagable::StarlarkSerializeContext;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
@@ -39,13 +34,13 @@ use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::string::StarlarkStr;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use strong_hash::StrongHash;
 
-use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
-use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifactUnpack;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
+use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifactView;
 use crate::interpreter::rule_defs::cmd_args::regex::CmdArgsRegex;
 
 /// Supported ways of quoting arguments.
@@ -104,7 +99,7 @@ pub(crate) trait CommandLineOptionsTrait<'v> {
 #[repr(C)]
 pub(crate) struct CommandLineOptions<'v> {
     // These impact how artifacts are rendered
-    pub(crate) relative_to: Option<(ValueOfUnchecked<'v, RelativeOrigin<'v>>, u32)>,
+    pub(crate) relative_to: Option<(ValueOf<'v, RelativeOrigin<'v>>, u32)>,
     pub(crate) absolute_prefix: Option<StringValue<'v>>,
     pub(crate) absolute_suffix: Option<StringValue<'v>>,
     pub(crate) parent: u32,
@@ -116,8 +111,7 @@ pub(crate) struct CommandLineOptions<'v> {
     pub(crate) format: Option<StringValue<'v>>,
     pub(crate) prepend: Option<StringValue<'v>>,
     pub(crate) quote: Option<QuoteStyle>,
-    #[allow(clippy::box_collection)]
-    pub(crate) replacements: Option<Box<Vec<(CmdArgsRegex<'v>, StringValue<'v>)>>>,
+    pub(crate) replacements: MiniVec<(CmdArgsRegex<'v>, StringValue<'v>)>,
 }
 
 #[derive(Clone, Copy, Dupe, Default)]
@@ -167,7 +161,7 @@ impl<'v, 'a> Serialize for OptionsReplacementsRef<'v, 'a> {
 #[derive(Default, Serialize)]
 pub(crate) struct CommandLineOptionsRef<'v, 'a> {
     #[serde(serialize_with = "serialize_opt_display")]
-    pub(crate) relative_to: Option<(ValueOfUnchecked<'v, RelativeOrigin<'v>>, u32)>,
+    pub(crate) relative_to: Option<(ValueOf<'v, RelativeOrigin<'v>>, u32)>,
     pub(crate) absolute_prefix: Option<StringValue<'v>>,
     pub(crate) absolute_suffix: Option<StringValue<'v>>,
     pub(crate) parent: u32,
@@ -194,11 +188,7 @@ impl<'v, 'a> CommandLineOptionsRef<'v, 'a> {
             format: self.format,
             prepend: self.prepend,
             quote: self.quote.dupe(),
-            replacements: if self.replacements.is_empty() {
-                None
-            } else {
-                Some(Box::new(self.replacements.iter().collect()))
-            },
+            replacements: self.replacements.iter().collect(),
         }
     }
 }
@@ -228,17 +218,14 @@ impl<'v> CommandLineOptionsTrait<'v> for CommandLineOptions<'v> {
             format: self.format,
             prepend: self.prepend,
             quote: self.quote.dupe(),
-            replacements: match &self.replacements {
-                None => OptionsReplacementsRef::default(),
-                Some(v) => OptionsReplacementsRef(v.as_slice()),
-            },
+            replacements: OptionsReplacementsRef(self.replacements.as_slice()),
         }
     }
 }
 
 #[derive(Debug, Allocative, StarlarkPagable)]
 enum FrozenCommandLineOption<'v> {
-    RelativeTo(ValueOfUnchecked<'v, RelativeOrigin<'v>>, u32),
+    RelativeTo(ValueOf<'v, RelativeOrigin<'v>>, u32),
     AbsolutePrefix(StringValue<'v>),
     AbsoluteSuffix(StringValue<'v>),
     Parent(u32),
@@ -248,46 +235,14 @@ enum FrozenCommandLineOption<'v> {
     Format(StringValue<'v>),
     Prepend(StringValue<'v>),
     Quote(#[starlark_pagable(pagable)] QuoteStyle),
-    Replacements(
-        #[starlark_pagable(
-            serialize_with = "serialize_minibox_starlark",
-            deserialize_with = "deserialize_minibox_starlark"
-        )]
-        MiniBoxSlice<(CmdArgsRegex<'v>, StringValue<'v>)>,
-    ),
+    Replacements(MiniBoxSlice<(CmdArgsRegex<'v>, StringValue<'v>)>),
 }
 
 size_assert::words_of_type!(FrozenCommandLineOption<'static>, 2);
 
 #[derive(Debug, Default, ProvidesStaticType, Allocative, StarlarkPagable)]
 pub(crate) struct FrozenCommandLineOptions<'v> {
-    #[starlark_pagable(
-        serialize_with = "serialize_minibox_starlark",
-        deserialize_with = "deserialize_minibox_starlark"
-    )]
     options: MiniBoxSlice<FrozenCommandLineOption<'v>>,
-}
-
-fn serialize_minibox_starlark<T: StarlarkSerialize>(
-    field: &MiniBoxSlice<T>,
-    ctx: &mut dyn StarlarkSerializeContext,
-) -> starlark::Result<()> {
-    PagableSerialize::pagable_serialize(&field.len(), ctx.pagable())?;
-    for item in field.iter() {
-        StarlarkSerialize::starlark_serialize(item, ctx)?;
-    }
-    Ok(())
-}
-
-fn deserialize_minibox_starlark<'fv, T: StarlarkDeserialize<'fv>>(
-    ctx: &mut dyn StarlarkDeserializeContext<'_, 'fv>,
-) -> starlark::Result<MiniBoxSlice<T>> {
-    let len = usize::pagable_deserialize(ctx.pagable())?;
-    let mut items = Vec::with_capacity(len);
-    for _ in 0..len {
-        items.push(T::starlark_deserialize(ctx)?);
-    }
-    Ok(MiniBoxSlice::from_iter(items))
 }
 
 impl<'v> FrozenCommandLineOptions<'v> {
@@ -414,9 +369,8 @@ impl<'v> Freeze<'v> for CommandLineOptions<'v> {
 
         let mut options = Vec::new();
         if let Some((relative_to, parent)) = relative_to {
-            let relative_to = freezer.freeze(relative_to.get())?;
             options.push(FrozenCommandLineOption::RelativeTo(
-                ValueOfUnchecked::new(relative_to),
+                Freeze::freeze(relative_to, freezer)?,
                 parent,
             ));
         }
@@ -452,11 +406,9 @@ impl<'v> Freeze<'v> for CommandLineOptions<'v> {
         if let Some(quote) = quote {
             options.push(FrozenCommandLineOption::Quote(quote));
         }
-        if let Some(replacements) = replacements {
-            if !replacements.is_empty() {
-                let replacements = MiniBoxSlice::from_iter(Freeze::freeze(*replacements, freezer)?);
-                options.push(FrozenCommandLineOption::Replacements(replacements));
-            }
+        if !replacements.is_empty() {
+            let replacements = MiniBoxSlice::from(Freeze::freeze(replacements, freezer)?);
+            options.push(FrozenCommandLineOption::Replacements(replacements));
         }
 
         Ok(FrozenCommandLineOptions {
@@ -477,10 +429,10 @@ where
 
 // NOTE: This is an enum as opposed to a trait because of the `C` parameter on (which is required
 // because upcasting is not stable).
-#[derive(Display, StarlarkTypeRepr, UnpackValue)]
+#[derive(Display, StarlarkTypeRepr, UnpackValue, ProvidesStaticType)]
 pub(crate) enum RelativeOrigin<'v> {
-    OutputArtifact(StarlarkOutputArtifactUnpack<'v>),
-    Artifact(&'v dyn StarlarkInputArtifactLike<'v>),
+    OutputArtifact(StarlarkOutputArtifactView<'v>),
+    Artifact(StarlarkArtifactView<'v>),
     CellRoot(&'v CellRoot),
     /// Bit of a useless variant since this is simply the default, but we allow it for consistency.
     ProjectRoot(&'v StarlarkProjectRoot),
@@ -533,7 +485,7 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
         if let Some((value, index)) = relative_to {
             iter.push((
                 "relative_to",
-                CommandLineOptionsIterItem::Value(value.get()),
+                CommandLineOptionsIterItem::Value(value.to_value()),
             ));
             if *index != 0 {
                 iter.push((

@@ -112,20 +112,16 @@ fn write_buffer_rows() -> usize {
     })
 }
 
-/// A set-but-unusable value falls back loudly: a typo silently measuring the
-/// default would produce a wrong conclusion. `default` 0 = off unless set.
+/// A set-but-unusable value is a panic: these are measurement probes, and a
+/// typo silently measuring the default would produce a wrong conclusion.
+/// `default` 0 = off unless set.
 fn parse_positive_env(var: &str, default: usize) -> usize {
     let Some(raw) = env::var_os(var) else {
         return default;
     };
     match raw.to_str().and_then(|v| v.parse::<usize>().ok()) {
         Some(v) if v > 0 => v,
-        _ => {
-            tracing::warn!(
-                "ignoring {var}={raw:?}: not a positive integer; using default {default}"
-            );
-            default
-        }
+        _ => panic!("{var}={raw:?} is not a positive integer"),
     }
 }
 
@@ -732,10 +728,6 @@ impl SqliteBackedPagableStorage {
                     Err((_, error)) if is_busy(&error) && waits < BUSY_READ_RETRIES => {
                         waits += 1;
                         self.busy_read_retries.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            "sqlite read of key {key:?} waited {BUSY_TIMEOUT:?} for the shard's \
-                             lock (SQLITE_BUSY); retry {waits} of {BUSY_READ_RETRIES}"
-                        );
                     }
                     Err((what, error)) => {
                         return Err(sqlite_read_error(key, what, error, waits + 1));

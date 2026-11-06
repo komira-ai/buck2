@@ -24,13 +24,14 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_signals::env::WaitingData;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
@@ -38,14 +39,20 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckMutInsertionSet;
 use dupe::Dupe;
 use itertools::Itertools;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use starlark::values::OwnedFrozen;
 use starlark::values::Value;
 use starlark::values::ValueError;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::ValueOf;
+use starlark::values::dict::DictType;
 
+use crate::actions::impls::cas_probe;
+use crate::actions::impls::cas_probe::SourceFile;
 use crate::actions::impls::copy::CopyMode;
+use crate::actions::impls::produce;
+use crate::actions::impls::produce::SourceCopy;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -128,22 +135,21 @@ impl UnregisteredAssembledDirAction {
     // Map each artifact into an optional tuple of (artifact, path) and associated_artifacts, then collect
     // them into an optional tuple of vector and an index set respectively
     fn unpack_args<'v>(
-        srcs: UnpackDictEntries<&'v str, ValueAsInputArtifactLike<'v>>,
+        srcs: ValueOf<'v, DictType<&'v str, StarlarkArtifactView<'v>>>,
         copy: CopyMode,
     ) -> buck2_error::Result<(
         Vec<(ArtifactGroup, Box<ForwardRelativePath>, CopyMode)>,
         BuckMutInsertionSet<ArtifactGroup>,
     )> {
-        // This assignment doesn't look like it should be necessary, but we get an error if we
-        // don't do it.
-        let len = srcs.entries.len();
-        srcs.entries
-            .into_iter()
-            .map(|(k, as_artifact)| {
-                let associates = as_artifact.0.get_associated_artifacts();
+        let len = srcs.dict().len();
+        srcs.try_items()
+            .map(|entry| {
+                let (k, as_artifact) = entry?;
+                let as_artifact = as_artifact.as_input_artifact_like();
+                let associates = as_artifact.get_associated_artifacts();
                 buck2_error::Ok((
                     (
-                        as_artifact.0.get_artifact_group()?,
+                        as_artifact.get_artifact_group()?,
                         ForwardRelativePathBuf::try_from(k.to_owned())
                             .buck_error_context("dict key must be a forward relative path")?
                             .into_box(),
@@ -166,7 +172,7 @@ impl UnregisteredAssembledDirAction {
 
     pub(crate) fn new<'v>(
         copy: CopyMode,
-        srcs: UnpackDictEntries<&'v str, ValueAsInputArtifactLike<'v>>,
+        srcs: ValueOf<'v, DictType<&'v str, StarlarkArtifactView<'v>>>,
     ) -> buck2_error::Result<Self> {
         let (mut args, unioned_associated_artifacts) = Self::unpack_args(srcs, copy)
             // FIXME: This warning is talking about the Starlark-level argument name `srcs`.
@@ -193,14 +199,15 @@ impl UnregisteredAssembledDirAction {
     /// non-overlapping -- mixing copies and symlinks under overlapping paths
     /// is ill-defined.
     pub(crate) fn new_assembled<'v>(
-        contents: Vec<(&'v str, ValueAsInputArtifactLike<'v>, CopyMode)>,
+        contents: Vec<(&'v str, StarlarkArtifactView<'v>, CopyMode)>,
     ) -> buck2_error::Result<Self> {
         let mut args = Vec::with_capacity(contents.len());
         let mut assocs = BuckMutInsertionSet::new();
         for (k, as_artifact, mode) in contents {
-            let associates = as_artifact.0.get_associated_artifacts();
+            let as_artifact = as_artifact.as_input_artifact_like();
+            let associates = as_artifact.get_associated_artifacts();
             args.push((
-                as_artifact.0.get_artifact_group()?,
+                as_artifact.get_artifact_group()?,
                 ForwardRelativePathBuf::try_from(k.to_owned())
                     .buck_error_context("dict key must be a forward relative path")?
                     .into_box(),
@@ -231,7 +238,7 @@ impl UnregisteredAction for UnregisteredAssembledDirAction {
         _error_handler: Option<OwnedFrozen<Value<'static>>>,
     ) -> buck2_error::Result<Box<dyn Action>> {
         Ok(Box::new(AssembledDirAction {
-            args: self.args,
+            args: self.args.into(),
             outputs: BoxSliceSet::from(outputs),
             category: self.category,
         }))
@@ -240,7 +247,7 @@ impl UnregisteredAction for UnregisteredAssembledDirAction {
 
 #[derive(Debug, Allocative, Pagable)]
 struct AssembledDirAction {
-    args: Vec<(ArtifactGroup, Box<ForwardRelativePath>, CopyMode)>,
+    args: MiniBoxSlice<(ArtifactGroup, Box<ForwardRelativePath>, CopyMode)>,
     outputs: BoxSliceSet<BuildArtifact>,
     category: DirActionCategory,
 }
@@ -293,6 +300,7 @@ impl Action for AssembledDirAction {
         )?;
         let mut builder = ArtifactValueBuilder::new(fs, ctx.digest_config());
         let mut srcs = Vec::new();
+        let mut source_files = Vec::new();
 
         for (group, relative_dest, copy) in &self.args {
             let (src_artifact, value) =
@@ -324,6 +332,16 @@ impl Action for AssembledDirAction {
                         temp_dest.as_ref(),
                         *executable_bit_override,
                     )?;
+                    if src_artifact.is_source() {
+                        for (path, metadata) in cas_probe::walk_files(&dest_entry) {
+                            source_files.push((
+                                src.join(&path),
+                                relative_dest.join(&path),
+                                metadata,
+                                *executable_bit_override,
+                            ));
+                        }
+                    }
                     srcs.push((
                         src,
                         relative_dest,
@@ -349,28 +367,74 @@ impl Action for AssembledDirAction {
             }
             .as_ref(),
         )?;
-        let srcs = srcs
-            .into_iter()
-            .map(
-                |(src, relative_dest, dest_entry, executable_bit_override)| {
-                    CopiedArtifact::new(
-                        src,
-                        actual_output.join(relative_dest),
-                        dest_entry,
-                        executable_bit_override,
-                    )
-                },
-            )
-            .collect_vec();
-
-        ctx.materializer()
-            .declare_copy(actual_output, value.dupe(), srcs)
-            .await?;
+        let materializer = ctx.materializer();
+        let execution_kind = if materializer.is_disk_state() {
+            // The output's structure is in its value; copies of buck-out content are nothing to
+            // the core and symlinks copy nothing. Copied source files are not known to be in the
+            // CAS, and the probe a `copy` makes asks about them a file at a time: the files are
+            // action inputs the CAS usually has, while the directory assembled here is in the CAS
+            // only if some action uploaded it in this exact shape. The files the CAS lacks are
+            // made under their own paths, or uploaded, as a write's misses are; the rest is CAS
+            // content.
+            let files: Vec<SourceFile> = source_files
+                .iter()
+                .map(|(src, _, metadata, _)| (src.clone(), metadata.dupe()))
+                .collect();
+            let probed = if files.is_empty() {
+                None
+            } else {
+                cas_probe::missing(ctx, &files).await
+            };
+            let (uploadable, to_make): (bool, Vec<usize>) = match &probed {
+                Some((_, missing)) => (true, missing.clone()),
+                None => (false, (0..source_files.len()).collect()),
+            };
+            let copies: Vec<SourceCopy> = to_make
+                .into_iter()
+                .map(|i| {
+                    let (src, path, metadata, executable_bit_override) = &source_files[i];
+                    SourceCopy {
+                        src: src.clone(),
+                        dest: actual_output.join(path),
+                        value: ArtifactValue::file(metadata.dupe()),
+                        executable_bit_override: *executable_bit_override,
+                    }
+                })
+                .collect();
+            if copies.is_empty() {
+                if probed.is_some() {
+                    ActionExecutionKind::Deferred
+                } else {
+                    ActionExecutionKind::Simple
+                }
+            } else {
+                produce::produce_copies(ctx, copies, uploadable).await?
+            }
+        } else {
+            // The deferred core is declared the copy, made when something needs the directory.
+            let srcs = srcs
+                .into_iter()
+                .map(
+                    |(src, relative_dest, dest_entry, executable_bit_override)| {
+                        CopiedArtifact::new(
+                            src,
+                            actual_output.join(relative_dest),
+                            dest_entry,
+                            executable_bit_override,
+                        )
+                    },
+                )
+                .collect_vec();
+            materializer
+                .declare_copy(actual_output, value.dupe(), srcs)
+                .await?;
+            ActionExecutionKind::Simple
+        };
         Ok((
             ActionOutputs::from_single(self.output().get_path().dupe(), value),
             ActionExecutionMetadata {
                 dep_file_db_writes_queued: 0,
-                execution_kind: ActionExecutionKind::Simple,
+                execution_kind,
                 timing: ActionExecutionTimingData::default(),
                 input_files_bytes: None,
                 waiting_data,

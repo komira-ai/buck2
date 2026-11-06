@@ -23,7 +23,7 @@ use buck2_build_api::anon_target::AnonTargetDependentAnalysisResults;
 use buck2_build_api::anon_target::AnonTargetDyn;
 use buck2_build_api::artifact_groups::promise::PromiseArtifactId;
 use buck2_build_api::artifact_groups::promise::PromiseArtifactResolveError;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::pair::ConfigurationNoExec;
 use buck2_core::content_hash::ContentBasedPathHash;
@@ -48,7 +48,7 @@ use buck2_hash::BuckMutMap;
 use buck2_interpreter::dice::starlark_provider::DynEvalKindKey;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_node::attrs::spec::AttributeSpec;
-use buck2_node::attrs::values::AttrValues;
+use buck2_node::attrs::values::SortedAttrValues;
 use buck2_node::rule_type::StarlarkRuleType;
 use buck2_util::strong_hasher::Blake3StrongHasher;
 use cmp_any::PartialEqAny;
@@ -60,7 +60,7 @@ use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::structs::AllocStruct;
 use starlark::values::structs::StructRef;
 use strong_hash::StrongHash;
@@ -76,7 +76,7 @@ use crate::anon_target_attr_resolve::AnonTargetAttrResolutionContext;
 /// from the same value passed explicitly. Attribute names are not stored;
 /// ids resolve against the [`AttributeSpec`] of the rule identified by the
 /// `rule_type` stored alongside this in [`AnonTarget`].
-pub(crate) type AnonAttrValues = AttrValues<AnonTargetAttr>;
+pub(crate) type AnonAttrValues = SortedAttrValues<AnonTargetAttr>;
 
 #[derive(Eq, PartialEq, Clone, Debug, Allocative, Pagable)]
 pub(crate) struct AnonTarget {
@@ -210,7 +210,7 @@ impl AnonTargetDyn for AnonTarget {
         attrs_spec: &AttributeSpec,
         dependents_analyses: AnonTargetDependentAnalysisResults<'_>,
         exec_resolution: ExecutionPlatformResolution,
-    ) -> buck2_error::Result<ValueOfUnchecked<'v, StructRef<'static>>> {
+    ) -> buck2_error::Result<ValueOf<'v, StructRef<'v>>> {
         let dep_analysis_results =
             get_deps_from_analysis_results(dependents_analyses.dep_analysis_results)?;
 
@@ -249,11 +249,10 @@ impl AnonTargetDyn for AnonTarget {
         // Storage order (attribute ids) is an internal detail; present the
         // fields in name order.
         resolved_attrs.sort_unstable_by_key(|(name, _)| *name);
-        let attributes = env
-            .heap()
-            .alloc_typed_unchecked(AllocStruct(resolved_attrs))
-            .cast();
-        Ok(attributes)
+        Ok(ValueOf::alloc_struct(
+            env.heap(),
+            AllocStruct(resolved_attrs),
+        ))
     }
 
     fn get_fulfilled_promise_artifacts<'v>(
@@ -271,8 +270,11 @@ impl AnonTargetDyn for AnonTarget {
                 let promise_id =
                     PromiseArtifactId::new(BaseDeferredKey::AnonTarget(self.dupe()), id);
 
-                match ValueAsInputArtifactLike::unpack_value(artifact)? {
-                    Some(artifact) => Ok((promise_id, artifact.0.get_bound_artifact()?)),
+                match StarlarkArtifactView::unpack_value(artifact)? {
+                    Some(artifact) => Ok((
+                        promise_id,
+                        artifact.as_input_artifact_like().get_bound_artifact()?,
+                    )),
                     None => {
                         Err(PromiseArtifactResolveError::NotAnArtifact(artifact.to_repr()).into())
                     }

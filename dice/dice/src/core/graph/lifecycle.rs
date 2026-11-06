@@ -8,6 +8,9 @@
  * above-listed licenses.
  */
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use allocative::Allocative;
 use dupe::Dupe;
 use pagable::DataKey;
@@ -50,6 +53,30 @@ pub(crate) enum RowCommitted {
 pub(crate) struct BackedValue {
     pub(crate) value: DiceValidValue,
     pub(crate) data_key: DataKey,
+    /// Size of the row's top-level serialized blob, excluding nested `PagableArc` sub-values;
+    /// zero when the value became backed without its row being read or written.
+    pub(crate) serialized_bytes: u64,
+    /// When the value became backed; see [`residency_cutoff`].
+    residency_generation: u64,
+}
+
+static RESIDENCY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A generation no earlier than that of any value backed so far, and earlier than that of any
+/// value backed from now on.
+pub(crate) fn residency_cutoff() -> u64 {
+    RESIDENCY_GENERATION.load(Ordering::Relaxed)
+}
+
+impl BackedValue {
+    fn new(value: DiceValidValue, data_key: DataKey, serialized_bytes: u64) -> Box<Self> {
+        Box::new(Self {
+            value,
+            data_key,
+            serialized_bytes,
+            residency_generation: RESIDENCY_GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
+        })
+    }
 }
 
 mini_vec::size_assert::words_of_type!(PagableValue, 3);
@@ -112,37 +139,45 @@ impl PagableValue {
     }
 
     /// Makes a paged-out value resident again with `value`, which was read back from its
-    /// `DataKey` or has just been proven equal to it. Under [`PageOutPolicy::OncePerValue`] the
-    /// row keeps backing it.
-    pub(crate) fn make_resident(&mut self, value: DiceValidValue, policy: PageOutPolicy) {
+    /// `DataKey` (a row of `serialized_bytes`) or has just been proven equal to it (pass zero).
+    /// Under [`PageOutPolicy::OncePerValue`] the row keeps backing it.
+    pub(crate) fn make_resident(
+        &mut self,
+        value: DiceValidValue,
+        serialized_bytes: u64,
+        policy: PageOutPolicy,
+    ) {
         if let PagableValue::PagedOut(data_key) = *self {
             *self = match policy {
                 PageOutPolicy::OncePerKey => PagableValue::Recomputed(value),
                 PageOutPolicy::OncePerValue => {
-                    PagableValue::Backed(Box::new(BackedValue { value, data_key }))
+                    PagableValue::Backed(BackedValue::new(value, data_key, serialized_bytes))
                 }
             };
         }
     }
 
-    /// The row at `data_key` now holds this value. A value never paged out is evicted under
-    /// [`EvictionPolicy::OnIdle`]; otherwise it, like a recomputed one, stays resident, backed
-    /// by the row.
+    /// The row at `data_key`, of `serialized_bytes`, now holds this value. A value never paged
+    /// out is evicted under [`EvictionPolicy::OnIdle`]; otherwise it, like a recomputed one,
+    /// stays resident, backed by the row.
     pub(crate) fn row_committed(
         &mut self,
         data_key: DataKey,
+        serialized_bytes: u64,
         policy: EvictionPolicy,
     ) -> RowCommitted {
+        let backed =
+            |value| PagableValue::Backed(BackedValue::new(value, data_key, serialized_bytes));
         match std::mem::replace(self, PagableValue::PagedOut(data_key)) {
             PagableValue::NeverPagedOut(value) => match policy {
                 EvictionPolicy::OnIdle => RowCommitted::Evicted,
                 EvictionPolicy::OnMemoryPressure => {
-                    *self = PagableValue::Backed(Box::new(BackedValue { value, data_key }));
+                    *self = backed(value);
                     RowCommitted::Backed
                 }
             },
             PagableValue::Recomputed(value) => {
-                *self = PagableValue::Backed(Box::new(BackedValue { value, data_key }));
+                *self = backed(value);
                 RowCommitted::Backed
             }
             other => {
@@ -152,11 +187,15 @@ impl PagableValue {
         }
     }
 
-    /// Drops a backed value, leaving its row. Returns whether there was one.
-    pub(crate) fn evict_backed(&mut self) -> bool {
+    /// Drops a value backed no later than `cutoff` (see [`residency_cutoff`]), leaving its row.
+    /// Returns whether there was one.
+    pub(crate) fn evict_backed(&mut self, cutoff: u64) -> bool {
         let PagableValue::Backed(backed) = self else {
             return false;
         };
+        if backed.residency_generation > cutoff {
+            return false;
+        }
         let data_key = backed.data_key;
         *self = PagableValue::PagedOut(data_key);
         true

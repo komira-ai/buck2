@@ -206,8 +206,10 @@ message StdoutStreamingOutput {
 /// Preemption of the running command was detected/allowed
 message CommandPreempted {}
 
-/// The result of a background idle page-out, once it finishes. Logged to the
-/// `buck2_page_outs` table (see the buck2_cleans pipeline).
+/// The result of a background idle page-out, once it finishes, or, for a
+/// command that evicted backed values without starting one, those evictions
+/// (`page_out_started` tells the two apart). Logged to the `buck2_page_outs`
+/// table (see the buck2_cleans pipeline).
 message PageOutSummary {
   map<string, string> metadata = 1;
   /// The command whose finalize triggered this idle page-out.
@@ -264,6 +266,34 @@ message PageOutSummary {
   optional int64 memory_restored_bytes = 25;
   /// Entries in the deserialized-arc cache after this page-out's sweep.
   optional uint64 daemon_arc_cache_entries = 28;
+  /// Backed values dropped by memory-pressure eviction (not by this page-out)
+  /// while this page-out ran, and the memory that freed, measured from the
+  /// allocator like `memory_offloaded_bytes`. Absent if pagable storage is not
+  /// configured; the bytes also when the allocator counters are unreadable.
+  optional uint64 evicted_count = 29;
+  optional int64 evicted_bytes = 30;
+  /// Daemon-lifetime memory-pressure evictions as of this page-out finishing:
+  /// eviction passes, the values they dropped and the memory that freed.
+  /// Difference consecutive rows of a daemon to see what pressure reclaimed
+  /// between its page-outs.
+  optional uint64 daemon_evictions = 31;
+  optional uint64 daemon_evicted_count = 32;
+  optional int64 daemon_evicted_bytes = 33;
+  /// Serialized size of the rows backing resident values after this page-out:
+  /// what the next memory-pressure eviction would drop, in serialized rather
+  /// than in-memory bytes, excluding nested PagableArc sub-values. A lower
+  /// bound; see `PagableNodeCounts::backed_bytes`.
+  optional uint64 evictable_bytes = 34;
+  /// `STARTED` on a row for an idle page-out. Any other value marks a row for a
+  /// command that evicted without starting one, and says why it did not; on
+  /// those rows the page-out fields are unset or zero (`paged_out_count`,
+  /// `duration_ms`, `cancelled`). Absent from manual page-outs.
+  optional PageOutStarted page_out_started = 35;
+  /// Memory-pressure evictions during the command that triggered this row:
+  /// eviction passes, the values they dropped and the memory that freed.
+  optional uint64 command_evictions = 36;
+  optional uint64 command_evicted_count = 37;
+  optional int64 command_evicted_bytes = 38;
 }
 
 // An event that represents a single point in time.
@@ -416,6 +446,9 @@ message InstantEvent {
 
     // Marks the end of the build phase of a command that builds targets.
     BuildPhaseEnd build_phase_end = 69;
+
+    // A settings value seen by this daemon for the first time.
+    BuckSettingsObserved buck_settings_observed = 70;
   }
 }
 
@@ -534,6 +567,16 @@ message PreviousCommandWithMismatchedConfig {
 
 message ConfigurationCreated {
   ConfigurationWithConstraints cfg = 1;
+}
+
+// The Buck settings a daemon runs under, sent once per daemon per distinct
+// value. Ingress stores these keyed by `hash`; invocation records carry the
+// same hash as `buck_settings_hash`.
+message BuckSettingsObserved {
+  // `buck2settings-` followed by the hex digest of `settings_json`.
+  string hash = 1;
+  // The settings as JSON, in the same form `buck2 status` prints.
+  string settings_json = 2;
 }
 
 message EndOfTestResults {
@@ -662,7 +705,7 @@ enum PageOutStarted {
   PAGE_OUT_STARTED_UNSPECIFIED = 0;
   // A background idle page-out was scheduled.
   PAGE_OUT_STARTED_STARTED = 1;
-  // Idle page-out is disabled: `buck2_hydration.page_out_on_idle` unset, or
+  // Idle page-out is disabled: `hydration.page_out_on_idle` off, or
   // `hydration.eviction_policy` is `on_memory_pressure` on a daemon with no
   // memory tracker, so nothing a page-out wrote would ever be evicted.
   PAGE_OUT_STARTED_DISABLED = 2;
@@ -719,6 +762,17 @@ message PagingSummary {
   optional uint64 paging_arc_cache_entries = 20;
   // Daemon-lifetime totals, not a per-command delta.
   optional StarlarkPartialDeserStats starlark_partial_deser = 17;
+  // Memory-pressure eviction during this command (delta vs the command-start
+  // baseline): eviction passes, the backed values they dropped, and the memory
+  // that freed, measured from the allocator. Absent if pagable storage is not
+  // configured; the bytes also when the allocator counters are unreadable.
+  optional uint64 paging_evictions = 21;
+  optional uint64 paging_evicted_count = 22;
+  optional int64 paging_evicted_bytes = 23;
+  // Serialized size of the rows backing resident values at command end: what
+  // the next memory-pressure eviction would drop, in serialized rather than
+  // in-memory bytes, excluding nested PagableArc sub-values. A lower bound.
+  optional uint64 paging_evictable_bytes = 24;
 }
 
 // What paging in a Starlark value costs at heap granularity versus value
@@ -816,8 +870,7 @@ message StructuredError {
   // Is this error indicative of the RE action cache returning corrupted
   // results?
   bool action_cache_is_corrupted = 10;
-  // Whether the error should be converted to a hard error in the future.
-  bool deprecation = 11;
+  reserved 11;
 }
 
 message CriticalPathEntry {
@@ -1252,6 +1305,12 @@ message Snapshot {
   uint64 buck2_system_cpu_us = 3;
   // Queue size of the blocking executor.
   uint64 blocking_executor_io_queue_size = 4;
+  // Inline I/O on the blocking executor: operations running on their caller's
+  // thread right now, and operations waiting for a permit to do so. The pooled
+  // executor bounds them to the host's parallelism; the direct one does not
+  // wait, so `waiting` stays zero under it.
+  uint64 blocking_executor_io_inline_in_flight = 19;
+  uint64 blocking_executor_io_inline_waiting = 20;
   // Tokio blocking queue depth.
   uint64 tokio_blocking_queue_depth = 14;
   // Tokio num idle blocking threads.
@@ -1299,6 +1358,8 @@ message Snapshot {
   uint64 write_action_cache_populate_failures = 1213;
   uint64 write_action_cache_verified = 1214;
   uint64 write_action_cache_mismatches = 1215;
+  uint64 write_action_cache_uploaded = 1216;
+  uint64 write_action_cache_written = 1217;
 
   // I/O operations in progress.
   uint32 io_in_flight_copy = 1101;
@@ -1403,6 +1464,11 @@ message Snapshot {
   // holding the same content, rather than downloading, since the daemon
   // started.
   uint64 disk_state_materializer_copied_from_disk = 208;
+  // The BlobStore's memory: the blobs in it and their bytes as compressed, and
+  // the files it has written at their destinations since the daemon started.
+  uint64 blob_store_memory_entries = 209;
+  uint64 blob_store_memory_bytes = 210;
+  uint64 blob_store_memory_served_files = 211;
 
   optional UnixSystemStats unix_system_stats = 300;
 
@@ -1967,6 +2033,10 @@ message CleanStaleStats {
   uint64 unmaterialization_upload_failed_bytes = 67;
   uint64 unmaterialization_upload_skipped_oversize_artifact_count = 68;
   uint64 unmaterialization_upload_skipped_oversize_bytes = 69;
+  // Used bytes (total minus free) on the buck-out filesystem; absent on probe
+  // failure.
+  optional uint64 used_disk_space_bytes_start = 70;
+  optional uint64 used_disk_space_bytes_end = 71;
 }
 
 enum CleanStaleResultKind {
@@ -1985,6 +2055,17 @@ message CleanStaleResult {
     MANUAL_EXPLICIT = 1;
     MANUAL_CONFIGURED = 2;
     SCHEDULED = 3;
+  }
+
+  // What issued the clean-stale run.
+  enum Origin {
+    ORIGIN_UNSPECIFIED = 0;
+    // `buck2 clean --stale` run directly.
+    CLEAN_COMMAND = 1;
+    // `buck2 clean --stale` spawned by `buck2 cleanall --stale`.
+    CLEANALL_COMMAND = 2;
+    // The daemon's clean-stale schedule.
+    DAEMON_SCHEDULE = 3;
   }
 
   enum PolicyMode {
@@ -2030,6 +2111,7 @@ message CleanStaleResult {
   FailurePhase failure_phase = 8;
   AdaptiveOutcome adaptive_outcome = 9;
   bool tracked_only = 10;
+  Origin origin = 11;
 }
 
 message InstallCommandEnd {
@@ -2492,6 +2574,10 @@ message ActionExecutionEnd {
   // before those were built. Inputs that arrive through a transitive set are
   // referenced by the set's id instead of being expanded.
   ActionGraphProducers graph_producers = 50;
+
+  // The name of the execution group the action ran in; empty for the default
+  // execution group.
+  string exec_group = 51;
 }
 
 enum IncrementalKind {
@@ -2566,6 +2652,10 @@ enum UploadResult {
   UPLOAD_RESULT_DEP_FILE_ENTRY_EXISTS = 17;
   // The action declares dep files but does not allow dep-file cache uploads.
   UPLOAD_RESULT_DEP_FILE_UPLOAD_NOT_ALLOWED = 18;
+  // Not uploaded: the command ran locally only because a hybrid executor fell
+  // back to local or local won the race. A local result is published only
+  // where the command was configured to run locally.
+  UPLOAD_RESULT_LOCAL_IN_PLACE_OF_REMOTE = 19;
 }
 
 message CommandInvalidationInfo {
@@ -3367,6 +3457,10 @@ enum CallerKind {
   CALLER_KIND_AGENT = 1;
   CALLER_KIND_COMMAND_SHELL = 2;
   CALLER_KIND_OTHER = 3;
+  // The launching Buck wrapper, identified by its direct-parent PID marker.
+  CALLER_KIND_WRAPPER = 4;
+  // A command launcher that leaves output for its caller, e.g. timeout.
+  CALLER_KIND_COMMAND_WRAPPER = 5;
 }
 
 enum AgentDetectionStopReason {
@@ -3479,6 +3573,8 @@ message InvocationRecord {
   optional uint64 time_to_first_command_execution_start_ms = 45;
   // Total system memory in bytes
   optional uint64 system_total_memory_bytes = 46;
+  // See `SystemInfo.container_memory_limit_bytes`.
+  optional uint64 container_memory_limit_bytes = 776;
   // Information of file changes provided by file watcher
   FileWatcherStats file_watcher_stats = 47;
   // How long did we spend querying the file watcher
@@ -3529,6 +3625,10 @@ message InvocationRecord {
   optional DaemonWasStartedReason daemon_was_started = 751;
   // Set if an event occurred that should trigger a command restart.
   optional bool should_restart = 752;
+  // Hash identifying the Buck settings this command ran under; the settings
+  // themselves are stored by ingress under this key, see
+  // `BuckSettingsObserved`. Unset for commands outside a repository.
+  optional string settings_hash = 775;
   // Metadata provided by the client. Unlike TypedMetadata, this won't become
   // its own column in Scuba, all those entries will land in a NormVector.
   repeated ClientMetadata client_metadata = 76;
@@ -3821,6 +3921,17 @@ message InvocationRecord {
   optional int64 paging_memory_restored_bytes = 462;
   // Entries in the deserialized-arc cache at command end.
   optional uint64 paging_arc_cache_entries = 768;
+  // Memory-pressure eviction during this command: eviction passes, the backed
+  // values they dropped, and the memory that freed, measured from the
+  // allocator. Each pass drops every backed value, which the command then pages
+  // back in as it reads them.
+  optional uint64 paging_evictions = 771;
+  optional uint64 paging_evicted_count = 772;
+  optional int64 paging_evicted_bytes = 773;
+  // Serialized size of the rows backing resident values at command end: what
+  // the next eviction would drop, in serialized rather than in-memory bytes,
+  // excluding nested PagableArc sub-values. A lower bound.
+  optional uint64 paging_evictable_bytes = 774;
 
   // Time from the start of the daemon command span (the same origin as
   // `command_duration`) to the end of the build phase. Absent for commands
@@ -3890,6 +4001,9 @@ message BuildGraphStats {
 message SoftError {
   string category = 1;
   bool is_quiet = 2;
+  // A use of something that is being removed, as opposed to something going
+  // wrong.
+  bool is_deprecation = 3;
 }
 
 message BuildTarget {
@@ -4320,6 +4434,11 @@ message SystemInfo {
   optional string daemon_cgroup_slice_path = 13;
   // Number of CPU cores on the system (from sysconf _SC_NPROCESSORS_ONLN).
   optional uint64 num_cores = 14;
+  // Memory limit of the container the daemon runs in, as published by the
+  // container's launcher. Unlike `system_total_memory_bytes`, which reports
+  // the host, this is the container's own size. Absent outside such
+  // containers.
+  optional uint64 container_memory_limit_bytes = 15;
 }
 
 message CpuCounter {

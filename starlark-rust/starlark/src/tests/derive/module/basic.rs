@@ -24,17 +24,22 @@ use crate::environment::MethodsBuilder;
 use crate::values::Heap;
 use crate::values::StringValue;
 use crate::values::Value;
-use crate::values::ValueOfUnchecked;
-use crate::values::list_or_tuple::UnpackListOrTuple;
+use crate::values::ValueOf;
+use crate::values::list_or_tuple::ListOrTupleType;
+use crate::values::typing::StarlarkIter;
 
 // The examples from the starlark_module documentation.
 #[test]
 fn test_starlark_module() {
     #[starlark_module]
     fn global(builder: &mut GlobalsBuilder) {
-        fn cc_binary(name: &str, srcs: UnpackListOrTuple<&str>) -> anyhow::Result<String> {
+        fn cc_binary<'v>(
+            name: &str,
+            srcs: ValueOf<'v, ListOrTupleType<&'v str>>,
+        ) -> anyhow::Result<String> {
             // real implementation may write it to a global variable
-            Ok(format!("{:?} {:?}", name, srcs.items))
+            let srcs = srcs.try_to_vec().map_err(|e| e.into_anyhow())?;
+            Ok(format!("{name:?} {srcs:?}"))
         }
     }
 
@@ -67,7 +72,7 @@ fn test_starlark_methods() {
 fn test_static_allowed() {
     #[starlark_module]
     fn globals(globals: &mut GlobalsBuilder) {
-        fn test<'v>() -> anyhow::Result<ValueOfUnchecked<'v, &'static str>> {
+        fn test<'v>() -> anyhow::Result<ValueOf<'v, StarlarkIter<&'static str>>> {
             panic!()
         }
     }

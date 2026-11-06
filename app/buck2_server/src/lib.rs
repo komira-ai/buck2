@@ -9,9 +9,9 @@
  */
 
 #![feature(try_blocks)]
-#![feature(used_with_arg)]
 
 pub mod active_commands;
+mod agent_config_guard;
 mod agent_context_validation;
 mod agent_host_guard;
 mod clean_stale;

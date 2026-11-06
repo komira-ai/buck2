@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
-use buck2_common::settings::PackageVisibilityDefaultIntersection;
 use buck2_configured::execution::ExecutionPlatformsKey;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
@@ -28,16 +27,15 @@ use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::buck_mut_insertion_map;
 use buck2_interpreter_for_build::interpreter::calculation::InterpreterResultsKey;
 use buck2_interpreter_for_build::super_package::package_value::SuperPackageValuesImpl;
+use buck2_node::attrs::arena::OwnedCoercedAttr;
 use buck2_node::attrs::attr::Attribute;
 use buck2_node::attrs::attr_type::AttrType;
-use buck2_node::attrs::attr_type::any::AnyAttrType;
 use buck2_node::attrs::attr_type::bool::BoolLiteral;
 use buck2_node::attrs::attr_type::dep::DepAttr;
 use buck2_node::attrs::attr_type::dep::DepAttrTransition;
 use buck2_node::attrs::attr_type::dep::DepAttrType;
 use buck2_node::attrs::attr_type::list::ListLiteral;
 use buck2_node::attrs::attr_type::string::StringLiteral;
-use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::attrs::spec::internal::is_internal_attr;
@@ -53,6 +51,7 @@ use buck2_node::provider_id_set::ProviderIdSet;
 use buck2_node::rule_type::RuleType;
 use buck2_node::rule_type::StarlarkRuleType;
 use buck2_node::super_package::SuperPackage;
+use buck2_settings::PackageVisibilityDefaultIntersection;
 use buck2_util::arc_str::ArcSlice;
 use dice::UserComputationData;
 use dice::testing::DiceBuilder;
@@ -77,12 +76,12 @@ async fn test_get_node() -> buck2_error::Result<()> {
         (
             "bool_field",
             Attribute::new(None, "", AttrType::bool())?,
-            CoercedAttr::Bool(BoolLiteral(false)),
+            OwnedCoercedAttr::new_with(|b| b.encode_bool(false))?,
         ),
         (
             "another_field",
             Attribute::new(None, "", AttrType::string())?,
-            CoercedAttr::String(StringLiteral("some_string".into())),
+            OwnedCoercedAttr::new_with(|b| b.encode_string("some_string"))?,
         ),
         (
             "some_deps",
@@ -91,9 +90,11 @@ async fn test_get_node() -> buck2_error::Result<()> {
                 "",
                 AttrType::list(AttrType::dep(ProviderIdSet::EMPTY, PluginKindSet::EMPTY)),
             )?,
-            CoercedAttr::List(ListLiteral(ArcSlice::new([CoercedAttr::Dep(
-                ProvidersLabel::new(label2.dupe(), ProvidersName::Default),
-            )]))),
+            OwnedCoercedAttr::new_with(|b| {
+                let dep =
+                    b.encode_dep(&ProvidersLabel::new(label2.dupe(), ProvidersName::Default))?;
+                b.encode_list(&[dep])
+            })?,
         ),
     ];
 
@@ -103,12 +104,12 @@ async fn test_get_node() -> buck2_error::Result<()> {
         (
             "bool_field",
             Attribute::new(None, "", AttrType::bool())?,
-            CoercedAttr::Bool(BoolLiteral(true)),
+            OwnedCoercedAttr::new_with(|b| b.encode_bool(true))?,
         ),
         (
             "another_field",
             Attribute::new(None, "", AttrType::string())?,
-            CoercedAttr::String(StringLiteral("another_string".into())),
+            OwnedCoercedAttr::new_with(|b| b.encode_string("another_string"))?,
         ),
         (
             "some_deps",
@@ -117,7 +118,7 @@ async fn test_get_node() -> buck2_error::Result<()> {
                 "",
                 AttrType::list(AttrType::dep(ProviderIdSet::EMPTY, PluginKindSet::EMPTY)),
             )?,
-            AnyAttrType::empty_list(),
+            OwnedCoercedAttr::new_with(|b| b.encode_list(&[]))?,
         ),
     ];
 

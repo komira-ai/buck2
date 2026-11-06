@@ -245,6 +245,9 @@ impl SnapshotCollector {
     fn add_daemon_metrics(&self, snapshot: &mut buck2_data::Snapshot) {
         snapshot.blocking_executor_io_queue_size =
             self.daemon.blocking_executor_factory.queue_size() as u64;
+        let inline_io = self.daemon.blocking_executor_factory.inline_io_stats();
+        snapshot.blocking_executor_io_inline_in_flight = inline_io.in_flight;
+        snapshot.blocking_executor_io_inline_waiting = inline_io.waiting;
         if let Some(store) = self
             .tenant
             .repo
@@ -340,6 +343,8 @@ impl SnapshotCollector {
         snapshot.write_action_cache_lookup_failures = counts.lookup_failures;
         snapshot.write_action_cache_populated = counts.populated;
         snapshot.write_action_cache_populate_failures = counts.populate_failures;
+        snapshot.write_action_cache_uploaded = counts.uploaded;
+        snapshot.write_action_cache_written = counts.written;
         snapshot.write_action_cache_verified = counts.verified;
         snapshot.write_action_cache_mismatches = counts.mismatches;
     }

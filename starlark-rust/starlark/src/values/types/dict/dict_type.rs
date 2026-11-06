@@ -19,17 +19,22 @@ use std::marker::PhantomData;
 
 use either::Either;
 
+use crate as starlark;
+use crate::any::ProvidesStaticType;
 use crate::typing::Ty;
-use crate::values::UnpackAndDiscard;
+use crate::values::Heap;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::dict::UnpackDictEntries;
+use crate::values::ValueOf;
+use crate::values::dict::AllocDict;
+use crate::values::dict::DictRef;
 use crate::values::type_repr::StarlarkTypeRepr;
 
 /// A dict type marker.
 ///
 /// [`StarlarkTypeRepr`] provides `dict[K, V]`.
 /// [`UnpackValue`] implementation verifies the types of entries and discards them.
+#[derive(ProvidesStaticType)]
 pub struct DictType<K: StarlarkTypeRepr, V: StarlarkTypeRepr> {
     k: PhantomData<K>,
     v: PhantomData<V>,
@@ -47,15 +52,135 @@ impl<'v, K: UnpackValue<'v>, V: UnpackValue<'v>> UnpackValue<'v> for DictType<K,
     type Error = Either<K::Error, V::Error>;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        match UnpackDictEntries::<UnpackAndDiscard<K>, UnpackAndDiscard<V>>::unpack_value_impl(
-            value,
-        ) {
-            Ok(Some(_)) => Ok(Some(DictType {
-                k: PhantomData,
-                v: PhantomData,
-            })),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        let Some(dict) = DictRef::from_value(value) else {
+            return Ok(None);
+        };
+        for (k, v) in dict.iter() {
+            if K::unpack_value_impl(k).map_err(Either::Left)?.is_none()
+                || V::unpack_value_impl(v).map_err(Either::Right)?.is_none()
+            {
+                return Ok(None);
+            }
         }
+        Ok(Some(DictType {
+            k: PhantomData,
+            v: PhantomData,
+        }))
+    }
+}
+
+impl<'v, K: UnpackValue<'v>, V: UnpackValue<'v>> ValueOf<'v, DictType<K, V>> {
+    /// The empty dict.
+    pub fn empty_dict() -> Self {
+        Self::new_unchecked(Value::new_empty_dict())
+    }
+
+    /// A new dict of these entries.
+    pub fn alloc_dict(
+        heap: Heap<'v>,
+        entries: impl IntoIterator<Item = (ValueOf<'v, K>, ValueOf<'v, V>)>,
+    ) -> Self {
+        Self::new_unchecked(
+            heap.alloc(AllocDict(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.to_value(), v.to_value())),
+            )),
+        )
+    }
+
+    /// The dict.
+    #[inline]
+    pub fn dict(self) -> DictRef<'v> {
+        DictRef::from_value(self.to_value()).expect("a value's type does not change")
+    }
+
+    /// The entries, re-checked unless the dict is frozen, as for
+    /// [`ValueOf<ListType<T>>::iter`](ValueOf::iter).
+    pub fn iter(self) -> DictEntries<'v, K, V> {
+        DictEntries {
+            frozen: self.to_value().is_frozen(),
+            entries: self.entries(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// The entries, unpacked. Each is re-checked, as for [`iter`](Self::iter).
+    pub fn try_items(self) -> impl Iterator<Item = crate::Result<(K, V)>> + 'v {
+        self.entries()
+            .map(|(k, v)| Ok((K::unpack_value_err(k)?, V::unpack_value_err(v)?)))
+    }
+
+    fn entries(self) -> Entries<'v> {
+        Entries {
+            dict: self.dict(),
+            index: 0,
+        }
+    }
+
+    /// The value at `key`, re-checked unless the dict is frozen.
+    pub fn get(self, key: Value<'v>) -> crate::Result<Option<ValueOf<'v, V>>> {
+        self.dict().get(key)?.map(|v| self.checked(v)).transpose()
+    }
+
+    /// The value at a string key, re-checked unless the dict is frozen.
+    pub fn get_str(self, key: &str) -> crate::Result<Option<ValueOf<'v, V>>> {
+        self.dict()
+            .get_str(key)
+            .map(|v| self.checked(v))
+            .transpose()
+    }
+
+    fn checked(self, v: Value<'v>) -> crate::Result<ValueOf<'v, V>> {
+        if self.to_value().is_frozen() {
+            Ok(ValueOf::new_unchecked(v))
+        } else {
+            ValueOf::new_err(v)
+        }
+    }
+}
+
+/// The entries of a [`ValueOf<DictType<K, V>>`], borrowed from the dict.
+pub struct DictEntries<'v, K, V> {
+    frozen: bool,
+    entries: Entries<'v>,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<'v, K: UnpackValue<'v>, V: UnpackValue<'v>> Iterator for DictEntries<'v, K, V> {
+    type Item = crate::Result<(ValueOf<'v, K>, ValueOf<'v, V>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (k, v) = self.entries.next()?;
+        Some(if self.frozen {
+            Ok((ValueOf::new_unchecked(k), ValueOf::new_unchecked(v)))
+        } else {
+            (|| Ok((ValueOf::new_err(k)?, ValueOf::new_err(v)?)))()
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+/// The entries of a dict, borrowed from it; indexed because the borrow lives in the iterator.
+struct Entries<'v> {
+    dict: DictRef<'v>,
+    index: usize,
+}
+
+impl<'v> Iterator for Entries<'v> {
+    type Item = (Value<'v>, Value<'v>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (k, v) = self.dict.content.get_index(self.index)?;
+        self.index += 1;
+        Some((*k, *v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.dict.content.len() - self.index;
+        (rem, Some(rem))
     }
 }

@@ -15,10 +15,17 @@ load(
 )
 load("@prelude//:paths.bzl", "paths")
 load("@prelude//apple:apple_error_handler.bzl", "apple_build_error_handler")
-load("@prelude//apple:apple_toolchain_types.bzl", "AppleToolchainInfo")
-load("@prelude//apple:apple_utility.bzl", "get_disable_pch_validation_flags", "get_module_name")
+load("@prelude//apple:apple_toolchain_types.bzl", "AppleToolchainInfo", "AppleToolsInfo")
+load("@prelude//apple:apple_utility.bzl", "get_apple_cxx_headers_layout", "get_disable_pch_validation_flags", "get_module_name")
 load("@prelude//apple:modulemap.bzl", "create_modulemap")
-load("@prelude//apple/swift:swift_helpers.bzl", "compile_with_argsfile", "compile_with_argsfile_cmd", "uses_explicit_modules")
+load(
+    "@prelude//apple/swift:swift_helpers.bzl",
+    "compile_with_argsfile",
+    "compile_with_argsfile_cmd",
+    "get_swift_dynamic_thunk_entry_point_name",
+    "uses_dynamic_replacement",
+    "uses_explicit_modules",
+)
 load(
     "@prelude//apple/swift:swift_types.bzl",
     "EXPLICIT_MODULES_CATEGORY_SUFFIX",
@@ -42,6 +49,7 @@ load(
     "@prelude//cxx:headers.bzl",
     "CHeader",
     "HeaderMode",
+    "cxx_attr_headers",
     "prepare_headers",
 )
 load(
@@ -92,7 +100,7 @@ load(
 )
 load(":swift_module_map.bzl", "write_swift_module_map_with_deps")
 load(":swift_output_file_map.bzl", "add_dependencies_output", "get_modularization_dependency_graph_output_map")
-load(":swift_pcm_compilation.bzl", "compile_underlying_pcm", "get_compiled_pcm_deps_tset", "get_swift_pcm_anon_targets")
+load(":swift_pcm_compilation.bzl", "compile_internal_bridging_header_pch", "compile_underlying_pcm", "get_compiled_pcm_deps_tset", "get_swift_pcm_anon_targets")
 load(
     ":swift_pcm_compilation_types.bzl",
     "SwiftPCMUncompiledInfo",
@@ -113,6 +121,24 @@ load(
 SwiftCompilationDatabase = record(
     db = field(Artifact),
     other_outputs = field(ArgLike),
+)
+
+# One file of the `@_dynamicReplacement` thunk module.
+SwiftDynamicThunkSource = record(
+    # The module source the file was generated from; None for the entry file.
+    original = field(Artifact | None),
+    thunk = field(Artifact),
+)
+
+SwiftDynamicThunkOutput = record(
+    object = field(Artifact),
+    module_name = field(str),
+    sources = field(list[SwiftDynamicThunkSource]),
+    # The commands that generated `sources` and compiled `object`, written
+    # with their outputs as plain paths so they can be recorded and re-run.
+    transform_command = field(cmd_args),
+    compile_command = field(cmd_args),
+    compile_argsfile = field(Artifact),
 )
 
 SwiftObjectOutput = record(
@@ -145,6 +171,10 @@ SwiftCompilationOutput = record(
     exported_pre = field(CPreprocessor),
     # Exported -Swift.h header
     exported_swift_header = field(Artifact),
+    # The umbrella header generated for a mixed module (`__<M>_umbrella__/<M>.h`, when
+    # `disable_generated_umbrella_header` is off): the exported header map names it under
+    # `<M>/<M>.h`, and `[umbrella-header]` is the one way to build it by label.
+    generated_umbrella_header = field(Artifact | None, None),
     # Argsfiles used to compile object files.
     argsfiles = field(CompileArgsfiles),
     # A tset of (SDK/first-party) swiftmodule artifacts required to be linked into binary.
@@ -160,6 +190,12 @@ SwiftCompilationOutput = record(
     # describes all transitive Swift module dependencies. Only populated when
     # explicit modules are enabled.
     swift_module_map_artifact = field(Artifact | None, None),
+    # The `@_dynamicReplacement` thunks for every function in the module,
+    # compiled as a separate module that imports this one. Populated when
+    # `swift_dynamic_replacement_enabled` is set and the toolchain carries the
+    # thunk tool; `apple_library` links the object and records the commands in
+    # `[swift-dynamic-dylib-thunk-command-database]`.
+    dynamic_thunk = field(SwiftDynamicThunkOutput | None, None),
     # An optional artifact with files that support consuming the generated library with later versions of the swift compiler.
     swift_library_for_distribution_output = field(SwiftLibraryForDistributionOutput | None),
     # A list of artifacts that stores the index data
@@ -184,6 +220,39 @@ SwiftDebugInfo = record(
 )
 
 _REQUIRED_SDK_MODULES = ["Swift", "SwiftOnoneSupport", "Darwin", "_Concurrency", "_StringProcessing"]
+
+# Makes every function in the module replaceable at run time with
+# `@_dynamicReplacement`, lets another module import its private declarations
+# with `@_private(sourceFile:)`, and lets later replacements chain on earlier
+# ones. These go into the shared flags so the swiftmodule, which is emitted by
+# a separate action in WMO mode, records the declarations as `dynamic` and
+# serializes the private ones.
+_DYNAMIC_REPLACEMENT_FLAGS = [
+    "-Xfrontend",
+    "-enable-implicit-dynamic",
+    "-Xfrontend",
+    "-enable-private-imports",
+    "-Xfrontend",
+    "-enable-dynamic-replacement-chaining",
+]
+
+# Result builders that protocols' `body` requirements carry, which a thunk has
+# to restate because a replacement does not inherit them: `Protocol=Builder`
+# pairs, comma separated, from `apple.swift_dynamic_thunk_result_builders`.
+# SwiftUI's `View` is always known to the tool.
+def _parse_result_builders(value: str) -> dict[str, str]:
+    builders = {}
+    for pair in value.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = [part.strip() for part in pair.split("=")]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            fail("apple.swift_dynamic_thunk_result_builders expects comma separated `Protocol=Builder` pairs, got `{}`".format(pair))
+        builders[parts[0]] = parts[1]
+    return builders
+
+_DYNAMIC_THUNK_RESULT_BUILDERS = _parse_result_builders(read_root_config("apple", "swift_dynamic_thunk_result_builders", ""))
 
 _REQUIRED_SDK_CXX_MODULES = _REQUIRED_SDK_MODULES + ["std"]
 
@@ -294,57 +363,81 @@ def get_swift_cxx_flags(ctx: AnalysisContext) -> list[str]:
 
     return gather
 
-def _get_compiled_underlying_pcm(
+def _get_pcm_preprocessor_info(
+    ctx: AnalysisContext,
+    headers: list[CHeader],
+    preprocessor_infos: list[CPreprocessorInfo],
+    header_map_name: str,
+) -> CPreprocessorInfo:
+    header_dict = {paths.join(h.namespace, h.name): h.artifact for h in headers}
+    header_map = prepare_headers(
+        ctx.actions,
+        get_cxx_toolchain_info(ctx),
+        header_dict,
+        header_map_name,
+        HeaderMode("header_map_only"),
+        allow_cache_upload = cxx_attrs_get_allow_cache_upload(ctx.attrs),
+    )
+    header_map_args = cmd_args(header_map.include_path, format = "-I{}") if header_map else cmd_args()
+    return cxx_merge_cpreprocessors(
+        ctx.actions,
+        [CPreprocessor(args = CPreprocessorArgs(args = [header_map_args]))],
+        preprocessor_infos,
+    )
+
+def _get_internal_bridging_header_flags(
     ctx: AnalysisContext,
     module_name: str,
-    module_pp_info: CPreprocessor | None,
-    exported_headers: list[CHeader],
+    public_preprocessor_info: CPreprocessorInfo,
+    uncompiled_pcm_info: SwiftPCMUncompiledInfo | None,
+    public_module: SwiftCompiledModuleInfo | None,
     deps_providers: list,
     swift_cxx_flags: list[str],
     framework_search_paths: cmd_args,
-) -> SwiftCompiledModuleInfo | None:
-    if supports_modulemaps_with_hmaps(ctx):
-        # We need to provide a headermap pointing to the exported headers of
-        # this target. Normally this would be passed through from the cxx
-        # layer, but the underlying module compilation happens before the cxx
-        # header map is generated, so we need to create one specifically for
-        # this module.
-        exported_headers_dict = {paths.join(h.namespace, h.name): h.artifact for h in exported_headers}
-        header_map = prepare_headers(
-            ctx.actions,
-            get_cxx_toolchain_info(ctx),
-            exported_headers_dict,
-            "swift-underlying-headers",
-            HeaderMode("header_map_only"),
-            allow_cache_upload = cxx_attrs_get_allow_cache_upload(ctx.attrs),
+) -> cmd_args:
+    header = getattr(ctx.attrs, "internal_bridging_header", None)
+    if header == None:
+        return cmd_args()
+
+    exported_dep_labels = {dep.label: None for dep in getattr(ctx.attrs, "exported_deps", [])}
+    private_deps = [dep for dep in ctx.attrs.deps if dep.label not in exported_dep_labels]
+    private_headers = cxx_attr_headers(ctx, get_apple_cxx_headers_layout(ctx))
+    private_header_args = cmd_args()
+    if private_headers or private_deps:
+        private_preprocessor_info = _get_pcm_preprocessor_info(
+            ctx,
+            private_headers,
+            cxx_inherited_preprocessor_infos(private_deps),
+            "swift-internal-bridging-header-headers",
         )
-        header_map_args = cmd_args(header_map.include_path, format = "-I{}")
+        private_header_args.add(cmd_args(private_preprocessor_info.set.project_as_args("args"), prepend = "-Xcc"))
+    public_header_args = cmd_args(public_preprocessor_info.set.project_as_args("args"), prepend = "-Xcc")
+    if not uses_explicit_modules(ctx):
+        return cmd_args("-internal-import-bridging-header", header, private_header_args, public_header_args)
 
-        # We need to collect the preprocessor info from exported_deps for their
-        # header map search paths.
-        preprocessor_info = cxx_merge_cpreprocessors(
-            ctx.actions,
-            [CPreprocessor(args = CPreprocessorArgs(args = [header_map_args]))],
-            cxx_inherited_preprocessor_infos(ctx.attrs.exported_deps),
-        )
-    else:
-        preprocessor_info = None
-
-    underlying_swift_pcm_uncompiled_info = get_swift_pcm_uncompile_info(
-        ctx,
-        preprocessor_info,
-        module_pp_info,
-    )
-    if not underlying_swift_pcm_uncompiled_info:
-        return None
-
-    return compile_underlying_pcm(
+    if uncompiled_pcm_info == None:
+        fail("Explicit internal bridging-header compilation requires SDK module information")
+    additional_args = cmd_args(framework_search_paths, private_header_args)
+    if not supports_modulemaps_with_hmaps(ctx):
+        additional_args.add(public_header_args)
+    if public_module:
+        additional_args.add(public_module.clang_importer_args, clang_module_file_args(public_module))
+    pch = compile_internal_bridging_header_pch(
         ctx,
         module_name,
-        underlying_swift_pcm_uncompiled_info,
+        header,
+        uncompiled_pcm_info,
         deps_providers,
         swift_cxx_flags,
-        framework_search_paths,
+        additional_args,
+    )
+    # Clang reads the PCH's input headers when loading it, even with PCH
+    # validation disabled, so they must be materialized for Swift compilation.
+    return cmd_args(
+        "-disable-bridging-pch",
+        "-internal-import-bridging-header",
+        pch,
+        hidden = [header, private_header_args, public_header_args],
     )
 
 def _generate_umbrella_header(ctx: AnalysisContext, module_name: str, exported_headers: list[CHeader], uses_content_based_paths: bool) -> [CHeader, None]:
@@ -411,27 +504,50 @@ def compile_swift(
     # If a target exports ObjC headers and Swift explicit modules are enabled,
     # we need to precompile a PCM of the underlying module and supply it to the Swift compilation.
     swift_cxx_flags = get_swift_cxx_flags(ctx)
-    if uses_explicit_modules(ctx):
-        exported_compiled_underlying_pcm = (
-            _get_compiled_underlying_pcm(
-                ctx,
-                module_name,
-                exported_objc_modulemap_pp_info,
-                exported_headers,
-                deps_providers,
-                swift_cxx_flags,
-                framework_search_paths,
-            )
-            if exported_objc_modulemap_pp_info
-            else None
+    explicit_modules_enabled = uses_explicit_modules(ctx)
+    internal_bridging_header = getattr(ctx.attrs, "internal_bridging_header", None)
+    public_preprocessor_info = None
+    if internal_bridging_header != None or (explicit_modules_enabled and exported_objc_modulemap_pp_info and supports_modulemaps_with_hmaps(ctx)):
+        public_preprocessor_info = _get_pcm_preprocessor_info(
+            ctx,
+            exported_headers,
+            cxx_inherited_preprocessor_infos(getattr(ctx.attrs, "exported_deps", [])),
+            "swift-underlying-headers",
         )
-    else:
-        exported_compiled_underlying_pcm = None
+    uncompiled_pcm_info = None
+    if explicit_modules_enabled and (exported_objc_modulemap_pp_info or internal_bridging_header != None):
+        uncompiled_pcm_info = get_swift_pcm_uncompile_info(
+            ctx,
+            public_preprocessor_info if supports_modulemaps_with_hmaps(ctx) else None,
+            exported_objc_modulemap_pp_info,
+        )
+    exported_compiled_underlying_pcm = None
+    if exported_objc_modulemap_pp_info and uncompiled_pcm_info:
+        exported_compiled_underlying_pcm = compile_underlying_pcm(
+            ctx,
+            module_name,
+            uncompiled_pcm_info,
+            deps_providers,
+            swift_cxx_flags,
+            framework_search_paths,
+        )
 
     # We always track inputs for dependency file tracking, but optionally set
     # the tag on the action depending on the use_depsfiles config.
     inputs_tag = ctx.actions.artifact_tag()
 
+    internal_bridging_header_flags = cmd_args()
+    if internal_bridging_header != None:
+        internal_bridging_header_flags = _get_internal_bridging_header_flags(
+            ctx,
+            module_name,
+            public_preprocessor_info,
+            uncompiled_pcm_info,
+            exported_compiled_underlying_pcm,
+            deps_providers,
+            swift_cxx_flags,
+            framework_search_paths,
+        )
     shared_flags, swift_module_map_artifact = _get_shared_flags(
         ctx = ctx,
         deps_providers = deps_providers,
@@ -443,6 +559,7 @@ def compile_swift(
         inputs_tag = inputs_tag,
         is_macro = is_macro,
     )
+    shared_flags.add(internal_bridging_header_flags)
     shared_flags.add(framework_search_paths)
     objc_swift_interface_info = _create_objc_swift_interface(ctx, shared_flags, module_name)
 
@@ -519,6 +636,22 @@ def compile_swift(
         category = compile_category,
     )
 
+    dynamic_thunk = None
+    if uses_dynamic_replacement(ctx) and not is_macro:
+        dynamic_thunk = _compile_dynamic_thunk(
+            ctx = ctx,
+            toolchain = toolchain,
+            deps_providers = deps_providers,
+            module_name = module_name,
+            srcs = srcs,
+            output_swiftmodule = output_swiftmodule,
+            underlying_module = exported_compiled_underlying_pcm,
+            public_modulemap_pp_info = exported_objc_modulemap_pp_info,
+            extra_search_paths_flags = extra_search_paths_flags,
+            framework_search_paths = framework_search_paths,
+            inputs_tag = inputs_tag,
+        )
+
     typecheck_file = _compile_typecheck_diagnostics(
         ctx = ctx,
         toolchain = toolchain,
@@ -555,11 +688,14 @@ def compile_swift(
         namespace = module_name,
         named = False,
     )
+    modulemap_artifact = modulemap_pp_info.modulemap_artifact
+    if generated_umbrella_header:
+        modulemap_artifact = modulemap_artifact.with_associated_artifacts([generated_umbrella_header.artifact])
     exported_pp_info = CPreprocessor(
         headers = [exported_swift_header] + ([generated_umbrella_header] if generated_umbrella_header else []),
         modular_args = modulemap_pp_info.modular_args,
         args = CPreprocessorArgs(args = modulemap_pp_info.args.args),
-        modulemap_artifact = modulemap_pp_info.modulemap_artifact,
+        modulemap_artifact = modulemap_artifact,
     )
 
     # We also need to include the unprefixed -Swift.h header in this libraries preprocessor info
@@ -599,6 +735,7 @@ def compile_swift(
             pre = pre,
             exported_pre = exported_pp_info,
             exported_swift_header = exported_swift_header.artifact,
+            generated_umbrella_header = generated_umbrella_header.artifact if generated_umbrella_header else None,
             argsfiles = object_output.argsfiles,
             swift_debug_info = extract_and_merge_swift_debug_infos(ctx, deps_providers, [output_swiftmodule]),
             clang_debug_info = extract_and_merge_clang_debug_infos(
@@ -611,6 +748,7 @@ def compile_swift(
             index_store = index_store,
             swiftdeps = object_output.swiftdeps,
             modularization_dependency_graph = modularization_dependency_graph,
+            dynamic_thunk = dynamic_thunk,
         ),
         objc_swift_interface = objc_swift_interface_info,
         swiftinterface = output_swiftinterface,
@@ -687,6 +825,121 @@ def _compile_dump_ast(ctx: AnalysisContext, toolchain: SwiftToolchainInfo, share
         output_file_map = output_file_map,
         supports_serialized_errors = False,
         incremental_build_allowed = False,
+    )
+
+def _dynamic_thunk_module_name(module_name: str) -> str:
+    return module_name + "_DynamicThunk"
+
+def _compile_dynamic_thunk(
+    ctx: AnalysisContext,
+    toolchain: SwiftToolchainInfo,
+    deps_providers: list,
+    module_name: str,
+    srcs: list[CxxSrcWithFlags],
+    output_swiftmodule: Artifact,
+    underlying_module: SwiftCompiledModuleInfo | None,
+    public_modulemap_pp_info: CPreprocessor | None,
+    extra_search_paths_flags: list[ArgLike],
+    framework_search_paths: cmd_args,
+    inputs_tag: ArtifactTag,
+) -> SwiftDynamicThunkOutput | None:
+    """Compiles `@_dynamicReplacement` thunks for every function in the module.
+
+    The thunk is its own module, `<Module>_DynamicThunk`, built with the same
+    shared flags as the module and importing the module's swiftmodule: its
+    replacement records must refer to the module's replacement keys as
+    undefined symbols, which `dlopen` then binds to the running app's copies.
+    Compiling the module's own sources a second time would define those keys
+    locally and replace nothing anyone calls."""
+    apple_tools = getattr(ctx.attrs, "_apple_tools", None)
+    tool = apple_tools[AppleToolsInfo].make_swift_dynamic_thunk if apple_tools else None
+    if not tool:
+        return None
+
+    uses_content_based_paths = get_uses_content_based_paths(ctx)
+    thunk_module_name = _dynamic_thunk_module_name(module_name)
+    entry_src = ctx.actions.declare_output(thunk_module_name, "__entry.thunk.swift", has_content_based_path = uses_content_based_paths)
+    transform_args = [
+        tool,
+        "--module-name",
+        module_name,
+        "--entry-symbol",
+        get_swift_dynamic_thunk_entry_point_name(ctx),
+    ]
+    for protocol, builder in _DYNAMIC_THUNK_RESULT_BUILDERS.items():
+        transform_args.extend(["--result-builder", protocol + "=" + builder])
+
+    # Each generated file is an output of the action and a plain path in the
+    # recorded command, so the pairs are built once and projected twice.
+    outputs = [("--entry-output", None, entry_src)]
+    for src in srcs:
+        # The short path keeps sources with the same basename apart. The
+        # `.thunk.swift` suffix keeps the generated file's own `#fileID` apart
+        # from the one its `#sourceLocation` directives produce for the
+        # original, which the compiler requires to differ.
+        thunk_src = ctx.actions.declare_output(
+            thunk_module_name,
+            paths.replace_extension(src.file.short_path.replace("/", "_"), ".thunk.swift"),
+            has_content_based_path = uses_content_based_paths,
+        )
+        outputs.append(("--output", src.file, thunk_src))
+    transform = cmd_args(transform_args)
+    transform_command = cmd_args(transform_args)
+    sources = []
+    for flag, original, thunk_src in outputs:
+        source_flags = ["--source", original] if original else []
+        transform.add(source_flags, flag, thunk_src.as_output())
+        transform_command.add(source_flags, flag, thunk_src)
+        sources.append(SwiftDynamicThunkSource(original = original, thunk = thunk_src))
+    thunk_srcs = [CxxSrcWithFlags(file = source.thunk) for source in sources]
+    ctx.actions.run(
+        transform,
+        category = "swift_dynamic_thunk_sources",
+        identifier = module_name,
+        error_handler = apple_build_error_handler,
+    )
+
+    shared_flags, _ = _get_shared_flags(
+        ctx = ctx,
+        deps_providers = deps_providers,
+        parse_as_library = True,
+        public_module = underlying_module,
+        module_name = thunk_module_name,
+        public_modulemap_pp_info = public_modulemap_pp_info,
+        extra_search_paths_flags = extra_search_paths_flags,
+        inputs_tag = inputs_tag,
+        is_macro = False,
+        thunk_of_module = SwiftCompiledModuleInfo(
+            is_framework = False,
+            is_sdk_module = False,
+            is_swiftmodule = True,
+            module_name = module_name,
+            output_artifact = output_swiftmodule,
+        ),
+    )
+    shared_flags.add(framework_search_paths)
+
+    output_object = ctx.actions.declare_output(thunk_module_name + ".o", has_content_based_path = uses_content_based_paths)
+    argsfiles, _ = _compile_with_argsfile(
+        ctx = ctx,
+        category = "swift_dynamic_thunk_compile",
+        shared_flags = shared_flags,
+        srcs = thunk_srcs,
+        additional_flags = cmd_args(["-emit-object", "-o", output_object.as_output(), "-wmo"]),
+        toolchain = toolchain,
+        extension = SWIFT_EXTENSION,
+        incremental_build_allowed = False,
+    )
+    argsfile = argsfiles.relative[SWIFT_EXTENSION]
+    return SwiftDynamicThunkOutput(
+        object = output_object,
+        module_name = thunk_module_name,
+        sources = sources,
+        transform_command = transform_command,
+        # The same invocation as the action, less the wrapper's diagnostics
+        # outputs: the argsfile's hidden inputs carry every module it imports.
+        compile_command = cmd_args(toolchain.compiler, "-emit-object", "-o", output_object, "-wmo", argsfile.cmd_form, [src.file for src in thunk_srcs]),
+        compile_argsfile = argsfile.file,
     )
 
 # We use separate actions for swiftmodule and object file output. This
@@ -1169,6 +1422,7 @@ def _get_shared_flags(
     extra_search_paths_flags: list[ArgLike],
     inputs_tag: ArtifactTag,
     is_macro: bool,
+    thunk_of_module: SwiftCompiledModuleInfo | None = None,
 ) -> (cmd_args, Artifact | None):
     toolchain = get_swift_toolchain_info(ctx)
     cmd = cmd_args()
@@ -1281,6 +1535,9 @@ def _get_shared_flags(
     if ctx.attrs._swift_enable_testing:
         cmd.add("-enable-testing")
 
+    if uses_dynamic_replacement(ctx) and not is_macro:
+        cmd.add(_DYNAMIC_REPLACEMENT_FLAGS)
+
     if getattr(ctx.attrs, "application_extension", False):
         cmd.add("-application-extension")
 
@@ -1314,10 +1571,12 @@ def _get_shared_flags(
             inputs_tag = inputs_tag,
             cmd = cmd,
             is_macro = is_macro,
+            map_module_name = module_name,
+            own_module = thunk_of_module,
         )
 
     _add_clang_deps_flags(ctx, pcm_deps_tset, cmd, inputs_tag)
-    _add_swift_deps_flags(ctx, cmd, is_macro)
+    _add_swift_deps_flags(ctx, cmd, is_macro, own_module = thunk_of_module)
 
     # Add flags for importing the ObjC part of this library
     _add_mixed_library_flags_to_cmd(
@@ -1325,6 +1584,7 @@ def _get_shared_flags(
         cmd,
         public_module,
         public_modulemap_pp_info,
+        import_underlying_module = thunk_of_module == None,
     )
 
     # Add toolchain and target flags last to allow for overriding defaults
@@ -1342,18 +1602,20 @@ def _add_swift_module_map_args(
     inputs_tag: ArtifactTag,
     cmd: cmd_args,
     is_macro: bool,
+    map_module_name: str,
+    own_module: SwiftCompiledModuleInfo | None = None,
 ) -> Artifact:
-    module_name = get_module_name(ctx)
     sdk_swiftmodule_deps_tset = [sdk_swiftmodule_deps_tset] if sdk_swiftmodule_deps_tset else []
-    all_deps_tset = ctx.actions.tset(
-        SwiftCompiledModuleTset,
-        children = _get_swift_paths_tsets(is_macro, ctx.attrs.deps + getattr(ctx.attrs, "exported_deps", []))
-        + [pcm_deps_tset, sdk_deps_tset]
-        + sdk_swiftmodule_deps_tset,
+    children = (
+        _get_swift_paths_tsets(is_macro, ctx.attrs.deps + getattr(ctx.attrs, "exported_deps", [])) + [pcm_deps_tset, sdk_deps_tset] + sdk_swiftmodule_deps_tset
     )
+    if own_module:
+        all_deps_tset = ctx.actions.tset(SwiftCompiledModuleTset, value = own_module, children = children)
+    else:
+        all_deps_tset = ctx.actions.tset(SwiftCompiledModuleTset, children = children)
     swift_module_map_artifact, swift_module_map_args = write_swift_module_map_with_deps(
         ctx,
-        module_name,
+        map_module_name,
         all_deps_tset,
     )
     cmd.add([
@@ -1364,7 +1626,12 @@ def _add_swift_module_map_args(
     ])
     return swift_module_map_artifact
 
-def _add_swift_deps_flags(ctx: AnalysisContext, cmd: cmd_args, is_macro: bool):
+def _add_swift_deps_flags(
+    ctx: AnalysisContext,
+    cmd: cmd_args,
+    is_macro: bool,
+    own_module: SwiftCompiledModuleInfo | None = None,
+):
     if uses_explicit_modules(ctx):
         cmd.add([
             "-Xcc",
@@ -1375,7 +1642,11 @@ def _add_swift_deps_flags(ctx: AnalysisContext, cmd: cmd_args, is_macro: bool):
             "-disable-implicit-swift-modules",
         ])
     else:
-        depset = ctx.actions.tset(SwiftCompiledModuleTset, children = _get_swift_paths_tsets(is_macro, ctx.attrs.deps + getattr(ctx.attrs, "exported_deps", [])))
+        children = _get_swift_paths_tsets(is_macro, ctx.attrs.deps + getattr(ctx.attrs, "exported_deps", []))
+        if own_module:
+            depset = ctx.actions.tset(SwiftCompiledModuleTset, value = own_module, children = children)
+        else:
+            depset = ctx.actions.tset(SwiftCompiledModuleTset, children = children)
         cmd.add(depset.project_as_args("module_search_path"))
 
         implicit_search_path_tset = get_implicit_framework_search_path_providers(
@@ -1396,13 +1667,18 @@ def _add_clang_deps_flags(ctx: AnalysisContext, pcm_deps_tset: SwiftCompiledModu
         cmd.add(cmd_args(preprocessors.set.project_as_args("modular_args"), prepend = "-Xcc"))
 
 def _add_mixed_library_flags_to_cmd(
-    ctx: AnalysisContext, cmd: cmd_args, underlying_module: SwiftCompiledModuleInfo | None, public_modulemap_pp_info: CPreprocessor | None
+    ctx: AnalysisContext,
+    cmd: cmd_args,
+    underlying_module: SwiftCompiledModuleInfo | None,
+    public_modulemap_pp_info: CPreprocessor | None,
+    import_underlying_module: bool = True,
 ) -> None:
     if uses_explicit_modules(ctx):
         if underlying_module:
             cmd.add(underlying_module.clang_importer_args)
             cmd.add(clang_module_file_args(underlying_module))
-            cmd.add("-import-underlying-module")
+            if import_underlying_module:
+                cmd.add("-import-underlying-module")
         return
 
     for objc_modulemap_pp_info in filter(None, [public_modulemap_pp_info]):
@@ -1418,7 +1694,7 @@ def _add_mixed_library_flags_to_cmd(
             cmd.add("-Xcc")
             cmd.add(arg)
 
-    if public_modulemap_pp_info:
+    if public_modulemap_pp_info and import_underlying_module:
         cmd.add("-import-underlying-module")
 
 def _get_swift_dependency_info(is_macro: bool, deps: list[Dependency]) -> list[SwiftDependencyInfo]:

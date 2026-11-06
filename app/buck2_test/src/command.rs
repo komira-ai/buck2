@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -30,6 +31,9 @@ use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::maybe_stream_build_reports;
 use buck2_build_api::build::build_report::streaming_build_result_channel;
 use buck2_build_api::build::build_report::write_build_report;
+use buck2_build_api::build::build_report_metrics::BuildReportMetricsConfig;
+use buck2_build_api::build::build_report_metrics::compute_build_report_supplemental_data;
+use buck2_build_api::build::graph_properties::GraphPropertiesOptions;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
@@ -122,6 +126,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::downward_api::BuckTestDownwardApi;
 use crate::executor_launcher::ExecutorLaunch;
 use crate::executor_launcher::ExecutorLauncher;
+use crate::executor_launcher::ExecutorOutput;
 use crate::executor_launcher::OutOfProcessTestExecutor;
 use crate::executor_launcher::TestExecutorClientWrapper;
 use crate::local_resource_registry::HasLocalResourceRegistry;
@@ -493,6 +498,10 @@ async fn test(
         .build_opts
         .as_ref()
         .internal_error("should have build options")?;
+    let build_report_metrics_config =
+        BuildReportMetricsConfig::from_buckconfig(&mut ctx.ctx(), cell_resolver.root_cell())
+            .await?;
+    let graph_properties = build_report_metrics_config.graph_properties;
 
     let timeout = request
         .timeout
@@ -516,6 +525,7 @@ async fn test(
     let (streaming_build_result_tx, streaming_build_result_rx) =
         streaming_build_result_channel(build_opts);
 
+    let build_start = Instant::now();
     let test_future = test_targets(
         ctx.dupe(),
         resolved_pattern,
@@ -539,6 +549,8 @@ async fn test(
         build_run_info,
         tpx_experiments,
         streaming_build_result_tx,
+        build_start,
+        graph_properties,
     );
 
     let test_outcome = maybe_stream_build_reports(
@@ -548,7 +560,7 @@ async fn test(
         server_ctx.project_root(),
         server_ctx.working_dir(),
         server_ctx.events().trace_id().dupe(),
-        Default::default(),
+        graph_properties,
         streaming_build_result_rx,
     )
     .await?;
@@ -628,15 +640,17 @@ async fn test(
         ),
     };
 
+    let supplemental_data = compute_build_report_supplemental_data(
+        &mut ctx.ctx(),
+        &test_outcome.build_target_result,
+        build_report_metrics_config,
+    )
+    .await?;
+
     let serialized_build_report = if build_opts.unstable_print_build_report {
         let artifact_fs = ctx.ctx().get_artifact_fs().await?;
-        let build_report_opts = build_report_opts(
-            &mut ctx.ctx(),
-            &cell_resolver,
-            build_opts,
-            Default::default(),
-        )
-        .await?;
+        let build_report_opts =
+            build_report_opts(&mut ctx.ctx(), &cell_resolver, build_opts, graph_properties).await?;
 
         write_build_report(
             build_report_opts,
@@ -650,9 +664,9 @@ async fn test(
                 .build_target_result
                 .configured_to_pattern_modifiers,
             &test_outcome.build_target_result.other_errors,
-            None,
-            None,
-            None,
+            supplemental_data.detailed_metrics,
+            supplemental_data.action_graph_sketch_result,
+            supplemental_data.artifact_path_sketch_result,
         )?
     } else {
         None
@@ -692,6 +706,8 @@ async fn test_targets(
     build_run_info: bool,
     tpx_experiments: BuckMutSet<String>,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 ) -> buck2_error::Result<TestOutcome> {
     let session = Arc::new(session);
 
@@ -731,7 +747,6 @@ async fn test_targets(
     let res = tag_result!(
         "executor_launch_failed",
         res,
-        quiet: true,
         daemon_in_memory_state_is_corrupted: true,
         task: false
     )?;
@@ -823,6 +838,8 @@ async fn test_targets(
                         ignore_tests_attribute,
                         build_default_info,
                         build_run_info,
+                        build_start,
+                        graph_properties,
                     },
                     streaming_build_result_tx,
                 );
@@ -841,9 +858,7 @@ async fn test_targets(
                     futures::pin_mut!(alive);
                     match futures::future::select(drive, alive).await {
                         futures::future::Either::Left(..) => {}
-                        futures::future::Either::Right(..) => {
-                            tracing::warn!("Test run was cancelled");
-                        }
+                        futures::future::Either::Right(..) => {}
                     }
                 }
 
@@ -921,22 +936,8 @@ async fn test_targets(
         .await
         .buck_error_context("Failed to retrieve executor exit code")?;
 
-    if executor_output.signal.is_some() {
-        // The executor was killed by a signal: a crash (e.g. SIGSEGV) or an OOM kill,
-        // as opposed to an orderly non-zero exit.
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::TestExecutorSignaled,
-            "{}",
-            executor_output.termination_message()
-        ));
-    }
-
-    if executor_output.exit_code != Some(0) {
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::TestExecutorNonZeroExit,
-            "{}",
-            executor_output.termination_message()
-        ));
+    if let Some(error) = executor_termination_error(&executor_output) {
+        return Err(error);
     }
 
     // Now that the executor has exited, we notify our results channel. Two things can happen:
@@ -1026,6 +1027,8 @@ struct TestDriverState<'a, 'e> {
     ignore_tests_attribute: bool,
     build_default_info: bool,
     build_run_info: bool,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 }
 
 type DriverWorkResult = ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>;
@@ -1068,7 +1071,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
             labels_tested: BuckMutSet::default(),
             errors: BuildTargetResultBuilder::new(
                 streaming_build_result_tx.clone(),
-                std::time::Instant::now(),
+                state.build_start,
             ),
             first_internal_error: None,
             build_target_result: BuildTargetResult::new(),
@@ -1481,6 +1484,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                             state.build_default_info,
                             state.build_run_info,
                             streaming_build_result_tx,
+                            state.build_start,
+                            state.graph_properties,
                         )
                         .await
                     }
@@ -1567,6 +1572,8 @@ async fn build_target_result(
     build_default_info: bool,
     build_run_info: bool,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 ) -> buck2_error::Result<(BuildTargetResult, FrozenProviderCollectionValue)> {
     // NOTE: We fail if we hit an incompatible target here. This can happen if we reach an
     // incompatible target via `tests = [...]`. This should perhaps change, but that's how it works
@@ -1584,7 +1591,7 @@ async fn build_target_result(
     // 3. --build-run-info is requested and the target produces a RunInfo
     if let Some(test_info) = test_provider_from_collection(collections)? {
         let skip_build_based_on_labels = !label_filtering.build_filtered_targets
-            && label_filtering.is_excluded(test_info.labels());
+            && label_filtering.is_excluded(test_info.labels()?);
         if skip_build_based_on_labels {
             return Ok((BuildTargetResult::new(), providers));
         }
@@ -1600,7 +1607,7 @@ async fn build_target_result(
 
     let materialization_and_upload = MaterializationAndUploadContext::skip();
     let (result_builder, consumer) =
-        AsyncBuildTargetResultBuilder::new(streaming_build_result_tx, std::time::Instant::now());
+        AsyncBuildTargetResultBuilder::new(streaming_build_result_tx, build_start);
     let configured_target = label.target().dupe();
     let target = TargetLabelWithModifiers {
         target_label: configured_target.unconfigured().dupe(),
@@ -1625,7 +1632,7 @@ async fn build_target_result(
                 },
                 BuildConfiguredLabelOptions {
                     skippable: false,
-                    graph_properties: Default::default(),
+                    graph_properties,
                     return_run_args: false,
                 },
                 None, // TODO: is this right?
@@ -1676,7 +1683,8 @@ async fn test_target<'a, 'e>(
         if use_internal_runner {
             let excluded = {
                 let provider = internal_provider.as_ref().value().as_ref();
-                label_filtering.is_excluded(provider.labels().collect())
+                label_filtering
+                    .is_excluded(provider.labels().collect::<buck2_error::Result<Vec<_>>>()?)
             };
             if excluded {
                 return Ok(None);
@@ -1713,24 +1721,24 @@ async fn test_target<'a, 'e>(
                 let provider = internal_provider.as_ref().value().as_ref();
                 let listing_spec = build_external_runner_spec(
                     provider.listing_command(),
-                    provider.env().map(|(k, _)| k),
+                    provider.env().map(|entry| Ok(entry?.0)),
                     provider.test_type(),
                     provider.labels(),
                     provider.contacts(),
                     handle.clone(),
                     working_dir_cell,
                     &tenting_acl_names,
-                );
+                )?;
                 let spec = build_external_runner_spec(
                     provider.command(),
-                    provider.env().map(|(k, _)| k),
+                    provider.env().map(|entry| Ok(entry?.0)),
                     provider.test_type(),
                     provider.labels(),
                     provider.contacts(),
                     handle,
                     working_dir_cell,
                     &tenting_acl_names,
-                );
+                )?;
                 (spec, listing_spec)
             };
             crate::internal_runner::run_internal_test(
@@ -1747,7 +1755,7 @@ async fn test_target<'a, 'e>(
 
     let fut = match test_provider_from_collection(collection)? {
         Some(test_info) => {
-            if label_filtering.is_excluded(test_info.labels()) {
+            if label_filtering.is_excluded(test_info.labels()?) {
                 return Ok(None);
             }
             run_tests(
@@ -2094,6 +2102,38 @@ fn ai_agent_tpx_args(agent_context: &[buck2_data::AgentContextEntry]) -> Vec<Str
     args
 }
 
+/// The error for a test executor that did not exit cleanly, or `None` if it did.
+///
+/// The string tags become part of the error's category key, which is the identity
+/// of the Logview MIDs tracking executor deaths: signal deaths are split by signal
+/// and core-dumped bit on purpose; non-zero exits are not split by status, since
+/// nearly all of them are status 1 and the status is already in the message.
+fn executor_termination_error(output: &ExecutorOutput) -> Option<buck2_error::Error> {
+    if let Some(signal) = output.signal {
+        // A crash (e.g. SIGSEGV) or an OOM kill, as opposed to an orderly non-zero exit.
+        let mut error = buck2_error::buck2_error!(
+            ErrorTag::TestExecutorSignaled,
+            "{}",
+            output.termination_message()
+        );
+        error = error.string_tag(&format!("signal({signal})"));
+        if output.core_dumped {
+            error = error.string_tag("core_dumped");
+        }
+        return Some(error);
+    }
+
+    if output.exit_code != Some(0) {
+        return Some(buck2_error::buck2_error!(
+            ErrorTag::TestExecutorNonZeroExit,
+            "{}",
+            output.termination_message()
+        ));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use buck2_cli_proto::RepresentativeConfigFlag;
@@ -2103,7 +2143,57 @@ mod tests {
     use crate::command::InternalRunnerConfig;
     use crate::command::TestLabelFiltering;
     use crate::command::ai_agent_tpx_args;
+    use crate::command::executor_termination_error;
     use crate::command::generate_config_entry_args;
+    use crate::executor_launcher::ExecutorOutput;
+
+    fn executor_output(
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        core_dumped: bool,
+    ) -> ExecutorOutput {
+        ExecutorOutput {
+            exit_code,
+            signal,
+            core_dumped,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    // These category keys identify the Logview MIDs that track executor deaths;
+    // a changed key opens a new regression task.
+    #[test]
+    fn non_zero_exit_category_key_is_not_split_by_status() {
+        let error = executor_termination_error(&executor_output(Some(1), None, false)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_NON_ZERO_EXIT"
+        );
+    }
+
+    #[test]
+    fn signal_death_category_key_includes_signal_and_core_dump() {
+        let error = executor_termination_error(&executor_output(None, Some(11), true)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_SIGNALED:core_dumped:signal(11)"
+        );
+    }
+
+    #[test]
+    fn signal_death_without_core_dump_omits_core_tag() {
+        let error = executor_termination_error(&executor_output(None, Some(9), false)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_SIGNALED:signal(9)"
+        );
+    }
+
+    #[test]
+    fn clean_exit_is_not_an_error() {
+        assert!(executor_termination_error(&executor_output(Some(0), None, false)).is_none());
+    }
 
     #[test]
     fn only_include_labels_in_includes() {

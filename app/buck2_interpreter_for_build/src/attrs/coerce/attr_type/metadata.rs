@@ -13,8 +13,8 @@ use buck2_error::conversion::from_any_with_tag;
 use buck2_error::internal_error;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::types::opaque_metadata::OpaqueMetadata;
+use buck2_node::attrs::arena::AttrToken;
 use buck2_node::attrs::attr_type::metadata::MetadataAttrType;
-use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
 use buck2_node::attrs::configurable::AttrIsConfigurable;
 use buck2_node::metadata::key::MetadataKeyRef;
@@ -29,12 +29,12 @@ use crate::attrs::coerce::AttrTypeCoerce;
 use crate::attrs::coerce::attr_type::ty_maybe_select::TyMaybeSelect;
 
 impl AttrTypeCoerce for MetadataAttrType {
-    fn coerce_item(
+    fn coerce_item<'v>(
         &self,
         configurable: AttrIsConfigurable,
-        _ctx: &dyn AttrCoercionContext,
-        value: Value,
-    ) -> buck2_error::Result<CoercedAttr> {
+        ctx: &dyn AttrCoercionContext<'v>,
+        value: Value<'v>,
+    ) -> buck2_error::Result<AttrToken> {
         if configurable == AttrIsConfigurable::Yes {
             return Err(internal_error!("Metadata attribute is not configurable"));
         }
@@ -59,7 +59,8 @@ impl AttrTypeCoerce for MetadataAttrType {
             map.insert(key.to_owned(), MetadataValue::new(value));
         }
 
-        Ok(CoercedAttr::Metadata(MetadataMap::new(map)))
+        let m = MetadataMap::new(map);
+        ctx.attr_arena().encode_metadata(&m)
     }
 
     fn starlark_type(&self) -> TyMaybeSelect {

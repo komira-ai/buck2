@@ -11,10 +11,12 @@
 use std::any::TypeId;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use dashmap::try_result::TryResult;
 use dupe::Dupe;
 
 use super::*;
@@ -36,8 +38,6 @@ use crate::testing::TestingDeserializer;
 use crate::testing::TestingSerializer;
 use crate::traits::PagableDeserializer;
 use crate::traits::PagableSerializer;
-
-static RESIDENT_ARC_DESERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[crate::pagable_typetag]
 trait SerializationView: PagableTagged + Send + Sync + std::fmt::Debug {
@@ -66,7 +66,28 @@ impl<'de> PagableDeserialize<'de> for ResidentArcValue {
     fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
         deserializer: &mut D,
     ) -> crate::Result<Self> {
-        RESIDENT_ARC_DESERIALIZATIONS.fetch_add(1, Ordering::SeqCst);
+        Ok(Self(u8::pagable_deserialize(deserializer)?))
+    }
+}
+
+/// Deserializations of [`ReuseProbe`], which only
+/// `page_in_reuses_arc_still_resident_after_page_out` deserializes, so its
+/// exact counts hold whatever the other tests do on parallel threads.
+static REUSE_PROBE_DESERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct ReuseProbe(u8);
+
+impl PagableSerialize for ReuseProbe {
+    fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> crate::Result<()> {
+        self.0.pagable_serialize(serializer)
+    }
+}
+
+impl<'de> PagableDeserialize<'de> for ReuseProbe {
+    fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
+        deserializer: &mut D,
+    ) -> crate::Result<Self> {
+        REUSE_PROBE_DESERIALIZATIONS.fetch_add(1, Ordering::SeqCst);
         Ok(Self(u8::pagable_deserialize(deserializer)?))
     }
 }
@@ -163,21 +184,29 @@ impl ArcErase for PausedDataKeyLookupArc {
 fn deserialize_resident_partial_arc<'de, D: PagableDeserializer<'de> + ?Sized>(
     deserializer: &mut D,
 ) -> crate::Result<PartialPagableArc<ResidentArcValue>> {
-    fn deserialize_fn(
+    deserialize_partial_arc(deserializer)
+}
+
+fn deserialize_partial_arc<'de, T, D>(deserializer: &mut D) -> crate::Result<PartialPagableArc<T>>
+where
+    T: for<'a> PagableDeserialize<'a> + PagableSerialize + Send + Sync + 'static,
+    D: PagableDeserializer<'de> + ?Sized,
+{
+    fn deserialize_fn<
+        T: for<'a> PagableDeserialize<'a> + PagableSerialize + Send + Sync + 'static,
+    >(
         deserializer: &mut dyn PagableDeserializer<'_>,
         _recipe: Arc<dyn PagableDeserializerRecipe>,
     ) -> crate::Result<Box<dyn ArcEraseDyn>> {
-        Ok(Box::new(PartialPagableArc::new(
-            ResidentArcValue::pagable_deserialize(deserializer)?,
-        )))
+        Ok(Box::new(PartialPagableArc::new(T::pagable_deserialize(
+            deserializer,
+        )?)))
     }
 
-    let arc = deserializer.deserialize_arc(
-        TypeId::of::<PartialPagableArc<ResidentArcValue>>(),
-        deserialize_fn,
-    )?;
+    let arc =
+        deserializer.deserialize_arc(TypeId::of::<PartialPagableArc<T>>(), deserialize_fn::<T>)?;
     arc.as_arc_any()
-        .downcast_ref::<PartialPagableArc<ResidentArcValue>>()
+        .downcast_ref::<PartialPagableArc<T>>()
         .ok_or_else(|| anyhow::anyhow!("resident partial arc type mismatch"))
         .cloned()
 }
@@ -688,6 +717,40 @@ fn deferred_arc_skips_fetch_then_preserves_identity() -> anyhow::Result<()> {
 }
 
 #[test]
+fn deferred_arc_metadata_skips_fetch_then_preserves_identity() -> anyhow::Result<()> {
+    let mem = InMemoryPagableStorage::new();
+    let storage = Arc::new(CountingStorage::new(mem.handle()));
+    let keys = serialize_shared_arc_items(&storage, 1)?;
+    let handle = PagableStorageHandle::new(storage.dupe() as Arc<dyn PagableStorage>);
+    let data = storage.fetch_data_blocking(&keys[0])?;
+    let mut de = handle.root_deserializer(keys[0], &data);
+    let _: u8 = crate::PagableDeserialize::pagable_deserialize(&mut de)?;
+    let before = storage.fetch_count.load(Ordering::SeqCst);
+    let deferred = crate::DeferredValue::<Arc<Vec<u8>>, u8>::deserialize_arc_with_metadata(
+        &mut de, true, 0xAB,
+    )?;
+    assert_eq!(*deferred.metadata_or_else(|v| &v[0]), 0xAB);
+    assert!(!deferred.is_resolved());
+    assert_eq!(storage.fetch_count.load(Ordering::SeqCst), before);
+    let loaded = deferred.read()?;
+    assert_eq!(loaded.as_slice(), &[0xAB; 1000]);
+    assert_eq!(storage.fetch_count.load(Ordering::SeqCst), before + 1);
+
+    let mut eager_de = handle.root_deserializer(keys[0], &data);
+    let _: u8 = crate::PagableDeserialize::pagable_deserialize(&mut eager_de)?;
+    let eager = crate::DeferredValue::<Arc<Vec<u8>>, u8>::deserialize_arc_with_metadata(
+        &mut eager_de,
+        false,
+        0xAB,
+    )?;
+    assert!(eager.is_resolved());
+    assert_eq!(*eager.metadata_or_else(|v| &v[0]), 0xAB);
+    assert!(Arc::ptr_eq(loaded, eager.read()?));
+    assert_eq!(storage.fetch_count.load(Ordering::SeqCst), before + 1);
+    Ok(())
+}
+
+#[test]
 fn unread_native_field_serializes_to_another_storage() -> anyhow::Result<()> {
     let mem = InMemoryPagableStorage::new();
     let storage = Arc::new(CountingStorage::new(mem.handle()));
@@ -1101,6 +1164,259 @@ fn evicting_an_arc_evicts_the_arcs_only_its_value_held() {
     assert_eq!(cache.len(), 0);
 }
 
+#[derive(pagable::PagableUnsupported)]
+struct NativeCacheChainNode {
+    child: Option<triomphe::Arc<NativeCacheChainNode>>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for NativeCacheChainNode {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn cached_native_chain(
+    cache: &DeserializedArcCache,
+    drops: &Arc<AtomicUsize>,
+    len: usize,
+) -> triomphe::Arc<NativeCacheChainNode> {
+    (0..len)
+        .fold(None, |child, index| {
+            let arc = triomphe::Arc::new(NativeCacheChainNode {
+                child,
+                drops: drops.dupe(),
+            });
+            drop(
+                cache
+                    .get_or_page_in(
+                        TypeId::of::<triomphe::Arc<NativeCacheChainNode>>(),
+                        DataKey::testing_new(index as u128 + 1),
+                        || Ok::<_, anyhow::Error>(Box::new(arc.clone())),
+                    )
+                    .expect("page-in closure is infallible"),
+            );
+            Some(arc)
+        })
+        .expect("the test chain is nonempty")
+}
+
+#[test]
+fn a_native_cache_chain_is_collected_in_one_pass() {
+    const NODES: usize = 500;
+    let cache = DeserializedArcCache::new();
+    let drops = Arc::new(AtomicUsize::new(0));
+    drop(cached_native_chain(&cache, &drops, NODES));
+
+    let stats = cache.evict_expired();
+    assert_eq!(stats.passes, 2);
+    assert_eq!(stats.entries_examined, NODES);
+    assert_eq!(stats.removed, NODES);
+    assert_eq!(drops.load(Ordering::SeqCst), NODES);
+}
+
+#[test]
+fn out_of_order_bindings_are_collected_by_fresh_fallback_passes() {
+    const NODES: usize = 8;
+    let cache = DeserializedArcCache::new();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let root = cached_native_chain(&cache, &drops, NODES);
+
+    // Rebind parents before children, deliberately reversing the sweep hint.
+    let mut node = Some(&root);
+    let mut index = NODES;
+    while let Some(arc) = node {
+        cache.bind(
+            TypeId::of::<triomphe::Arc<NativeCacheChainNode>>(),
+            DataKey::testing_new(index as u128),
+            arc,
+        );
+        index -= 1;
+        node = arc.child.as_ref();
+    }
+    assert_eq!(index, 0);
+    drop(root);
+
+    let stats = cache.evict_expired();
+    assert_eq!(stats.passes, NODES + 1);
+    assert_eq!(stats.entries_examined, NODES * (NODES + 1) / 2);
+    assert_eq!(stats.removed, NODES);
+    assert_eq!(drops.load(Ordering::SeqCst), NODES);
+}
+
+#[test]
+fn eviction_stats_count_successful_removals_not_stale_candidates() {
+    let cache = DeserializedArcCache::new();
+    let key = DataKey::testing_new(1);
+    let type_id = TypeId::of::<PartialPagableArc<ResidentArcValue>>();
+    let first = PartialPagableArc::new(ResidentArcValue(1));
+    drop(page_in_partial_arc(&cache, key, &first));
+    drop(first);
+
+    let expired: Vec<_> = cache
+        .map
+        .iter()
+        .filter(|entry| entry.value().expired())
+        .map(|entry| *entry.key())
+        .collect();
+    assert_eq!(expired, vec![(type_id, key)]);
+
+    // A page-in between the scan and removal binds a live allocation to the
+    // same key. Replay that interleaving without depending on thread scheduling.
+    let replacement = PartialPagableArc::new(ResidentArcValue(2));
+    drop(page_in_partial_arc(&cache, key, &replacement));
+    assert_eq!(cache.remove_expired(expired), 0);
+    let bound = cache.get(&type_id, &key).expect("live rebind survives");
+    assert!(PartialPagableArc::ptr_eq(
+        &replacement,
+        downcast_partial_arc(&*bound),
+    ));
+    drop((bound, replacement));
+    let stats = cache.evict_expired();
+    assert_eq!(stats.passes, 2);
+    assert_eq!(stats.entries_examined, 1);
+    assert_eq!(stats.removed, 1);
+}
+
+#[test]
+fn eviction_preserves_a_page_in_gate_replacing_an_expired_binding() {
+    let cache = DeserializedArcCache::new();
+    let key = DataKey::testing_new(1);
+    let type_id = TypeId::of::<PartialPagableArc<ResidentArcValue>>();
+    let arc = PartialPagableArc::new(ResidentArcValue(1));
+    drop(page_in_partial_arc(&cache, key, &arc));
+    drop(arc);
+    assert!(cache.map.get(&(type_id, key)).unwrap().expired());
+
+    let gate = Arc::new(Mutex::new(()));
+    let previous = cache
+        .map
+        .insert((type_id, key), Slot::PagingIn(gate.dupe()));
+    drop(previous);
+    assert_eq!(cache.remove_expired(vec![(type_id, key)]), 0);
+    assert!(matches!(
+        cache.map.get(&(type_id, key)).unwrap().value(),
+        Slot::PagingIn(bound) if Arc::ptr_eq(bound, &gate),
+    ));
+    assert_eq!(cache.evict_expired().removed, 0);
+}
+
+#[derive(pagable::PagableUnsupported)]
+struct CacheDropAction {
+    cache: Weak<DeserializedArcCache>,
+    own_key: DataKey,
+    action: Box<dyn Fn(&DeserializedArcCache) + Send + Sync>,
+}
+
+impl Drop for CacheDropAction {
+    fn drop(&mut self) {
+        let cache = self.cache.upgrade().expect("the test holds the cache");
+        let own_key = (TypeId::of::<triomphe::Arc<Self>>(), self.own_key);
+        // A nonblocking probe fails promptly instead of deadlocking if the
+        // removal still holds this value's shard lock during its destructor.
+        assert!(!matches!(cache.map.try_get(&own_key), TryResult::Locked));
+        assert!(matches!(cache.map.entry(own_key), Entry::Vacant(_)));
+        (self.action)(&cache);
+    }
+}
+
+fn bind_cache_drop_action(
+    cache: &Arc<DeserializedArcCache>,
+    key: DataKey,
+    action: impl Fn(&DeserializedArcCache) + Send + Sync + 'static,
+) {
+    let arc = triomphe::Arc::new(CacheDropAction {
+        cache: Arc::downgrade(cache),
+        own_key: key,
+        action: Box::new(action),
+    });
+    cache.bind(TypeId::of::<triomphe::Arc<CacheDropAction>>(), key, &arc);
+}
+
+#[test]
+fn drop_callback_rebinds_a_snapshot_key_without_holding_its_shard_lock() {
+    let cache = Arc::new(DeserializedArcCache::new());
+    let target_key = DataKey::testing_new(1);
+    let type_id = TypeId::of::<PartialPagableArc<ResidentArcValue>>();
+    let stale = PartialPagableArc::new(ResidentArcValue(1));
+    drop(page_in_partial_arc(&cache, target_key, &stale));
+    drop(stale);
+
+    let replacement = PartialPagableArc::new(ResidentArcValue(2));
+    ArcErase::set_data_key(&replacement, target_key);
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    bind_cache_drop_action(&cache, DataKey::testing_new(2), {
+        let replacement = replacement.dupe();
+        let callbacks = callbacks.dupe();
+        move |cache| {
+            cache.register_resident(target_key, &replacement);
+            callbacks.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let stats = cache.evict_expired();
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.passes, 2);
+    assert_eq!(
+        stats.entries_examined, 3,
+        "two initial visits plus one live survivor"
+    );
+    assert_eq!(stats.removed, 1);
+    let bound = cache
+        .get(&type_id, &target_key)
+        .expect("the rebind survives");
+    assert!(PartialPagableArc::ptr_eq(
+        &replacement,
+        downcast_partial_arc(&*bound),
+    ));
+    drop((bound, replacement));
+    assert_eq!(cache.evict_expired().removed, 1);
+}
+
+#[test]
+fn a_drop_callback_new_binding_is_visited_by_a_fresh_snapshot() {
+    let cache = Arc::new(DeserializedArcCache::new());
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    bind_cache_drop_action(&cache, DataKey::testing_new(1), {
+        let callbacks = callbacks.dupe();
+        move |cache| {
+            let arc = triomphe::Arc::new(7u8);
+            cache.bind(
+                TypeId::of::<triomphe::Arc<u8>>(),
+                DataKey::testing_new(2),
+                &arc,
+            );
+            callbacks.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let stats = cache.evict_expired();
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.passes, 3);
+    assert_eq!(stats.entries_examined, 2);
+    assert_eq!(stats.removed, 2);
+}
+
+#[test]
+fn an_expired_rebind_is_eligible_despite_its_new_order() {
+    let cache = DeserializedArcCache::new();
+    let key = DataKey::testing_new(1);
+    let stale = PartialPagableArc::new(ResidentArcValue(1));
+    drop(page_in_partial_arc(&cache, key, &stale));
+    drop(stale);
+    let bindings = cache.bindings_in_eviction_order();
+    assert_eq!(bindings.len(), 1);
+
+    let replacement = PartialPagableArc::new(ResidentArcValue(2));
+    drop(page_in_partial_arc(&cache, key, &replacement));
+    drop(replacement);
+    assert_eq!(
+        cache.remove_expired(bindings.into_iter().map(|(_, key)| key)),
+        1
+    );
+    assert_eq!(cache.len(), 0);
+}
+
 #[test]
 fn a_failed_page_in_leaves_the_key_to_the_next_caller() {
     let cache = DeserializedArcCache::new();
@@ -1276,7 +1592,7 @@ fn page_in_reuses_arc_still_resident_after_page_out() -> anyhow::Result<()> {
     let mem = InMemoryPagableStorage::new();
     let storage = Arc::new(CountingStorage::new(mem.handle()));
     let handle = PagableStorageHandle::new(storage.dupe() as Arc<dyn PagableStorage>);
-    let original = PartialPagableArc::new(ResidentArcValue(42));
+    let original = PartialPagableArc::new(ReuseProbe(42));
 
     let finished = ArcSerCache::new();
     let storage_context = storage.storage_context();
@@ -1290,36 +1606,33 @@ fn page_in_reuses_arc_still_resident_after_page_out() -> anyhow::Result<()> {
             PageOutError::AlreadyFailed => panic!("unexpected AlreadyFailed"),
         })?;
 
-    RESIDENT_ARC_DESERIALIZATIONS.store(0, Ordering::SeqCst);
+    REUSE_PROBE_DESERIALIZATIONS.store(0, Ordering::SeqCst);
     let parent = storage.fetch_data_blocking(&parent_key)?;
     let child_key = parent.arcs[0];
     let mut deser = handle.root_deserializer(parent_key, &parent);
-    let restored = deserialize_resident_partial_arc(&mut deser)?;
+    let restored: PartialPagableArc<ReuseProbe> = deserialize_partial_arc(&mut deser)?;
 
     assert!(
         PartialPagableArc::ptr_eq(&original, &restored),
         "page-in should reuse the allocation retained across page-out",
     );
     assert_eq!(restored.0, 42);
-    assert_eq!(RESIDENT_ARC_DESERIALIZATIONS.load(Ordering::SeqCst), 0);
+    assert_eq!(REUSE_PROBE_DESERIALIZATIONS.load(Ordering::SeqCst), 0);
 
     drop(restored);
     drop(original);
     assert!(
         storage
             .arc_cache()
-            .get(
-                &TypeId::of::<PartialPagableArc<ResidentArcValue>>(),
-                &child_key,
-            )
+            .get(&TypeId::of::<PartialPagableArc<ReuseProbe>>(), &child_key,)
             .is_none(),
         "the resident registry must not keep the allocation alive",
     );
 
     let mut deser = handle.root_deserializer(parent_key, &parent);
-    let restored = deserialize_resident_partial_arc(&mut deser)?;
+    let restored: PartialPagableArc<ReuseProbe> = deserialize_partial_arc(&mut deser)?;
     assert_eq!(restored.0, 42);
-    assert_eq!(RESIDENT_ARC_DESERIALIZATIONS.load(Ordering::SeqCst), 1);
+    assert_eq!(REUSE_PROBE_DESERIALIZATIONS.load(Ordering::SeqCst), 1);
     Ok(())
 }
 

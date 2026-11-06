@@ -20,6 +20,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,7 @@ from typing import (
 
 import __manifest__
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.api.buck_result import BuckException
 from buck2.tests.e2e_util.api.executable import WindowsCmdOption
 from decorator import decorator
 
@@ -58,6 +60,7 @@ BuckTestMarker = namedtuple(
         "setup_eden",
         "disable_daemon_cgroup",
         "write_invocation_record",
+        "allow_daemon_panics",
     ],
 )
 
@@ -83,10 +86,14 @@ async def buck_fixture(  # noqa C901 : "too complex"
     test_executable = os.environ["TEST_EXECUTABLE"]
 
     env: Dict[str, str] = {**os.environ}
+    env["BUCK2_SHARE_DAEMON"] = "false"
+    env.pop("BUCK2_DAEMON_GROUP", None)
     # This is necessary for static linking on Linux.
     if platform.system() != "Windows":
         env["BUCKD_STARTUP_TIMEOUT"] = "120"
         env["BUCKD_STARTUP_INIT_TIMEOUT"] = "120"
+    else:
+        env["CI"] = "true"
 
     # allow_soft_errors will override any existing environment variable behavior
     if marker.allow_soft_errors or marker.inplace:
@@ -102,8 +109,18 @@ async def buck_fixture(  # noqa C901 : "too complex"
     env["BUCK2_TEST_BLOCK_ON_UPLOAD"] = "true"
     # Require the events dispatcher to be set for e2e tests.
     env["ENFORCE_DISPATCHER_SET"] = "true"
-    # Inform buck of the test timeout
-    env["BUCK2_SELF_TEST_TIMEOUT_S"] = "600"
+    # Inform buck of the test timeout so the daemon self-terminates (with its
+    # +30s grace, see self_test_timeout.rs) before TPX hard-kills the test.
+    # TPX publishes the real per-test budget in TPX_TIMEOUT_SEC, which already
+    # reflects timeout labels like `long_running` (10x) and `glacial` (16.5x).
+    # Honor that budget, minus headroom for the grace and final cleanup, so a
+    # labeled test's inner buck2 actually gets its extended runway instead of
+    # being capped at ~630s. Never drop below the historical 600s floor.
+    tpx_timeout_s = os.environ.get("TPX_TIMEOUT_SEC")
+    self_test_timeout_s = 600
+    if tpx_timeout_s and tpx_timeout_s.isdigit():
+        self_test_timeout_s = max(self_test_timeout_s, int(tpx_timeout_s) - 90)
+    env["BUCK2_SELF_TEST_TIMEOUT_S"] = str(self_test_timeout_s)
     # Timeout Watchman requests because we often see it hang and crash.
     env["BUCK2_WATCHMAN_TIMEOUT"] = "30"
     env["BUCK2_RUNTIME_THREADS"] = "8"
@@ -234,13 +251,19 @@ async def buck_fixture(  # noqa C901 : "too complex"
 
             buck_cwd = project_dir
 
+        # Core tests run with read-only outputs, under either materializer.
+        extra_config_lines.append("[buck2]\nreadonly_outputs = true\n")
         # A target variant can run its suite against another materializer implementation;
         # see `buck2_core_tests`.
         materializer = os.environ.get("BUCK2_TEST_MATERIALIZER")
-        if materializer:
-            extra_config_lines.append(f"[buck2]\nmaterializer = {materializer}\n")
-        # Core tests run with read-only outputs, under either materializer.
-        extra_config_lines.append("[buck2]\nreadonly_outputs = true\n")
+        if materializer == "v2":
+            # Every `ROLLOUT_VERSION` is at least 0.
+            extra_config_lines.append("[buck2]\nmaterializer_v2_version = 0\n")
+            # The disk-state twins run strict: a root leaves disk the moment its last lease
+            # does, so a reader without one fails here rather than by chance in use.
+            extra_config_lines.append("[buck2]\nmaterializer_strict_leases = true\n")
+        elif materializer is not None:
+            raise Exception(f"Unknown `BUCK2_TEST_MATERIALIZER` value `{materializer}`")
 
         for section, config in marker.extra_buck_config.items():
             extra_config_lines.append(f"[{section}]\n")
@@ -270,11 +293,22 @@ async def buck_fixture(  # noqa C901 : "too complex"
 
         yield buck
 
+        daemon_panic = None
+        if not (marker.allow_daemon_panics or marker.inplace):
+            if not marker.skip_final_kill:
+                # Kill (not clean) first: it waits for the daemon to exit and leaves its
+                # stderr in place for the check.
+                await buck.kill()
+            daemon_panic = await _daemon_panic(buck)
+
         if not marker.skip_final_kill:
             if keep_temp:
                 await buck.kill()
             else:
                 await buck.clean()
+
+        if daemon_panic is not None:
+            raise AssertionError(daemon_panic)
     finally:
         sys.stdout = orig_stdout
 
@@ -319,6 +353,53 @@ async def _get_common_dir() -> Path:
     assert stdout is not None, "stdout should not be None"
     common_dir = Path(stdout.decode().strip())
     return common_dir
+
+
+async def _daemon_panic(buck: Buck) -> Optional[str]:
+    """
+    A failure message if any daemon this test used panicked, else None.
+
+    A daemon that panics after answering a command goes unnoticed: the client already has its
+    result and the next command starts a new daemon. So this reads the daemon's stderr after
+    the test, including the previous daemon's copy in `prev/`.
+    """
+    if not buck.cwd.is_dir():
+        # The test deleted its own project.
+        return None
+    try:
+        daemon_dir = await buck.get_daemon_dir()
+    except BuckException:
+        # No project root, so no daemon.
+        return None
+    project_daemon_dir = daemon_dir.parent
+    if not project_daemon_dir.is_dir():
+        return None
+    for stderr in sorted(project_daemon_dir.glob("*/buckd.stderr")) + sorted(
+        project_daemon_dir.glob("*/prev/buckd.stderr")
+    ):
+        try:
+            text = stderr.read_text(errors="replace")
+        except OSError:
+            continue
+        if "panicked at" not in text:
+            continue
+        if _HARD_ERROR_UPGRADE in text:
+            what = (
+                "The buck2 daemon hit a soft error during this test. Tests run with "
+                "BUCK2_HARD_ERROR, which turns soft errors into panics. If this soft error is "
+                "expected, mark the test `allow_soft_errors=True` (or `allow_daemon_panics=True` "
+                "to keep hard errors for everything else)."
+            )
+        else:
+            what = (
+                "The buck2 daemon panicked during this test. If that is expected, mark the test "
+                "`allow_daemon_panics=True`."
+            )
+        return f"{what} Daemon stderr ({stderr}):\n\n{text}"
+    return None
+
+
+_HARD_ERROR_UPGRADE = "Upgraded warning to failure via $BUCK2_HARD_ERROR"
 
 
 def _buck_argument(args: Sequence[Any], kwargs: Dict[str, Any]) -> Buck:
@@ -486,6 +567,13 @@ def _cleanup_eden(
     )
 
 
+def _copy_writable(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    """Copies a file, giving the copy its owner's write permission; the test
+    writes to its copy of fixtures that buck materializes read-only."""
+    shutil.copy2(src, dst)
+    os.chmod(dst, os.stat(dst).st_mode | stat.S_IWUSR)
+
+
 def _copytree(
     src: Path,
     dst: Path,
@@ -500,9 +588,11 @@ def _copytree(
         s = src / item
         d = dst / item
         if os.path.isdir(s):
-            shutil.copytree(s, d, symlinks, ignore, dirs_exist_ok=True)
+            shutil.copytree(
+                s, d, symlinks, ignore, copy_function=_copy_writable, dirs_exist_ok=True
+            )
         else:
-            shutil.copy2(s, d)
+            _copy_writable(s, d)
 
 
 def _check_core_test_cells(project_dir: Path) -> None:
@@ -741,7 +831,7 @@ def parametrize(
     product of their entries.
 
     The test cases are named after the test and the case: `test_foo` with the id `linux` is
-    `test_foo_linux`. An empty `argvalues` leaves one case that skips.
+    `test_foo_linux`. An empty `argvalues` leaves no case: the test does not exist.
     """
     names = (
         [n.strip() for n in argnames.split(",")]
@@ -793,9 +883,6 @@ def _expand_parametrized_tests(cls: type) -> None:
         if stacked is None:
             continue
         delattr(cls, name)
-        if not all(stacked):
-            setattr(cls, name, _skipping_test_case(fn, name, "empty parameter set"))
-            continue
         for combination in itertools.product(*stacked):
             case_id = "-".join(case_id for case_id, _ in combination)
             kwargs = {}
@@ -840,16 +927,6 @@ def _bind_test_case(
     return _as_test_case(case, fn, name)
 
 
-def _skipping_test_case(
-    fn: Callable[..., Any], name: str, reason: str
-) -> Callable[..., Any]:
-    @functools.wraps(fn)
-    def case(self: unittest.TestCase) -> None:
-        self.skipTest(reason)
-
-    return _as_test_case(case, fn, name)
-
-
 def _as_test_case(
     case: Callable[..., Any], fn: Callable[..., Any], name: str
 ) -> Callable[..., Any]:
@@ -864,8 +941,9 @@ def buck_test(
     data_dir: Optional[str] = "",
     # Accepted values are specified in SKIPPABLE_PLATFORMS
     skip_for_os: List[str] = [],  # noqa: B006 value is read-only
-    # Materializer implementations (`buck2.materializer` values) the test does not apply to,
-    # for tests that assert on one implementation's own state or output. See `buck2_core_tests`.
+    # Materializer implementations (`BUCK2_TEST_MATERIALIZER` values) the test does not apply
+    # to, for tests that assert on one implementation's own state or output. See
+    # `buck2_core_tests`.
     skip_for_materializer: List[str] = [],  # noqa: B006 value is read-only
     allow_soft_errors: bool = False,
     extra_buck_config: Optional[Dict[str, Dict[str, str]]] = None,
@@ -873,6 +951,7 @@ def buck_test(
     setup_eden: bool = False,
     disable_daemon_cgroup: bool = True,
     write_invocation_record: bool = False,
+    allow_daemon_panics: bool = False,
 ) -> Callable[..., Any]:
     """
     Defines a buck test. This is a must have decorator on all test case functions.
@@ -904,6 +983,11 @@ def buck_test(
         setup_eden:
             Whether or not to set up an EdenFS repo for this test. Only matters for inplace=False.
             Note that this will slow the test down, so it should not be widely enabled.
+        allow_daemon_panics:
+            By default an isolated test fails if its daemon panicked at any point, even after
+            the command finished. Set this if the test deliberately makes the daemon panic.
+            That includes tests that expect a soft error from the daemon, since
+            BUCK2_HARD_ERROR turns those into panics.
     """
 
     if inplace and data_dir == "":
@@ -947,6 +1031,7 @@ def buck_test(
         setup_eden=setup_eden,
         disable_daemon_cgroup=disable_daemon_cgroup,
         write_invocation_record=write_invocation_record,
+        allow_daemon_panics=allow_daemon_panics,
     )
 
     def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -1001,11 +1086,9 @@ def is_deployed_buck2() -> bool:
     This may break deployed buck2, so please make sure this only affects tests for rules
     that buck2 users are not using.
 
-    Example of skipping test case with deployed buck2:
-        @unittest.skipIf(
-            is_deployed_buck2(),
-            "Skip if testing with deployed buck2",
-        )
+    Example of a test case that passes without running with deployed buck2:
+        if is_deployed_buck2():
+            return
     """
     return os.environ.get("TEST_EXECUTABLE") == "buck2"
 

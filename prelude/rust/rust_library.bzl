@@ -505,6 +505,7 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
         rustdoc = rustdoc,
         rustdoc_test = rustdoc_test,
         doctests_enabled = doctests_enabled,
+        doc_supports_test_execution_caching = ctx.attrs.doc_supports_test_execution_caching,
         re_executors = re_executors,
         check_artifacts = output_as_diag_subtargets(diag_artifacts[incr_enabled], clippy_artifacts[incr_enabled]),
         expand = expand,
@@ -792,6 +793,7 @@ def _default_providers(
     rustdoc: Artifact,
     rustdoc_test: cmd_args | None,
     doctests_enabled: bool,
+    doc_supports_test_execution_caching: bool,
     re_executors: RemoteTestExecutorConfig,
     check_artifacts: dict[str, Artifact | None],
     expand: Artifact | None,
@@ -852,6 +854,7 @@ def _default_providers(
         rustdoc_test_info = ExternalRunnerTestInfo(
             type = "rustdoc",
             command = [rustdoc_test],
+            supports_test_execution_caching = doc_supports_test_execution_caching,
             default_executor = re_executors.default_executor,
             executor_overrides = re_executors.executor_overrides,
             # Doctests always run from the project root with project-relative paths,
@@ -1267,18 +1270,22 @@ def _compute_transitive_deps(
     return transitive_deps, rust_debug_info, transitive_proc_macro_deps
 
 def rust_library_macro_wrapper(rust_library: typing.Callable) -> typing.Callable:
-    def wrapper(**kwargs):
+    def wrapper(proc_macro_alias_actual = None, **kwargs):
         if kwargs.get("proc_macro") == True:
             name = kwargs["name"]
             if kwargs.get("crate", None) == None and kwargs.get("crate_dynamic", None) == None:
                 kwargs["crate"] = name.replace("-", "_")
 
+            if proc_macro_alias_actual == None:
+                proc_macro_alias_actual = ":_" + name
+
             rust_proc_macro_alias(
                 name = name,
-                actual_exec = ":_" + name,
-                actual_plugin = ":_" + name,
+                actual_exec = proc_macro_alias_actual,
+                actual_plugin = proc_macro_alias_actual,
                 default_target_platform = kwargs.get("default_target_platform", None),
                 visibility = kwargs.pop("visibility", []),
+                _rust_toolchain = kwargs.get("_rust_toolchain", None),
             )
             kwargs["name"] = "_" + name
 
@@ -1347,6 +1354,7 @@ rust_library = prelude_rule(
         | {
             "crate_dynamic": attrs.option(attrs.dep(), default = None),
             "doc_env": rust_common.env_arg()["env"],
+            "doc_supports_test_execution_caching": attrs.bool(default = True),
             "doctests": attrs.option(attrs.bool(), default = None),
             "include_in_android_merge_map_output": attrs.bool(default = True),
             "proc_macro": attrs.bool(default = False),

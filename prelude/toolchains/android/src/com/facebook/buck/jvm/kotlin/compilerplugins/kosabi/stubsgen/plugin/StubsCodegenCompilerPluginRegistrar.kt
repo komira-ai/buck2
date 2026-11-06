@@ -20,7 +20,7 @@ import org.jetbrains.kotlin.fir.extensions.FirAnalysisHandlerExtension
 @OptIn(org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi::class)
 class StubsCodegenCompilerPluginRegistrar : CompilerPluginRegistrarCompat() {
 
-  override val pluginIdCompat: String = "com.facebook.kotlin.compilerplugins.kosabi.stubsgen"
+  override val pluginId: String = "com.facebook.kotlin.compilerplugins.kosabi.stubsgen"
 
   override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
 
@@ -39,6 +39,7 @@ class StubsCodegenCompilerPluginRegistrar : CompilerPluginRegistrarCompat() {
             stubsDumpDir = stubsGenDir,
             stubsClassOutputDir = stubsClassOutputDir,
             classPaths = classPaths,
+            skipJavaImports = configuration.get(skipJavaImportsKey).toBoolean(),
         ),
     )
   }

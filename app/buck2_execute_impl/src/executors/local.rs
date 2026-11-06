@@ -32,7 +32,7 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_core::tag_error;
 use buck2_core::tag_result;
 use buck2_error::BuckErrorContext;
@@ -615,13 +615,9 @@ impl LocalExecutor {
         } = materialized_inputs;
         // An action with neither outputs nor a scratch path has nothing to report under it.
         let outputs_lease = outputs_lease.unwrap_or_else(WriteLease::noop);
-        // Set once the run's outputs have been collected: that report settles every root of the
-        // lease, what the run produced tracked and what it did not left, and the leases over
-        // published content join the outputs lease for the result's readers. Every other way
-        // out leaves the run's partial content untracked, for the next run of the action to
-        // clear.
-        let mut reported = false;
-        let mut published = Vec::new();
+        // Set once the run's outputs have been collected: the leases `publish` returned over
+        // them, which join the outputs lease for the result's readers.
+        let mut published = None;
 
         let mut result = async {
             manager.start_waiting_category(WaitingCategory::Unknown);
@@ -775,8 +771,7 @@ impl LocalExecutor {
                         .await
                     {
                         Ok((output_values, hashing_time, leases)) => {
-                            reported = true;
-                            published = leases;
+                            published = Some(leases);
                             (output_values, hashing_time)
                         }
                         Err(e) => {
@@ -802,7 +797,7 @@ impl LocalExecutor {
                     timing.execution_stats = execution_stats;
                     if let Some(cgroup_result) = cgroup_result {
                         if let Some(e) = cgroup_result.error {
-                            let _unused = soft_error!("action_cgroup_error", e);
+                            soft_error_or_panic!("action_cgroup_error", e);
                         }
                         timing.suspend_duration = cgroup_result.suspend_duration;
                         timing.suspend_count = Some(cgroup_result.suspend_count);
@@ -884,8 +879,7 @@ impl LocalExecutor {
                         .await
                     {
                         Ok((output_values, hashing_time, leases)) => {
-                            reported = true;
-                            published = leases;
+                            published = Some(leases);
                             (output_values, hashing_time)
                         }
                         Err(e) => {
@@ -909,11 +903,9 @@ impl LocalExecutor {
             }
         }
         .await;
-        if reported {
+        if let Some(mut published) = published {
             published.push(outputs_lease.into_read_lease());
             result.outputs_lease = Some(ReadLease::join(published));
-        } else {
-            outputs_lease.abandon();
         }
 
         if let Some(run_action_key) = request.run_action_key()
@@ -967,8 +959,6 @@ impl LocalExecutor {
             if let Some(entry) = entry {
                 insert_entry(&mut builder, path.clone(), entry)?;
                 entries.push((output.cloned(), path));
-            } else {
-                outputs_lease.leave_untracked(&path)?;
             }
         }
 
@@ -1445,7 +1435,6 @@ pub async fn materialize_inputs(
             return Err(tag_error!(
                 "cas_missing_fatal",
                 MaterializationError::NotFound { source }.into(),
-                quiet: true,
                 task: false,
                 daemon_in_memory_state_is_corrupted: true,
                 action_cache_is_corrupted: corrupted
@@ -1453,11 +1442,6 @@ pub async fn materialize_inputs(
         }
         Err(e) => return Err(e.into()),
     };
-
-    // Scratch content is never an artifact: nothing reports it.
-    if let (Some(lease), Some(scratch)) = (&outputs, &scratch.0) {
-        lease.leave_untracked(scratch)?;
-    }
 
     Ok(MaterializedInputPaths {
         scratch,
@@ -1516,7 +1500,6 @@ async fn check_inputs(
                                 let _ignored = tag_result!(
                                     "missing_local_inputs",
                                     metadata.categorize_internal().buck_error_context("Missing input"),
-                                    quiet: true,
                                     task: false,
                                     daemon_materializer_state_is_corrupted: true
                                 );

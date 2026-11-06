@@ -56,17 +56,18 @@ use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::values::ValueOf;
 use starlark::values::dict::DictRef;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::dict::DictType;
 use starlark::values::list::ListRef;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::none::NoneType;
 use starlark::values::record::Record;
 use starlark::values::set::SetRef;
 use starlark::values::starlark_value;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
-use starlark::values::tuple::UnpackTuple;
+use starlark::values::tuple::TupleType;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::bxl::starlark_defs::artifacts::ArtifactArg;
@@ -580,10 +581,10 @@ impl<'v> AllocValue<'v> for StarlarkOutputStream {
 #[derive(StarlarkTypeRepr, UnpackValue)]
 enum EnsureMultipleArtifactsArg<'v> {
     None(NoneType),
-    EnsuredArtifactArgs(UnpackList<ArtifactArg<'v>>),
+    EnsuredArtifactArgs(ValueOf<'v, ListType<ArtifactArg<'v>>>),
     ProvidersArtifactIterable(&'v StarlarkProvidersArtifactIterable<'v>),
     BxlBuildResult(&'v StarlarkBxlBuildResult),
-    Dict(UnpackDictEntries<Value<'v>, &'v StarlarkBxlBuildResult>),
+    Dict(ValueOf<'v, DictType<Value<'v>, &'v StarlarkBxlBuildResult>>),
     CmdLine(ValueAsCommandLineLike<'v>),
 }
 
@@ -611,14 +612,14 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn print<'v>(
         this: &'v StarlarkOutputStream,
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(args)] args: ValueOf<'v, TupleType<Value<'v>>>,
         #[starlark(default = " ")] sep: &'v str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         let buffer_output = BufferPrintOutput {
             output: this.output(),
         };
-        this.print(args.into_iter(), sep, eval, buffer_output)?;
+        this.print(args.items(), sep, eval, buffer_output)?;
 
         Ok(NoneType)
     }
@@ -684,29 +685,33 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn stream<'v>(
         this: &'v StarlarkOutputStream,
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(args)] args: ValueOf<'v, TupleType<Value<'v>>>,
         #[starlark(default = " ")] sep: &'v str,
-        #[starlark(require = named, default = UnpackList::default())] wait_on: UnpackList<
-            Either<&'v EnsuredArtifact, &'v EnsuredArtifactGroup>,
+        #[starlark(require = named, default = ValueOf::empty_list())] wait_on: ValueOf<
+            'v,
+            ListType<Either<&'v EnsuredArtifact, &'v EnsuredArtifactGroup<'v>>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         let extra = BxlEvalExtra::from_context(eval)?;
         let streaming_writer = BxlStreamingWriter::new(&extra.dice);
 
-        let wait_on = wait_on.into_iter().flat_map(|wait_on| match wait_on {
-            Either::Left(ensured_artifact) => {
-                vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
-            }
-            Either::Right(ensured_group) => ensured_group
-                .inner()
-                .iter()
-                .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
-                .collect(),
-        });
+        let wait_on = wait_on
+            .try_to_vec()?
+            .into_iter()
+            .flat_map(|wait_on| match wait_on {
+                Either::Left(ensured_artifact) => {
+                    vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
+                }
+                Either::Right(ensured_group) => ensured_group
+                    .inner()
+                    .iter()
+                    .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
+                    .collect(),
+            });
 
         let streaming_output = StreamingOutput::new(wait_on, this.state.dupe(), streaming_writer);
-        this.print(args.into_iter(), sep, eval, streaming_output)?;
+        this.print(args.items(), sep, eval, streaming_output)?;
 
         Ok(NoneType)
     }
@@ -741,23 +746,27 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         this: &'v StarlarkOutputStream,
         value: Value<'v>,
         #[starlark(require=named, default=true)] pretty: bool,
-        #[starlark(require = named, default = UnpackList::default())] wait_on: UnpackList<
-            Either<&'v EnsuredArtifact, &'v EnsuredArtifactGroup>,
+        #[starlark(require = named, default = ValueOf::empty_list())] wait_on: ValueOf<
+            'v,
+            ListType<Either<&'v EnsuredArtifact, &'v EnsuredArtifactGroup<'v>>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         let extra = BxlEvalExtra::from_context(eval)?;
         let streaming_writer = BxlStreamingWriter::new(&extra.dice);
-        let wait_on = wait_on.into_iter().flat_map(|wait_on| match wait_on {
-            Either::Left(ensured_artifact) => {
-                vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
-            }
-            Either::Right(ensured_group) => ensured_group
-                .inner()
-                .iter()
-                .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
-                .collect(),
-        });
+        let wait_on = wait_on
+            .try_to_vec()?
+            .into_iter()
+            .flat_map(|wait_on| match wait_on {
+                Either::Left(ensured_artifact) => {
+                    vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
+                }
+                Either::Right(ensured_group) => ensured_group
+                    .inner()
+                    .iter()
+                    .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
+                    .collect(),
+            });
         let streaming_output = StreamingOutput::new(wait_on, this.state.dupe(), streaming_writer);
 
         this.print_json(value, pretty, eval, streaming_output)?;
@@ -816,10 +825,9 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             EnsureMultipleArtifactsArg::None(_) => Ok(heap.alloc(Vec::<EnsuredArtifact>::new())),
             EnsureMultipleArtifactsArg::EnsuredArtifactArgs(list) => {
                 let artifacts: Vec<EnsuredArtifact> = list
-                    .items
-                    .into_iter()
+                    .try_items()
                     .map(|artifact| {
-                        let artifact = artifact.into_ensured_artifact()?;
+                        let artifact = artifact?.into_ensured_artifact()?;
                         this.populate_ensured_artifacts(EnsuredArtifactOrGroup::Artifact(
                             artifact.clone(),
                         ))?;
@@ -844,9 +852,9 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             }
             EnsureMultipleArtifactsArg::Dict(build_result_dict) => Ok(heap.alloc_dict(
                 build_result_dict
-                    .entries
-                    .into_iter()
-                    .map(|(label, bxl_build_result)| {
+                    .try_items()
+                    .map(|entry| {
+                        let (label, bxl_build_result) = entry?;
                         Ok((
                             label.get_hashed().map_err(|e| {
                                 from_starlark_with_options(

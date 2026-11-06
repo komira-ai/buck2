@@ -290,3 +290,21 @@ def compile_with_argsfile(
 def uses_explicit_modules(ctx: AnalysisContext) -> bool:
     swift_toolchain = get_swift_toolchain_info(ctx)
     return ctx.attrs.uses_explicit_modules and is_sdk_modules_provided(swift_toolchain)
+
+def uses_dynamic_replacement(ctx: AnalysisContext) -> bool:
+    """Whether the module is compiled so its functions can be replaced at run
+    time. Only `apple_library` declares the attribute; other Swift rules never
+    opt in."""
+    return getattr(ctx.attrs, "swift_dynamic_replacement_enabled", False)
+
+def get_swift_dynamic_thunk_entry_point_name(ctx: AnalysisContext) -> str:
+    """The C symbol of the dynamic thunk's entry point, which is also the Swift
+    function's name, so it has to be an identifier in both."""
+    name = ctx.attrs.swift_dynamic_thunk_entry_point_name
+    valid = len(name) > 0 and not name[0].isdigit()
+    for c in name.elems():
+        if not (c.isalnum() or c == "_"):
+            valid = False
+    if not valid:
+        fail("swift_dynamic_thunk_entry_point_name must be a C identifier, got '{}'".format(name))
+    return name

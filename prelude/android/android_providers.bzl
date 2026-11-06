@@ -61,6 +61,11 @@ AndroidBinaryNativeLibsInfo = record(
     # Artifacts that must be produced for the binary to be valid. Threaded into
     # the apk's validation_deps_outputs, so a failing check fails the build.
     validation_outputs = list[Artifact],
+    # Under defer_relink, the same packaging inputs built from the relinked
+    # libraries (an AndroidBinaryNativeLibsInfo): the binary's own package is
+    # built from them, while the inputs above, from the unrelinked libraries,
+    # make the early package Redex starts from. None otherwise.
+    shipped = field(typing.Any, None),
 )
 
 AndroidBinaryResourcesInfo = record(
@@ -257,6 +262,8 @@ AndroidResourceInfo = provider(
         "r_dot_java_package": provider_field(Artifact | None, default = None),
         # resources defined by this rule. May be empty
         "res": provider_field(Artifact | None, default = None),
+        # original resources before transforms, when available
+        "source_res": provider_field(Artifact | None, default = None),
         # whether this resource contains non-XML resources
         "unused_resource_dep_validation_has_non_xml_resources": provider_field(bool, default = False),
         # priority of the resources, may be 'low' or 'normal'

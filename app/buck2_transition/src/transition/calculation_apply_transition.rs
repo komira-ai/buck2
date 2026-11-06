@@ -50,7 +50,8 @@ use pagable::pagable_typetag;
 use starlark::eval::Evaluator;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::ValueOf;
+use starlark::values::dict::DictType;
 use starlark::values::structs::AllocStruct;
 
 use crate::transition::calculation_fetch_transition::FetchTransition;
@@ -102,7 +103,12 @@ fn call_transition_function<'v>(
             args.push(("refs", refs));
             v.as_ref().add_to_heap(eval.heap()).as_ref().implementation
         }
-        TransitionData::Target(v) => v.as_ref().add_to_heap(eval.heap()).as_ref().r#impl.get(),
+        TransitionData::Target(v) => v
+            .as_ref()
+            .add_to_heap(eval.heap())
+            .as_ref()
+            .r#impl
+            .to_value(),
     };
     if let Some(attrs) = attrs {
         args.push(("attrs", attrs));
@@ -111,10 +117,11 @@ fn call_transition_function<'v>(
         .eval_function(impl_, &[], &args)
         .map_err(buck2_error::Error::from)?;
     if transition.is_split() {
-        match UnpackDictEntries::<&str, &PlatformInfo>::unpack_value(new_platforms)? {
+        match ValueOf::<DictType<&str, &PlatformInfo>>::new(new_platforms) {
             Some(dict) => {
                 let mut split = BuckMutInsertionMap::new();
-                for (k, v) in dict.entries {
+                for entry in dict.try_items() {
+                    let (k, v) = entry?;
                     let prev = split.insert(
                         k.to_owned(),
                         v.to_configuration(conf.exec_marking().dupe())?,
@@ -163,7 +170,8 @@ async fn do_apply_transition(
                 let attrs = match (transition.attr_names(), attrs) {
                     (Some(names), Some(values)) => {
                         let mut attrs = Vec::new();
-                        for (name, value) in names.into_iter().zip_eq(values.iter()) {
+                        for (name, value) in names.zip_eq(values.iter()) {
+                            let name = name?;
                             let value = match value {
                                 Some(value) => (CONFIGURED_ATTR_TO_VALUE.get()?)(
                                     value,
@@ -341,16 +349,13 @@ impl TransitionCalculation for TransitionCalculationImpl {
 
         let transition = ctx.fetch_transition(transition_id).await?;
 
-        #[allow(clippy::manual_map)]
-        let attrs = if let Some(attrs) = transition.attr_names() {
-            Some(
+        let attrs = match transition.attr_names() {
+            Some(attrs) => Some(
                 attrs
-                    .into_iter()
-                    .map(|attr| configured_attrs.get(attr).duped())
-                    .collect(),
-            )
-        } else {
-            None
+                    .map(|attr| Ok(configured_attrs.get(attr?).duped()))
+                    .collect::<buck2_error::Result<_>>()?,
+            ),
+            None => None,
         };
 
         let key = TransitionKey {

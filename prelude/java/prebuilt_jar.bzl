@@ -12,7 +12,7 @@ load("@prelude//android:build_only_native_code.bzl", "is_build_only_native_code"
 load("@prelude//decls:common.bzl", "buck")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//java/utils:java_utils.bzl", "get_classpath_subtargets")
-load("@prelude//jvm:attrs.bzl", "dex_min_sdk_version", "jvm_common")
+load("@prelude//jvm:attrs.bzl", "jvm_common", "min_sdk_version")
 load(
     ":java_providers.bzl",
     "ClasspathSnapshotGranularity",
@@ -181,13 +181,13 @@ prebuilt_jar = prelude_rule(
             "generate_abi": attrs.bool(default = True),
             "is_executable": attrs.bool(default = False),
             "maven_coords": attrs.option(attrs.string(), default = None),
+            "min_sdk_version": attrs.default_only(attrs.option(attrs.int(), default = min_sdk_version())),
             # Prebuilt jars are quick to build, and often contain third-party code, which in turn is
             # often a source of annotations and constants. To ease migration to ABI generation from
             # source without deps, we have them present during ABI gen by default.
             "required_for_source_only_abi": attrs.bool(default = True),
             "uses_content_based_paths": jvm_common.content_based_path_attr(),
             "_build_only_native_code": attrs.default_only(attrs.bool(default = is_build_only_native_code())),
-            "_dex_min_sdk_version": attrs.option(attrs.int(), default = dex_min_sdk_version()),
             "_dex_toolchain": toolchains_common.dex(),
             "_exec_os_type": buck.exec_os_type_arg(),
             "_prebuilt_jar_toolchain": toolchains_common.prebuilt_jar(),

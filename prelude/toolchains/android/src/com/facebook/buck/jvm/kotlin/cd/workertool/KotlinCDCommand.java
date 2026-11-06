@@ -25,6 +25,7 @@ import com.facebook.buck.jvm.cd.command.PostBuildParams;
 import com.facebook.buck.jvm.cd.command.kotlin.BuildKotlinCommand;
 import com.facebook.buck.jvm.cd.serialization.kotlin.ActionMetadataSerializer;
 import com.facebook.buck.jvm.java.ActionMetadata;
+import com.facebook.buck.jvm.java.CompilerClassToSourceMap;
 import com.facebook.buck.jvm.kotlin.KotlinStepsBuilder;
 import com.facebook.buck.jvm.kotlin.cd.analytics.KotlinCDAnalytics;
 import com.facebook.buck.jvm.kotlin.cd.analytics.logger.KotlinCDLogger;
@@ -83,6 +84,7 @@ public class KotlinCDCommand implements JvmCDCommand {
 
   private final String buildUuid;
   private final String executionPlatform;
+  private final Path scratchDir;
 
   private final KotlinStepsBuilder stepsBuilder;
   private final BuildKotlinCommand buildKotlinCommand;
@@ -109,12 +111,24 @@ public class KotlinCDCommand implements JvmCDCommand {
     try (Reader reader = new FileReader(commandFile.toFile())) {
       JsonFormat.parser().ignoringUnknownFields().merge(reader, builder);
     }
-    RelPath buckScratchPath = RelPath.get(env.get(WORKING_DIRECTORY_ENV_VAR));
+    String scratchPath = env.get(WORKING_DIRECTORY_ENV_VAR);
+    if (scratchPath == null || scratchPath.isEmpty()) {
+      throw new IllegalStateException(
+          "BUCK_SCRATCH_PATH environment variable must be set and non-empty");
+    }
+    RelPath buckScratchPath = RelPath.get(scratchPath);
+    scratchDir = buckScratchPath.getPath();
     com.facebook.buck.cd.model.kotlin.BuildKotlinCommand proto = builder.build();
     this.buildKotlinCommand =
         BuildKotlinCommand.Companion.fromProto(
-            proto.getBuildCommand(), Optional.ofNullable(buckScratchPath));
+            proto.getBuildCommand(), Optional.of(buckScratchPath));
     this.postBuildParams = PostBuildParams.Companion.fromProto(proto.getPostBuildParams());
+    CompilerClassToSourceMap.prepare(
+        buildKotlinCommand
+            .getBaseJarCommand()
+            .getCompilerOutputPathsValue()
+            .getLibraryCompilerOutputPath(),
+        buildKotlinCommand.getBaseJarCommand().getBuildCellRootPath().getPath());
     this.buildUuid = env.get("BUCK_BUILD_ID");
     this.executionPlatform = env.get("INSIDE_RE_WORKER") != null ? "remote_execution" : "local";
     KotlinCDAnalytics kotlinCDAnalytics = initKotlinCDAnalytics();
@@ -360,6 +374,16 @@ public class KotlinCDCommand implements JvmCDCommand {
 
   @Override
   public void postExecute() throws IOException {
+    CompilerClassToSourceMap.writeCombined(
+        buildKotlinCommand
+            .getBaseJarCommand()
+            .getCompilerOutputPathsValue()
+            .getLibraryCompilerOutputPath(),
+        buildKotlinCommand.getBaseJarCommand().getBuildCellRootPath().getPath(),
+        // The shared javaSrcs protocol field carries both .java and .kt inputs.
+        buildKotlinCommand.getBaseJarCommand().getJavaSrcs().stream()
+            .map(RelPath::getPath)
+            .collect(Collectors.toList()));
     maybeCreateIncrementalStateDir();
     maybeRunPostProcessor();
     maybeWriteClassAbi();
@@ -381,7 +405,7 @@ public class KotlinCDCommand implements JvmCDCommand {
     Path libraryJar = postBuildParams.getLibraryJar();
     Preconditions.checkNotNull(libraryJar, "libraryJar must be set when postProcessorCmd is set");
 
-    Path tempDir = Files.createTempDirectory("postprocessor");
+    Path tempDir = Files.createTempDirectory(scratchDir, "postprocessor");
     try {
       Path postprocessedJar = tempDir.resolve("postprocessed_output.jar");
       List<String> cmd = new ArrayList<>(Arrays.asList(postProcessorCmd.split("\\s+")));

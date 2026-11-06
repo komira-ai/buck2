@@ -51,6 +51,7 @@ use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::buck_mut_insertion_map;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use starlark::values::OwnedFrozen;
@@ -60,6 +61,7 @@ use starlark::values::Value;
 use crate::actions::impls::declare_writes::declare_writes;
 use crate::actions::impls::run::DepFilesPlaceholderArtifactPathMapper;
 use crate::actions::impls::write_cache;
+use crate::actions::impls::write_cache::CacheUse;
 use crate::actions::impls::write_cache::KeyInputs;
 use crate::actions::impls::write_cache::WriteCache;
 use crate::actions::impls::write_cache::WriteCacheKey;
@@ -126,7 +128,7 @@ impl<'v> CommandLineArtifactVisitor<'v> for CommandLineContentBasedInputVisitor 
 pub(crate) struct UnregisteredWriteAction {
     pub(crate) is_executable: bool,
     pub(crate) absolute: bool,
-    pub(crate) macro_files: Option<Box<[Artifact]>>,
+    pub(crate) macro_files: Option<MiniBoxSlice<Artifact>>,
     pub(crate) use_dep_files_placeholder_for_content_based_paths: bool,
 }
 
@@ -267,53 +269,54 @@ impl WriteAction {
         Ok(key)
     }
 
+    /// Declares the output as a write without the cache is declared.
+    async fn execute_plain(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
+        let (values, execution_kind) =
+            declare_writes(ctx, Box::new(|| Ok(vec![self.write_request(ctx)?]))).await?;
+        Ok((single(values)?, execution_kind))
+    }
+
     /// Declares the output through `cache`: as the content the cache has for it, or else the
-    /// way a write without the cache is declared, recorded for later first if the cache
-    /// populates.
+    /// way a write without the cache is declared, recorded for later first where the write is
+    /// one to record.
     async fn execute_cached(
         &self,
         ctx: &dyn ActionExecutionCtx,
-        cache: WriteCache,
+        cache: WriteCache<'_>,
     ) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
         let key = self.cache_key(ctx)?;
+        let populate = match cache.use_for(&key) {
+            CacheUse::None => return self.execute_plain(ctx).await,
+            CacheUse::Lookup => false,
+            CacheUse::Populate => true,
+        };
         if let Some(cached) = cache.lookup(ctx, &key).await {
             let value = cached.value(self.inner.is_executable);
             write_cache::declare(ctx, &self.output, value.dupe(), cached.info).await?;
             return Ok((value, ActionExecutionKind::Deferred));
         }
-        let mut rendered = None;
-        if cache.populates() {
-            let request = self.write_request(ctx)?;
+        let request = self.write_request(ctx)?;
+        if populate {
             match cache.populate(ctx, &key, &request).await {
                 Ok((value, info)) => {
                     write_cache::declare(ctx, &self.output, value.dupe(), info).await?;
-                    return Ok((value, ActionExecutionKind::Simple));
+                    return Ok((value, ActionExecutionKind::Deferred));
                 }
                 Err(e) => {
                     WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.populate_failures);
-                    // Declaring the write as usual is the right fallback, but a cache that
+                    // Producing the write anyway is the right fallback, but a cache that
                     // cannot be populated would silently stay empty, which should be visible.
-                    let _ignored = soft_error!(
+                    soft_error!(
                         "write_action_cache_populate_failed",
-                        e.context("Recording a write's content in the action cache failed"),
-                        quiet: true
+                        e.context("Recording a write's content in the action cache failed")
                     );
-                    rendered = Some(request);
                 }
             }
         }
-        // A miss is a write like any other: the probe, when it is on, still spares the write
-        // when the CAS has the content, which on a cold cache is most of them. Rendered
-        // already when populating failed; `declare_writes` asks again only for a probe miss.
-        let (values, execution_kind) = declare_writes(
-            ctx,
-            Box::new(move || match rendered.take() {
-                Some(request) => Ok(vec![request]),
-                None => Ok(vec![self.write_request(ctx)?]),
-            }),
-        )
-        .await?;
-        Ok((single(values)?, execution_kind))
+        write_cache::declare_miss(ctx, request).await
     }
 
     /// Declares the output as it would be declared without the cache, and checks the content
@@ -321,7 +324,7 @@ impl WriteAction {
     async fn execute_verifying(
         &self,
         ctx: &dyn ActionExecutionCtx,
-        cache: WriteCache,
+        cache: WriteCache<'_>,
     ) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
         let key = self.cache_key(ctx)?;
         let cached = cache.lookup(ctx, &key).await;
@@ -334,7 +337,7 @@ impl WriteAction {
             WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.verified);
             if cached.digest != rendered {
                 WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.mismatches);
-                let _ignored = soft_error!(
+                soft_error!(
                     "write_action_cache_mismatch",
                     buck2_error!(
                         buck2_error::ErrorTag::Tier0,

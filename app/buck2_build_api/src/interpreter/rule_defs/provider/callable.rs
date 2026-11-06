@@ -56,14 +56,19 @@ use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkRepresentations;
+use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Tracer;
 use starlark::values::Value;
+use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::any_complex::StarlarkAnyComplex;
 use starlark::values::dict::DictRef;
+use starlark::values::dict::DictType;
 use starlark::values::list::ListRef;
-use starlark::values::list_or_tuple::UnpackListOrTuple;
+use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::starlark_value;
 use starlark::values::typing::TypeCompiled;
 use starlark::values::typing::TypeInstanceId;
@@ -389,19 +394,51 @@ impl TypeMatcher for UserProviderMatcher {
     }
 }
 
-#[starlark_value(type = "ProviderCallable", skip_vtable)]
-impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
-    type Canonical = FrozenUserProviderCallable<'v>;
+/// A provider callable in either of its representations.
+#[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+pub enum UserProviderCallableView<'v> {
+    Frozen(ValueTyped<'v, FrozenUserProviderCallable<'v>>),
+    Unfrozen(ValueTyped<'v, UserProviderCallable<'v>>),
+}
 
+impl<'v> UserProviderCallableView<'v> {
+    fn docs(&self) -> &'v Option<DocString> {
+        match self {
+            UserProviderCallableView::Frozen(this) => &this.as_ref().docs,
+            UserProviderCallableView::Unfrozen(this) => &this.as_ref().docs,
+        }
+    }
+
+    fn fields(&self) -> &'v BuckMutInsertionMap<String, UserProviderField<'v>> {
+        match self {
+            UserProviderCallableView::Frozen(this) => &this.as_ref().fields,
+            UserProviderCallableView::Unfrozen(this) => &this.as_ref().fields,
+        }
+    }
+
+    /// What `export_as` establishes; always present once frozen.
+    fn callable(&self) -> Option<&'v UserProviderCallableNamed<'v>> {
+        match self {
+            UserProviderCallableView::Frozen(this) => Some(&this.as_ref().callable),
+            UserProviderCallableView::Unfrozen(this) => this.as_ref().callable.get(),
+        }
+    }
+}
+
+#[starlark_value(type = "ProviderCallable")]
+impl<'v> StarlarkType<'v> for UserProviderCallableView<'v> {
     fn export_as(
         &self,
         variable_name: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<()> {
+        let UserProviderCallableView::Unfrozen(this) = self else {
+            return Ok(());
+        };
         // First export wins
-        self.callable.get_or_try_init(|| {
+        this.callable.get_or_try_init(|| {
             let provider_id = Arc::new(ProviderId {
-                path: Some(self.path),
+                path: Some(this.path),
                 name: variable_name.to_owned(),
             });
             let ty_provider_type_instance_id =
@@ -413,17 +450,19 @@ impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
                 Some(TypeMatcherFactory::new(UserProviderMatcher {
                     type_instance_id: ty_provider_type_instance_id,
                 })),
-                self.fields
+                this.fields
                     .iter()
                     .map(|(name, field)| (name.to_owned(), field.ty.as_ty().dupe()))
                     .collect(),
             )?;
             let (signature, creator_func) = create_callable_function_signature(
                 &provider_id.name,
-                &self.fields,
+                &this.fields,
                 ty_provider.clone(),
             )?;
-            let ty_callable = ty_provider_callable::<UserProviderCallable>(creator_func)?;
+            // The frozen representation is the one with a registered typing vtable; both
+            // representations' vtables are the type's.
+            let ty_callable = ty_provider_callable::<FrozenUserProviderCallable>(creator_func)?;
             buck2_error::Ok(UserProviderCallableNamed {
                 id: provider_id.dupe(),
                 signature,
@@ -431,7 +470,7 @@ impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
                     let data =
                         fh.alloc_simple_typed(StarlarkAnyComplex::new(UserProviderCallableData {
                             provider_id,
-                            fields: self
+                            fields: this
                                 .fields
                                 .iter()
                                 .map(|(name, field)| (name.clone(), field.ty.to_frozen(fh)))
@@ -455,23 +494,20 @@ impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        match self.callable.get() {
+        match self.callable() {
             Some(callable) => callable.invoke(args, eval),
             None => Err(buck2_error::Error::from(ProviderCallableError::NotBound).into()),
         }
     }
 
-    fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
-        demand.provide_value::<&dyn ProviderCallableLike>(self);
-    }
-
     fn eval_type(&self) -> Option<Ty> {
-        self.callable.get().map(|named| named.ty_provider.dupe())
+        self.callable().map(|named| named.ty_provider.dupe())
     }
 
     fn documentation(&self) -> DocItem {
-        let return_types = vec![Ty::any(); self.fields.len()];
-        let Some(callable) = self.callable.get() else {
+        let fields = self.fields();
+        let return_types = vec![Ty::any(); fields.len()];
+        let Some(callable) = self.callable() else {
             // This shouldn't really happen, we mostly don't even ask for documentation on
             // non-frozen things
             return DocItem::Member(DocMember::Property(DocProperty {
@@ -479,22 +515,31 @@ impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
                 typ: Ty::any(),
             }));
         };
-        let field_names: Vec<_> = self.fields.keys().map(|x| x.as_str()).collect();
+        let field_names: Vec<_> = fields.keys().map(|x| x.as_str()).collect();
         provider_callable_documentation(
             None,
             ProviderMembersSource::FromFields {
                 fields: &field_names,
                 // TODO(nga): types.
-                field_docs: &vec![None; self.fields.len()],
+                field_docs: &vec![None; fields.len()],
                 field_types: &return_types,
             },
             callable.ty_callable.dupe(),
-            &self.docs,
+            self.docs(),
         )
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
-        self.callable.get().map(|named| named.ty_callable.dupe())
+        self.callable().map(|named| named.ty_callable.dupe())
+    }
+}
+
+#[starlark_value(skip_vtable)]
+impl<'v> StarlarkValue<'v> for UserProviderCallable<'v> {
+    type Type = UserProviderCallableView<'v>;
+
+    fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
+        demand.provide_value::<&dyn ProviderCallableLike>(self);
     }
 }
 
@@ -541,44 +586,12 @@ impl<'v> ProviderCallableLike for FrozenUserProviderCallable<'v> {
     }
 }
 
-#[starlark_value(type = "ProviderCallable", frozen_vtable)]
+#[starlark_value(frozen_vtable)]
 impl<'v> StarlarkValue<'v> for FrozenUserProviderCallable<'v> {
-    type Canonical = Self;
-
-    fn invoke(
-        &self,
-        _me: Value<'v>,
-        args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        self.callable.invoke(args, eval)
-    }
+    type Type = UserProviderCallableView<'v>;
 
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         demand.provide_value::<&dyn ProviderCallableLike>(self);
-    }
-
-    fn documentation(&self) -> DocItem {
-        let return_types = vec![Ty::any(); self.fields.len()];
-        let field_names: Vec<_> = self.fields.keys().map(|x| x.as_str()).collect();
-        provider_callable_documentation(
-            None,
-            ProviderMembersSource::FromFields {
-                fields: &field_names,
-                field_docs: &vec![None; self.fields.len()],
-                field_types: &return_types,
-            },
-            self.callable.ty_callable.dupe(),
-            &self.docs,
-        )
-    }
-
-    fn typechecker_ty(&self) -> Option<Ty> {
-        Some(self.callable.ty_callable.dupe())
-    }
-
-    fn eval_type(&self) -> Option<Ty> {
-        Some(self.callable.ty_provider.dupe())
     }
 }
 
@@ -652,8 +665,8 @@ pub fn register_provider(builder: &mut GlobalsBuilder) {
     fn provider<'v>(
         #[starlark(require=named, default = "")] doc: &str,
         #[starlark(require=named)] fields: Either<
-            UnpackListOrTuple<String>,
-            BuckMutInsertionMap<String, Value<'v>>,
+            ValueOf<'v, ListOrTupleType<String>>,
+            ValueOf<'v, DictType<String, Value<'v>>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<UserProviderCallable<'v>> {
@@ -662,24 +675,23 @@ pub fn register_provider(builder: &mut GlobalsBuilder) {
 
         let fields = match fields {
             Either::Left(fields) => {
+                let fields = fields.try_to_vec()?;
                 let new_fields: BuckMutInsertionMap<String, UserProviderField<'v>> = fields
-                    .items
                     .iter()
                     .map(|name| (name.clone(), UserProviderField::default()))
                     .collect();
-                if new_fields.len() != fields.items.len() {
+                if new_fields.len() != fields.len() {
                     return Err(
-                        buck2_error::Error::from(ProviderCallableError::NonUniqueFields(
-                            fields.items,
-                        ))
-                        .into(),
+                        buck2_error::Error::from(ProviderCallableError::NonUniqueFields(fields))
+                            .into(),
                     );
                 }
                 new_fields
             }
             Either::Right(fields) => {
-                let mut new_fields = BuckMutInsertionMap::with_capacity(fields.len());
-                for (name, field) in fields {
+                let mut new_fields = BuckMutInsertionMap::with_capacity(fields.dict().len());
+                for entry in fields.try_items() {
+                    let (name, field) = entry?;
                     if let Some(field) = field.downcast_ref::<UserProviderField>() {
                         new_fields.insert(name, field.dupe());
                     } else {

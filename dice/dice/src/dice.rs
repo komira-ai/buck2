@@ -32,6 +32,7 @@ use crate::core::state::init_state;
 use crate::introspection::graph::GraphIntrospectable;
 use crate::key::DiceKey;
 use crate::key_index::DiceKeyIndex;
+use crate::metrics::EvictionSnapshot;
 use crate::metrics::Metrics;
 use crate::metrics::PageInKeyTypeMetrics;
 use crate::metrics::PagingMemorySnapshot;
@@ -136,6 +137,10 @@ impl DiceDataBuilder {
         self.cycle_check_interval = interval;
     }
 
+    /// Starts the core state thread. Call this from within the tokio runtime that will run the
+    /// computations: the thread answers requests through that runtime's workers, which is a good
+    /// deal cheaper than answering them itself, as it does when started outside a runtime, so the
+    /// runtime has to keep running for as long as the `Dice` is in use.
     pub fn build(self, detect_cycles: DetectCycles) -> StdArc<Dice> {
         let cycle_check_interval = match detect_cycles {
             DetectCycles::Enabled => Some(self.cycle_check_interval),
@@ -210,11 +215,24 @@ impl Dice {
     /// affect computed values must be represented by keys or tracked dependencies. Dropping
     /// the future before it yields the branch does not leak one.
     pub fn new_root_with_data(&self, data: DiceData) -> impl Future<Output = BranchId> + use<> {
+        self.new_root_with_shared_data(StdArc::new(data))
+    }
+
+    /// Start an empty root with the same immutable computation data as `from`.
+    /// Cached results are shared wherever their tracked dependencies agree.
+    pub fn new_root_from(&self, from: BranchId) -> impl Future<Output = BranchId> + use<> {
+        self.new_root_with_shared_data(self.data_for_branch(from))
+    }
+
+    fn new_root_with_shared_data(
+        &self,
+        data: StdArc<DiceData>,
+    ) -> impl Future<Output = BranchId> + use<> {
         let branch_data = self.branch_data.dupe();
         let branch = self.state_handle.new_root();
         async move {
             let branch = branch.await;
-            branch_data.write().insert(branch, StdArc::new(data));
+            branch_data.write().insert(branch, data);
             branch
         }
     }
@@ -308,6 +326,14 @@ impl Dice {
         self.pagable_storage
             .as_ref()
             .map(|storage| storage.paged_out_node_total())
+    }
+
+    /// Cumulative evictions by [`Dice::evict_backed`] since daemon start, or `None` if pagable
+    /// storage is not configured.
+    pub fn eviction_metrics(&self) -> Option<EvictionSnapshot> {
+        self.pagable_storage
+            .as_ref()
+            .map(|storage| storage.eviction_snapshot())
     }
 
     /// Last measured on-disk size in bytes of the pagable store, or `None` if
@@ -618,6 +644,11 @@ pub struct PagableNodeCounts {
     pub paged_out: usize,
     pub candidates: usize,
     pub backed: usize,
+    /// Serialized size of the rows holding the `backed` values: what [`Dice::evict_backed`]
+    /// would drop, in serialized rather than in-memory bytes, excluding nested `PagableArc`
+    /// sub-values. A lower bound: a value that became backed by being proven equal to a
+    /// paged-out one, rather than read back, counts as zero.
+    pub backed_bytes: u64,
 }
 
 /// Summary of how many DICE node values are resident in memory vs paged out to

@@ -12,15 +12,17 @@ use allocative::Allocative;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::dynamic_value::DynamicValue;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_value::StarlarkArtifactValue;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_output_artifact::FrozenStarlarkOutputArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifactView;
 use buck2_build_api::interpreter::rule_defs::artifact::unpack_artifact::UnpackNonPromiseInputArtifact;
 use buck2_core::deferred::dynamic::DynamicLambdaResultsKey;
 use buck2_error::buck2_error;
+use buck2_error::internal_error;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutInsertionSet;
 use buck2_util::size_assert;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use starlark::StarlarkPagable;
 use starlark::typing::Ty;
 use starlark::values::Freeze;
@@ -29,7 +31,7 @@ use starlark::values::Freezer;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictRef;
 use starlark::values::list::ListRef;
@@ -68,7 +70,7 @@ pub enum DynamicAttrType<'v> {
     List(Box<DynamicAttrType<'v>>),
     /// Tuple.
     #[display("dynattrs.tuple({})", _0.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(", "))]
-    Tuple(Box<[DynamicAttrType<'v>]>),
+    Tuple(MiniBoxSlice<DynamicAttrType<'v>>),
     /// Value or `None`.
     #[display("dynattrs.option({})", _0)]
     Option(Box<DynamicAttrType<'v>>),
@@ -79,37 +81,48 @@ pub enum DynamicAttrType<'v> {
 
 /// A value passed to a dynamic action, in whichever heap holds it.
 ///
-/// Unlike most starlark data there is no frozen variant: the `Output` values are output artifacts
-/// in either form (`StarlarkOutputArtifact` before the freeze, `FrozenStarlarkOutputArtifact`
-/// after), which is why the field is a `ValueOfUnchecked` rather than a `ValueTyped`.
+/// Unlike most starlark data there is no frozen variant: an `Output` is an output artifact in
+/// whichever representation the heap holds, which the view says.
 #[derive(Debug, Trace, Allocative, StarlarkPagable)]
 pub enum DynamicAttrValue<'v> {
-    Output(ValueOfUnchecked<'v, FrozenStarlarkOutputArtifact<'v>>),
+    Output(ValueOf<'v, StarlarkOutputArtifactView<'v>>),
     ArtifactValue(Artifact),
     DynamicValue(DynamicValue),
     Value(Value<'v>),
-    List(Box<[DynamicAttrValue<'v>]>),
-    Tuple(Box<[DynamicAttrValue<'v>]>),
-    Dict(Box<BuckMutInsertionMap<Value<'v>, DynamicAttrValue<'v>>>),
+    List(MiniBoxSlice<DynamicAttrValue<'v>>),
+    Tuple(MiniBoxSlice<DynamicAttrValue<'v>>),
+    Dict(BuckMutInsertionMap<Value<'v>, DynamicAttrValue<'v>>),
     Option(Option<Box<DynamicAttrValue<'v>>>),
 }
 
 // This isn't *super* sensitive, but it's not nothing either
 size_assert::words_of_type!(DynamicAttrValue<'static>, 4);
 
+/// An output before the attributes freeze, which is when they are bound and collected.
+fn unfrozen_output<'v>(
+    output: ValueOf<'v, StarlarkOutputArtifactView<'v>>,
+) -> buck2_error::Result<ValueTyped<'v, StarlarkOutputArtifact<'v>>> {
+    match output.unpack() {
+        StarlarkOutputArtifactView::Unfrozen(output) => Ok(output),
+        StarlarkOutputArtifactView::Frozen(_) => Err(internal_error!(
+            "Dynamic action outputs are bound before the attributes freeze"
+        )),
+    }
+}
+
 impl<'v> Freeze<'v> for DynamicAttrValue<'v> {
     type Frozen<'fv> = DynamicAttrValue<'fv>;
 
     fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
         match self {
-            DynamicAttrValue::Output(o) => Ok(DynamicAttrValue::Output(ValueOfUnchecked::new(
-                Freeze::freeze(o.get(), freezer)?,
-            ))),
+            DynamicAttrValue::Output(o) => {
+                Ok(DynamicAttrValue::Output(Freeze::freeze(o, freezer)?))
+            }
             DynamicAttrValue::ArtifactValue(a) => Ok(DynamicAttrValue::ArtifactValue(a)),
             DynamicAttrValue::DynamicValue(d) => Ok(DynamicAttrValue::DynamicValue(d)),
             DynamicAttrValue::Value(v) => Ok(DynamicAttrValue::Value(Freeze::freeze(v, freezer)?)),
             DynamicAttrValue::List(l) => Ok(DynamicAttrValue::List(l.freeze(freezer)?)),
-            DynamicAttrValue::Dict(d) => Ok(DynamicAttrValue::Dict(d.freeze(freezer)?)),
+            DynamicAttrValue::Dict(d) => Ok(DynamicAttrValue::Dict(Freeze::freeze(d, freezer)?)),
             DynamicAttrValue::Tuple(t) => Ok(DynamicAttrValue::Tuple(t.freeze(freezer)?)),
             DynamicAttrValue::Option(o) => Ok(DynamicAttrValue::Option(o.freeze(freezer)?)),
         }
@@ -119,7 +132,7 @@ impl<'v> Freeze<'v> for DynamicAttrValue<'v> {
 #[derive(Debug, Trace, Allocative, StarlarkPagable, Freeze)]
 pub struct DynamicAttrValues<'v> {
     /// Indexed by attrs definitions in `DynamicActionCallable`.
-    pub values: Box<[DynamicAttrValue<'v>]>,
+    pub values: MiniBoxSlice<DynamicAttrValue<'v>>,
 }
 
 impl<'v> DynamicAttrValue<'v> {
@@ -158,10 +171,7 @@ impl<'v> DynamicAttrValue<'v> {
     fn bind(&self, bind: &mut DynamicActionsOutputArtifactBinder) -> buck2_error::Result<()> {
         match self {
             DynamicAttrValue::Output(output) => {
-                let v =
-                    ValueTyped::<'v, StarlarkOutputArtifact<'v>>::unpack_value_err(output.get())
-                        .expect("Checked at construction time");
-                bind.bind(v.artifact())?;
+                bind.bind(unfrozen_output(*output)?.artifact())?;
                 Ok(())
             }
             DynamicAttrValue::ArtifactValue(_)
@@ -187,7 +197,7 @@ impl<'v> DynamicAttrValue<'v> {
 
 pub fn dedupe_output_artifacts<'v>(
     v: Vec<ValueTyped<'v, StarlarkOutputArtifact<'v>>>,
-) -> Box<[ValueTyped<'v, StarlarkOutputArtifact<'v>>]> {
+) -> MiniBoxSlice<ValueTyped<'v, StarlarkOutputArtifact<'v>>> {
     let mut found = BuckMutInsertionSet::default();
     let mut outputs = Vec::new();
     for i in v {
@@ -205,20 +215,26 @@ impl<'v> DynamicAttrValues<'v> {
         }
     }
 
-    pub fn outputs(&self) -> Box<[ValueTyped<'v, StarlarkOutputArtifact<'v>>]> {
+    pub fn outputs(
+        &self,
+    ) -> buck2_error::Result<MiniBoxSlice<ValueTyped<'v, StarlarkOutputArtifact<'v>>>> {
         let mut outputs = Vec::new();
+        let mut error = None;
         self.for_each_node(&mut |value| {
             if let DynamicAttrValue::Output(output) = value {
-                let typed =
-                    ValueTyped::<'v, StarlarkOutputArtifact<'v>>::unpack_value_err(output.get())
-                        .expect("Checked at construction time");
-                outputs.push(typed);
+                match unfrozen_output(*output) {
+                    Ok(typed) => outputs.push(typed),
+                    Err(e) => error = Some(e),
+                }
             }
         });
-        dedupe_output_artifacts(outputs)
+        match error {
+            Some(e) => Err(e),
+            None => Ok(dedupe_output_artifacts(outputs)),
+        }
     }
 
-    pub fn artifact_values(&self) -> Box<[Artifact]> {
+    pub fn artifact_values(&self) -> MiniBoxSlice<Artifact> {
         let mut artifact_values = BuckMutInsertionSet::default();
         self.for_each_node(&mut |value| {
             if let DynamicAttrValue::ArtifactValue(artifact) = value {
@@ -228,7 +244,7 @@ impl<'v> DynamicAttrValues<'v> {
         artifact_values.into_iter().collect()
     }
 
-    pub fn dynamic_values(&self) -> Box<[DynamicValue]> {
+    pub fn dynamic_values(&self) -> MiniBoxSlice<DynamicValue> {
         let mut dynamic_values = BuckMutInsertionSet::new();
         self.for_each_node(&mut |value| {
             if let DynamicAttrValue::DynamicValue(dynamic_value) = value {
@@ -289,8 +305,8 @@ impl<'v> DynamicAttrType<'v> {
         match self {
             DynamicAttrType::Output => {
                 let artifact = ValueTyped::<StarlarkOutputArtifact<'v>>::unpack_value_err(value)?;
-                Ok(DynamicAttrValue::Output(ValueOfUnchecked::new(
-                    artifact.to_value(),
+                Ok(DynamicAttrValue::Output(ValueOf::from_representation(
+                    artifact,
                 )))
             }
             DynamicAttrType::ArtifactValue => {
@@ -320,7 +336,7 @@ impl<'v> DynamicAttrType<'v> {
                 for elem in list.iter() {
                     res.push(elem_ty.coerce(elem)?);
                 }
-                Ok(DynamicAttrValue::List(res.into_boxed_slice()))
+                Ok(DynamicAttrValue::List(res.into()))
             }
             DynamicAttrType::Dict(elem_ty) => {
                 let (key_ty, value_ty) = &**elem_ty;
@@ -337,7 +353,7 @@ impl<'v> DynamicAttrType<'v> {
                     }
                     res.insert_hashed_unique_unchecked(key, value_ty.coerce(value)?);
                 }
-                Ok(DynamicAttrValue::Dict(Box::new(res)))
+                Ok(DynamicAttrValue::Dict(res))
             }
             DynamicAttrType::Tuple(elem_tys) => {
                 let tuple = <&TupleRef>::unpack_value_err(value)?;
@@ -353,7 +369,7 @@ impl<'v> DynamicAttrType<'v> {
                 for (elem, ty) in tuple.iter().zip(elem_tys.iter()) {
                     res.push(ty.coerce(elem)?);
                 }
-                Ok(DynamicAttrValue::Tuple(res.into_boxed_slice()))
+                Ok(DynamicAttrValue::Tuple(res.into()))
             }
             DynamicAttrType::Option(elem_ty) => {
                 if value.is_none() {

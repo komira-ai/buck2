@@ -25,7 +25,7 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionKind;
 use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::path_format;
@@ -34,7 +34,6 @@ use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
-use buck2_error::BuckErrorOptionContext;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
@@ -55,6 +54,7 @@ use starlark::values::Value;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::DictType;
 
+use crate::actions::impls::produce;
 use crate::actions::impls::write::CommandLineContentBasedInputVisitor;
 
 #[derive(Debug, buck2_error::Error)]
@@ -68,15 +68,15 @@ enum WriteHmapActionValidationError {
 
 /// Header map entries: include name to `(artifact, path below it)`.
 /// An empty path means the artifact itself.
-pub(crate) type HmapMappings<'v> = DictType<&'v str, (ValueAsInputArtifactLike<'v>, &'v str)>;
+pub(crate) type HmapMappings<'v> = DictType<&'v str, (StarlarkArtifactView<'v>, &'v str)>;
 
 fn for_each_mapping<'v>(
     mappings: Value<'v>,
-    mut f: impl FnMut(&'v str, ValueAsInputArtifactLike<'v>, &'v str) -> buck2_error::Result<()>,
+    mut f: impl FnMut(&'v str, StarlarkArtifactView<'v>, &'v str) -> buck2_error::Result<()>,
 ) -> buck2_error::Result<()> {
     for (name, entry) in DictRef::unpack_value_err(mappings)?.iter() {
         let name = <&str>::unpack_value_err(name)?;
-        let (artifact, subpath) = <(ValueAsInputArtifactLike, &str)>::unpack_value_err(entry)?;
+        let (artifact, subpath) = <(StarlarkArtifactView, &str)>::unpack_value_err(entry)?;
         f(name, artifact, subpath)?;
     }
     Ok(())
@@ -87,7 +87,10 @@ pub(crate) fn visit_hmap_artifacts<'v>(
     visitor: &mut dyn CommandLineArtifactVisitor<'v>,
 ) -> buck2_error::Result<()> {
     for_each_mapping(mappings, |_, artifact, _| {
-        artifact.0.as_command_line_like().visit_artifacts(visitor)
+        artifact
+            .as_input_artifact_like()
+            .as_command_line_like()
+            .visit_artifacts(visitor)
     })
 }
 
@@ -143,8 +146,8 @@ impl WriteHmapAction {
                 mappings.iter().map(|(name, entry)| {
                     let name = <&str>::unpack_value_err(name)?;
                     let (artifact, subpath) =
-                        <(ValueAsInputArtifactLike, &str)>::unpack_value_err(entry)?;
-                    let artifact = artifact.0.get_bound_artifact()?;
+                        <(StarlarkArtifactView, &str)>::unpack_value_err(entry)?;
+                    let artifact = artifact.as_input_artifact_like().get_bound_artifact()?;
                     let artifact_path =
                         artifact.resolve_path(fs.fs(), artifact_path_mapping.get(&artifact))?;
                     let mut path =
@@ -219,40 +222,33 @@ impl Action for WriteHmapAction {
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         let fs = ctx.fs();
 
-        let mut execution_start = None;
-        let value = ctx
-            .materializer()
-            .declare_write(Box::new(|| {
-                execution_start = Some(Instant::now());
-                let content =
-                    self.get_contents(&ctx.executor_fs(), &ctx.artifact_path_mapping(None))?;
-                let path = fs.resolve_build(
-                    self.output.get_path(),
-                    if self.output.get_path().is_content_based_path() {
-                        let digest = TrackedFileDigest::from_content(
-                            &content,
-                            ctx.digest_config().cas_digest_config(),
-                        );
-                        Some(ContentBasedPathHash::new(digest.raw_digest().as_bytes())?)
-                    } else {
-                        None
-                    }
-                    .as_ref(),
-                )?;
-                Ok(vec![WriteRequest {
-                    path,
-                    content,
-                    is_executable: false,
-                    path_kind: self.output.get_path().path_resolution_method(),
-                }])
-            }))
-            .await?
-            .into_iter()
-            .next()
-            .internal_error("Write did not execute")?;
+        let execution_start = Instant::now();
+        let content = self.get_contents(&ctx.executor_fs(), &ctx.artifact_path_mapping(None))?;
+        let path = fs.resolve_build(
+            self.output.get_path(),
+            if self.output.get_path().is_content_based_path() {
+                let digest = TrackedFileDigest::from_content(
+                    &content,
+                    ctx.digest_config().cas_digest_config(),
+                );
+                Some(ContentBasedPathHash::new(digest.raw_digest().as_bytes())?)
+            } else {
+                None
+            }
+            .as_ref(),
+        )?;
+        let (value, _) = produce::write_here(
+            ctx,
+            WriteRequest {
+                path,
+                content,
+                is_executable: false,
+                path_kind: self.output.get_path().path_resolution_method(),
+            },
+        )
+        .await?;
 
-        let wall_time = Instant::now()
-            - execution_start.internal_error("Action did not set execution_start")?;
+        let wall_time = Instant::now() - execution_start;
 
         Ok((
             ActionOutputs::new(buck_mut_insertion_map![self.output.get_path().dupe() => value]),

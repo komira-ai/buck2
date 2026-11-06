@@ -19,7 +19,6 @@ package com.facebook
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
-import org.jetbrains.kotlin.backend.jvm.JvmIrDeserializerImpl
 import org.jetbrains.kotlin.cli.common.config.KotlinSourceRoot
 import org.jetbrains.kotlin.cli.common.config.kotlinSourceRoots
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
@@ -28,8 +27,6 @@ import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.compiler.VfsBasedProjectEnvironment
-import org.jetbrains.kotlin.cli.jvm.compiler.createContextForIncrementalCompilation
-import org.jetbrains.kotlin.cli.jvm.compiler.report
 import org.jetbrains.kotlin.cli.jvm.config.jvmClasspathRoots
 import org.jetbrains.kotlin.com.intellij.openapi.diagnostic.Logger
 import org.jetbrains.kotlin.com.intellij.openapi.project.Project
@@ -50,7 +47,6 @@ import org.jetbrains.kotlin.extensions.CompilerConfigurationExtension
 import org.jetbrains.kotlin.extensions.PreprocessedFileCreator
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
-import org.jetbrains.kotlin.fir.backend.jvm.JvmFir2IrExtensions
 import org.jetbrains.kotlin.fir.declarations.FirConstructor
 import org.jetbrains.kotlin.fir.declarations.FirEnumEntry
 import org.jetbrains.kotlin.fir.declarations.FirRegularClass
@@ -101,8 +97,6 @@ import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtClass
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtTreeVisitorVoid
-import org.jetbrains.kotlin.resolve.multiplatform.hmppModuleName
-import org.jetbrains.kotlin.resolve.multiplatform.isCommonSource
 import org.jetbrains.kotlin.types.ConstantValueKind
 
 @SuppressWarnings("PackageLocationMismatch")
@@ -506,10 +500,13 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
       sourceFiles: List<KtFile>,
       project: Project,
   ): ModuleCompilerIrBackendInputCompat {
-    val extensions = JvmFir2IrExtensions(configuration, JvmIrDeserializerImpl())
+    val extensions = createJvmFir2IrExtensionsCompat(configuration)
     val composeAbiEnabled =
         configuration.get(K2JvmAbiConfigurationKeys.ENABLE_COMPOSE_ABI_EMULATION) == true
     val allIrExtensions = buildList {
+      // Plugin extensions run first, before the emulations and the sanitizer read the IR they
+      // change (e.g. Compose stability reads the superclass DataClassGenerate injects).
+      addAll(abiRelevantPluginIrExtensions(project, configuration))
       // Compose ABI emulation runs before the IR sanitizer so that any emulated
       // declarations are present when non-ABI content is stripped.
       if (composeAbiEnabled) {
@@ -589,8 +586,8 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         }
 
     // Write bytecode from generationState.factory to disk.
-    // Apply bytecode post-processing (strip @Throws annotations and private metadata)
-    // in-memory before writing to avoid a separate read-back pass.
+    // Apply bytecode post-processing (see BytecodeSanitizerStage) in-memory before writing to
+    // avoid a separate read-back pass.
     val outputFiles =
         result.classFileFactoryCompat.asList().map { outputFile ->
           val originalBytes = outputFile.asByteArray()
@@ -728,7 +725,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
     fun ensurePluginsConfigured() {
       if (!pluginsConfigured) {
         for (extension in CompilerConfigurationExtension.getInstances(project)) {
-          extension.updateFileRegistry()
+          extension.updateFileRegistryCompat(project)
         }
         pluginsConfigured = true
       }
@@ -748,14 +745,18 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
               )
         }
 
-        configuration.report(CompilerMessageSeverity.ERROR, message, reportLocation)
+        configuration.messageCollector.report(
+            CompilerMessageSeverity.ERROR,
+            message,
+            reportLocation,
+        )
         continue
       }
 
       if (!vFile.isDirectory && vFile.extension != KotlinFileType.EXTENSION) {
         ensurePluginsConfigured()
         if (vFile.fileType != KotlinFileType.INSTANCE) {
-          configuration.report(
+          configuration.messageCollector.report(
               CompilerMessageSeverity.ERROR,
               "Source entry is not a Kotlin file: $sourceRootPath",
               reportLocation,
@@ -803,9 +804,9 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         moduleName ->
       psiManager.findFile(virtualFile)?.let {
         if (it is KtFile) {
-          it.isCommonSource = isCommon
+          it.isCommonSourceCompat = isCommon
           if (moduleName != null) {
-            it.hmppModuleName = moduleName
+            it.hmppModuleNameCompat = moduleName
           }
           result.add(it)
         }
@@ -1294,14 +1295,12 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         projectEnvironment.getSearchScopeByPsiFiles(ktFiles) +
             projectEnvironment.getSearchScopeForProjectJavaSources()
 
-    var librariesScope = projectEnvironment.getSearchScopeForProjectLibraries()
-
-    val providerAndScopeForIncrementalCompilation =
-        createContextForIncrementalCompilation(projectEnvironment, configuration, sourceScope)
-
-    providerAndScopeForIncrementalCompilation?.precompiledBinariesFileScope?.let {
-      librariesScope -= it
-    }
+    val (librariesScope, providerAndScopeForIncrementalCompilation) =
+        prepareLibrariesScopeAndIncrementalContextCompat(
+            projectEnvironment,
+            configuration,
+            sourceScope,
+        )
     val sessionsWithSources = prepareJvmSessionsCompat(
         ktFiles,
         rootModuleName,

@@ -6,6 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@prelude//:attrs_validators.bzl", "validation_common")
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//android:build_only_native_code.bzl", "is_build_only_native_code")
 load("@prelude//decls:common.bzl", "TestType", "buck")
@@ -41,6 +42,7 @@ def kotlin_test_impl(ctx: AnalysisContext) -> list[Provider]:
             java_providers.class_to_src_map,
         ]
         + target_stats_providers
+        + ([java_providers.validation_info] if java_providers.validation_info else [])
     )
 
 kotlin_test = prelude_rule(
@@ -151,7 +153,7 @@ kotlin_test = prelude_rule(
             "runtime_deps": attrs.list(attrs.dep(), default = []),
             "source": attrs.option(attrs.string(), default = None),
             "source_only_abi_deps": attrs.list(attrs.dep(), default = []),
-            "supports_test_execution_caching": attrs.bool(default = False),
+            "supports_test_execution_caching": attrs.bool(default = True),
             "target": attrs.option(attrs.string(), default = None),
             "test_case_timeout_ms": attrs.option(attrs.int(), default = None),
             "test_class_names_file": attrs.option(attrs.source(), default = None),
@@ -168,6 +170,7 @@ kotlin_test = prelude_rule(
         | no_x_jdk_release_arg()
         | buck.licenses_arg()
         | buck.contacts_arg()
+        | validation_common.attrs_validators_arg()
         | test_common.attributes()
     ),
 )

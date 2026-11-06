@@ -30,11 +30,6 @@ RemoteTestExecutorConfig = record(
     use_project_relative_paths = field(bool, default = False),
 )
 
-def _network_access_kwargs(network_access: str | None) -> dict[str, str]:
-    if network_access == None:
-        return {}
-    return {"network_access": network_access}
-
 _FORCE_RUN_AS_BUNDLE = read_root_config("tpx", "force_run_as_bundle", "False")
 
 def _force_local_re_tests() -> bool:
@@ -150,7 +145,7 @@ def _get_re_executors(
     network_access = getattr(ctx.attrs, "network_access", None)
 
     if re_arg.disabled:
-        executor = CommandExecutorConfig(local_enabled = True, remote_enabled = False, **_network_access_kwargs(network_access))
+        executor = CommandExecutorConfig(local_enabled = True, remote_enabled = False, remote_cache_enabled = False, network_access = network_access)
         # A `remote_execution = "disabled"` target has always produced an executor
         # and therefore run from the project root; preserve that behavior.
         return RemoteTestExecutorConfig(default_executor = executor, run_from_project_root = True, use_project_relative_paths = True)
@@ -165,7 +160,7 @@ def _get_re_executors(
         # `remote_cache_enabled = False` keeps this a plain `Executor::Local`
         # (parity: the unset default is True in fbcode but False in OSS), and nothing
         # is uploaded from here anyway (`allow_cache_uploads` is False).
-        executor = CommandExecutorConfig(local_enabled = True, remote_enabled = False, remote_cache_enabled = False, **_network_access_kwargs(network_access))
+        executor = CommandExecutorConfig(local_enabled = True, remote_enabled = False, remote_cache_enabled = False, network_access = network_access)
         return RemoteTestExecutorConfig(default_executor = executor)
 
     re_props_copy = dict(re_props)
@@ -176,6 +171,7 @@ def _get_re_executors(
     use_case = re_props_copy.pop("use_case")
     listing_capabilities = re_props_copy.pop("listing_capabilities", None)
     remote_cache_enabled = re_props_copy.pop("remote_cache_enabled", None)
+    remote_enabled = re_props_copy.pop("remote_enabled", True)
     re_dependencies = re_props_copy.pop("dependencies", [])
     re_gang_workers = re_props_copy.pop("gang_workers", [])
     re_gang = re_props_copy.pop("gang", None)
@@ -192,6 +188,8 @@ def _get_re_executors(
     if re_props_copy:
         unexpected_props = ", ".join(re_props_copy.keys())
         fail("{}: found unexpected re props: {}".format(ctx.label, unexpected_props))
+    if not local_enabled and not remote_enabled:
+        fail("{}: neither remote nor local test execution are enabled".format(ctx.label))
 
     if re_gang != None:
         meta_internal_extra_params = dict(meta_internal_extra_params or {})
@@ -199,7 +197,7 @@ def _get_re_executors(
 
     default_executor = CommandExecutorConfig(
         local_enabled = local_enabled,
-        remote_enabled = True,
+        remote_enabled = remote_enabled,
         remote_execution_properties = capabilities,
         remote_execution_use_case = use_case or "tpx-default",
         remote_cache_enabled = remote_cache_enabled,
@@ -208,21 +206,21 @@ def _get_re_executors(
         remote_execution_resource_units = re_resource_units,
         remote_execution_dynamic_image = re_dynamic_image,
         meta_internal_extra_params = meta_internal_extra_params,
-        **_network_access_kwargs(network_access),
+        network_access = network_access,
     )
 
     listing_executor = default_executor
     if listing_capabilities != None or local_listing_enabled != None:
         listing_executor = CommandExecutorConfig(
             local_enabled = local_listing_enabled if local_listing_enabled != None else local_enabled,
-            remote_enabled = True,
+            remote_enabled = remote_enabled,
             remote_execution_properties = listing_capabilities if listing_capabilities != None else capabilities,
             remote_execution_use_case = use_case or "tpx-default",
             remote_cache_enabled = remote_cache_enabled,
             remote_execution_resource_units = re_listing_resource_units,
             remote_execution_dynamic_image = re_dynamic_image,
             meta_internal_extra_params = meta_internal_extra_params,
-            **_network_access_kwargs(network_access),
+            network_access = network_access,
         )
     return RemoteTestExecutorConfig(
         default_executor = default_executor,

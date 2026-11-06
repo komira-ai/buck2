@@ -76,6 +76,7 @@ use remote_execution::TClientContextMetadata;
 use remote_execution::TCode;
 use remote_execution::TDependency;
 use remote_execution::TDigest;
+use remote_execution::TDuration;
 use remote_execution::TExecutionPolicy;
 use remote_execution::THostResourceRequirements;
 use remote_execution::THostRuntimeRequirements;
@@ -178,6 +179,7 @@ struct RemoteExecutionClientData {
     local_cache: LocalCacheStats,
     persistent_cache_mode: Option<String>,
     presence_check_concurrency: usize,
+    presence_check_max_batch: usize,
 }
 
 /// Issues presence-check RPCs through a client, under whatever use case each batch belongs to.
@@ -254,6 +256,7 @@ impl RemoteExecutionClient {
                 local_cache: Default::default(),
                 persistent_cache_mode,
                 presence_check_concurrency: re_config.static_metadata.presence_check_concurrency(),
+                presence_check_max_batch: re_config.static_metadata.presence_check_max_batch(),
             }),
         })
     }
@@ -270,7 +273,7 @@ impl RemoteExecutionClient {
                         return Err(e);
                     }
 
-                    tracing::warn!(
+                    tracing::debug!(
                         "Failed to connect to RE, retrying after sleeping {} seconds: {:#?}",
                         i,
                         e
@@ -325,6 +328,21 @@ impl RemoteExecutionClient {
                 use_case,
                 identity,
             ))
+            .await
+    }
+
+    /// Uploads whichever of `blobs` the CAS does not hold, as `upload` does for an action's
+    /// inputs: behind the CAS semaphore, with the presence check in front.
+    pub async fn upload_blobs(
+        &self,
+        blobs: &ActionBlobs,
+        use_case: RemoteExecutorUseCase,
+    ) -> buck2_error::Result<UploadStats> {
+        let _cas = self.data.client.cas_semaphore.acquire().await;
+
+        self.data
+            .uploads
+            .op(Uploader::upload_blobs(self, blobs, use_case))
             .await
     }
 
@@ -471,9 +489,12 @@ impl RemoteExecutionClient {
         let backend: Arc<dyn TtlBackend> = Arc::new(ClientTtlBackend {
             client: self.dupe(),
         });
-        CasPresence::global(self.data.presence_check_concurrency)
-            .check(backend, use_case, negative_cache, digests)
-            .await
+        CasPresence::global(
+            self.data.presence_check_concurrency,
+            self.data.presence_check_max_batch,
+        )
+        .check(backend, use_case, negative_cache, digests)
+        .await
     }
 
     pub async fn get_digest_expirations(
@@ -1636,6 +1657,7 @@ impl RemoteExecutionClientImpl {
                 ..Default::default()
             }),
             respect_file_symlinks: Some(self.respect_file_symlinks),
+            disable_cancel_on_disconnect: !meta_internal_extra_params.cancel_on_client_disconnect,
             ..use_case.metadata(Some(identity))
         };
 
@@ -1659,6 +1681,13 @@ impl RemoteExecutionClientImpl {
                     .setup_preference_key
                     .clone()
                     .unwrap_or_default(),
+                queue_timeout: meta_internal_extra_params
+                    .remote_execution_policy
+                    .queue_timeout_s
+                    .map(|seconds| TDuration {
+                        seconds: seconds.into(),
+                        ..Default::default()
+                    }),
                 ..Default::default()
             }),
             action_digest: action_digest.to_re(),
@@ -1702,6 +1731,7 @@ impl RemoteExecutionClientImpl {
                             ..Default::default()
                         },
                         host_resource_requirements: THostResourceRequirements {
+                            input_files_bytes: identity.paths.input_files_bytes() as i64,
                             resource_units: gang.resource_units.map(i64::from).unwrap_or_default(),
                             ..Default::default()
                         },
@@ -1758,6 +1788,10 @@ impl RemoteExecutionClientImpl {
                         host_runtime_requirements: THostRuntimeRequirements {
                             platform: remote_execution::TPlatform {
                                 properties,
+                                ..Default::default()
+                            },
+                            host_resource_requirements: THostResourceRequirements {
+                                input_files_bytes: identity.paths.input_files_bytes() as i64,
                                 ..Default::default()
                             },
                             ..Default::default()
@@ -1824,10 +1858,8 @@ impl RemoteExecutionClientImpl {
                     compute_cost_ms,
                 ))
             }
-            // Cancelling an execution request from the RE client causes it to be cancelled on the
-            // server side if and only if it had not yet started executing - if it had started
-            // executing, it'll run to completion and be written to the cache, so treat it mostly
-            // like a completed execution.
+            // RE drops a cancelled execution that had not started. A started one already ran on RE,
+            // whether RE then finishes or stops it, so trace it as an execution.
             Ok(ExecuteResponseOrCancelled::Cancelled(_, _, ExecutionStarted::Yes)) => Some((
                 buck2_data::action_digest_trace::ActionDigestTraceEvent::RemoteExecution,
                 None,

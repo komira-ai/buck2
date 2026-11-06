@@ -41,6 +41,7 @@ use buck2_core::category::Category;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -53,11 +54,13 @@ use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::cache_uploader::CacheUploadResults;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
+use buck2_execute::execute::low_pass_filter::LowPassFilter;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::prepared::PreparedAction;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::execute::write_action_cache::WriteActionCache;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
@@ -80,9 +83,8 @@ use remote_execution::TActionResult2;
 use starlark::values::Heap;
 use starlark::values::OwnedFrozen;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
-use starlark::values::dict::DictType;
 
+use crate::actions::errors::error_handler::OutputArtifacts;
 use crate::actions::errors::execute_error::ExecuteError;
 use crate::actions::execute::action_execution_target::ActionExecutionTarget;
 use crate::actions::execute::action_executor::ActionExecutionMetadata;
@@ -90,8 +92,6 @@ use crate::actions::execute::action_executor::ActionOutputs;
 use crate::actions::impls::run_action_knobs::RunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
-use crate::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
-use crate::interpreter::rule_defs::artifact::starlark_artifact_value::StarlarkArtifactValue;
 use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 
 pub mod artifact;
@@ -199,9 +199,8 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         _artifact_fs: &ArtifactFs,
         _heap: Heap<'v>,
         _outputs: Option<&ActionOutputs>,
-    ) -> buck2_error::Result<ValueOfUnchecked<'v, DictType<StarlarkArtifact, StarlarkArtifactValue>>>
-    {
-        Ok(ValueOfUnchecked::new(starlark::values::Value::new_none()))
+    ) -> buck2_error::Result<Option<OutputArtifacts<'v>>> {
+        Ok(None)
     }
 
     fn all_outputs_are_content_based(&self) -> bool {
@@ -352,6 +351,15 @@ pub trait ActionExecutionCtx: Send + Sync {
     /// CAS serves it in place of the URL rather than in place of a cache.
     fn may_probe_cas(&self) -> bool;
 
+    /// The action cache as write actions use it, under this action's executor configuration;
+    /// `None` where that executor reads no cache.
+    fn write_action_cache(&self) -> Option<&dyn WriteActionCache>;
+
+    /// The command's gate on local work: the hybrid executor runs a command locally only when
+    /// there is room behind it, and a write that could as well be uploaded is written locally
+    /// on the same terms.
+    fn low_pass_filter(&self) -> &LowPassFilter;
+
     fn re_platform(&self) -> &remote_execution::Platform;
 
     fn digest_config(&self) -> DigestConfig;
@@ -398,6 +406,21 @@ pub enum ActionErrors {
         "Analysis produced multiple actions with category `{0}` and at least one of them had no identifier. Add an identifier to these actions to disambiguate them"
     )]
     ActionCategoryDuplicateSingleton(Category),
+    #[error(
+        "Action with category `{category}`{identifier} runs in execution group `{group}`, which has no compatible execution platform. Run `buck2 audit execution-platform-resolution` on the target to see why each platform was skipped"
+    )]
+    NoExecutionPlatformForGroup {
+        category: String,
+        identifier: String,
+        group: String,
+    },
+}
+
+/// The category and identifier of an action, which name it in errors raised when it is
+/// registered.
+pub struct ActionName {
+    pub category: String,
+    pub identifier: Option<String>,
 }
 
 #[derive(Derivative, Debug, Display, Allocative, Pagable)]
@@ -411,7 +434,15 @@ pub struct RegisteredAction {
     action: Box<dyn Action>,
     #[derivative(Hash = "ignore", PartialEq = "ignore")]
     executor_config: Arc<CommandExecutorConfig>,
+    /// For actions of rules that declare named execution groups, the execution group whose
+    /// platform `executor_config` comes from; `None` for rules without named groups. Boxed so the
+    /// field is one word: only actions of rules with named groups allocate.
+    #[derivative(Hash = "ignore", PartialEq = "ignore")]
+    execution_group: Option<Box<ExecutionGroup>>,
 }
+
+// One word for the group keeps the `Arc` allocation in the same allocator size class.
+buck2_util::size_assert::words_of_type!(RegisteredAction, 8);
 
 impl RegisteredAction {
     pub fn new(
@@ -419,10 +450,20 @@ impl RegisteredAction {
         action: Box<dyn Action>,
         executor_config: Arc<CommandExecutorConfig>,
     ) -> Self {
+        Self::new_in_group(key, action, executor_config, None)
+    }
+
+    pub fn new_in_group(
+        key: ActionKey,
+        action: Box<dyn Action>,
+        executor_config: Arc<CommandExecutorConfig>,
+        execution_group: Option<ExecutionGroup>,
+    ) -> Self {
         Self {
             key,
             action,
             executor_config,
+            execution_group: execution_group.map(Box::new),
         }
     }
 
@@ -458,6 +499,10 @@ impl RegisteredAction {
         &self.executor_config
     }
 
+    pub fn execution_group(&self) -> Option<&ExecutionGroup> {
+        self.execution_group.as_deref()
+    }
+
     pub fn category(&self) -> CategoryRef<'_> {
         self.action.category()
     }
@@ -486,6 +531,7 @@ struct ActionToBeRegistered {
     key: ActionKey,
     outputs: BuckMutInsertionSet<BuildArtifact>,
     action: Box<dyn UnregisteredAction>,
+    execution_group: ExecutionGroup,
 }
 
 impl ActionToBeRegistered {
@@ -493,11 +539,13 @@ impl ActionToBeRegistered {
         key: ActionKey,
         outputs: BuckMutInsertionSet<BuildArtifact>,
         a: A,
+        execution_group: ExecutionGroup,
     ) -> Self {
         Self {
             key,
             outputs,
             action: Box::new(a),
+            execution_group,
         }
     }
 

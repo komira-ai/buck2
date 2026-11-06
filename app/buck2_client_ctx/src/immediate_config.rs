@@ -20,14 +20,13 @@ use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 #[cfg(fbcode_build)]
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
-use buck2_common::settings::BuckSettings;
-use buck2_common::settings::parser::parse_settings;
 use buck2_core::buck2_env;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::soft_error;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::internal_error;
@@ -37,6 +36,10 @@ use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
+use buck2_settings::BuckSettings;
+use buck2_settings::ResolvedSettings;
+use buck2_settings::parser::parse_settings;
+use buck2_settings::parser::resolve_settings;
 use prost::Message;
 
 /// Lazy-computed immediate config data. This is produced by reading the root buckconfig (but not
@@ -134,6 +137,24 @@ impl<'a> ImmediateConfigContext<'a> {
             .get_or_try_init(|| parse_settings(project_root, setting_arg_layers))
     }
 
+    /// Like [`buck_settings`](Self::buck_settings), with where each value came
+    /// from. Not cached; for reporting.
+    pub fn resolved_settings(
+        &self,
+        project_root: &ProjectRoot,
+    ) -> buck2_error::Result<ResolvedSettings> {
+        let setting_arg_layers = self.setting_arg_layers.get().ok_or_else(|| {
+            internal_error!("Buck settings read before setting arguments were set")
+        })?;
+        resolve_settings(project_root, setting_arg_layers)
+    }
+
+    /// The root `.buckconfig`, which is what the buckconfig fallbacks of
+    /// settings read on the client.
+    pub fn root_config(&self) -> buck2_error::Result<&LegacyBuckConfig> {
+        Ok(&self.data()?.root_config)
+    }
+
     pub fn daemon_startup_config(&self) -> buck2_error::Result<&DaemonStartupConfig> {
         self.daemon_startup_config
             .get_or_try_init(|| {
@@ -142,16 +163,18 @@ impl<'a> ImmediateConfigContext<'a> {
                 let paranoid = match is_paranoid_enabled(&data.paranoid_info_path) {
                     Ok(paranoid) => paranoid,
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to determine whether paranoid is enabled in `{}`: {:#}",
-                            data.paranoid_info_path,
-                            e
+                        soft_error!(
+                            "paranoid_info_unreadable",
+                            e.context(format!(
+                                "Failed to determine whether paranoid is enabled in `{}`",
+                                data.paranoid_info_path
+                            ))
                         );
                         false
                     }
                 };
 
-                DaemonStartupConfig::new(&data.root_config, buck_settings, paranoid)
+                DaemonStartupConfig::new(&data.root_config, &buck_settings.daemon, paranoid)
                     .buck_error_context("Error loading daemon startup config")
             })
             .buck_error_context("Error creating daemon startup config")
@@ -318,7 +341,12 @@ mod tests {
         )?])?;
 
         assert_eq!(
-            context.buck_settings(&project_root)?.log_download.log_url(),
+            context
+                .buck_settings(&project_root)?
+                .daemon
+                .log_download
+                .log_url(&mut buck2_settings::NoBuckconfig)?
+                .as_deref(),
             Some("https://command-line/")
         );
         assert!(
@@ -350,7 +378,10 @@ mod tests {
 
         context.set_setting_arg_layers(vec![setting_arg_layer])?;
         assert_eq!(
-            context.daemon_startup_config()?.log_download_method,
+            context
+                .daemon_startup_config()?
+                .startup_options
+                .log_download_method,
             LogDownloadMethod::Curl("setting_arg".to_owned())
         );
 

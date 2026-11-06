@@ -95,6 +95,9 @@ enum ErrorTag {
   EXIT_STATUS = 517;
   EXIT_STATUS_UNKNOWN = 519;
   DAEMON_LAUNCH_FAILED = 508;
+  // The client gave up waiting for the daemon launcher process to complete
+  // and killed it.
+  DAEMON_LAUNCH_TIMEOUT = 522;
   DAEMON_NESTED_CONSTRAINTS_MISMATCH = 509;
   DAEMON_CONSTRAINTS_WRONG_AFTER_START = 510;
   DAEMON_DIR_CLEANUP_FAILED = 511;
@@ -126,6 +129,9 @@ enum ErrorTag {
   SERVER_SIGABRT = 402;
   // Server received SIGBUS
   SERVER_SIGBUS = 403;
+  // Server received SIGBUS for an address in its own executable's loaded
+  // segments
+  SERVER_SIGBUS_EXECUTABLE = 405;
   // Server disconnect with no error but memory pressure was detected.
   SERVER_MEMORY_PRESSURE = 401;
   DAEMON_OOM_KILLED = 404;

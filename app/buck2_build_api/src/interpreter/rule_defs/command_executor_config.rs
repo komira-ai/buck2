@@ -39,7 +39,6 @@ use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::internal_error;
 use buck2_hash::BuckFixedSortedMap;
-use buck2_hash::BuckMutInsertionMap;
 use derive_more::Display;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
@@ -48,9 +47,11 @@ use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Value;
+use starlark::values::ValueOf;
 use starlark::values::dict::DictRef;
+use starlark::values::dict::DictType;
 use starlark::values::list::ListRef;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::none::NoneOr;
 use starlark::values::none::NoneType;
 use starlark::values::starlark_value;
@@ -82,6 +83,10 @@ enum CommandExecutorConfigErrors {
     ReGangNumSubGroupsNotAnInt(String),
     #[error("expected an integer for `resource_units` in `remote_execution_gang`, got `{0}`")]
     ReGangResourceUnitsNotAnInt(String),
+    #[error(
+        "expected a positive integer for `queue_timeout_s` in `remote_execution_policy`, got `{0}`"
+    )]
+    ReQueueTimeoutNotPositive(String),
 }
 
 #[derive(
@@ -169,13 +174,18 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
     /// * `remote_execution_custom_image`: Custom Tupperware image for remote execution for this platform
     /// * `meta_internal_extra_params`: Json dict of extra params to pass to RE related to Meta internal infra.
     ///   Supports the following keys:
-    ///   - `remote_execution_policy`: Policy settings for remote execution
+    ///   - `remote_execution_policy`: Policy settings for remote execution. A dict with optional keys
+    ///     `priority`, `region_preference`, `setup_preference_key` and `queue_timeout_s` (seconds the
+    ///     action may wait in the RE queue; RE caps it at the platform's queue timeout)
     ///   - `remote_execution_caf_fbpkgs`: CAF fbpkgs configuration
     ///   - `remote_execution_gang`: Constrained gang for gang scheduling in remote execution. A dict with keys:
     ///     - `capabilities`: A dict of capability key-value pairs (required)
     ///     - `num_of_workers`: Number of workers in the gang (required, integer)
     ///     - `locality`: Optional locality constraint ("region", "datacenter", or "network_domain")
     ///     Note: mutually exclusive with `remote_execution_gang_workers`
+    ///   - `cancel_on_client_disconnect`: Directs RE to stop a started execution when buck2
+    ///     closes the execution stream (e.g. the command is cancelled or the process exits).
+    ///     Defaults to `False`, which lets RE run it to completion and write the result to cache.
     /// * `priority`: The priority for remote execution requests. The exact interpretation is up
     ///   to the RE server. See the Bazel Remote Execution API for recommended interpretation:
     ///   https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L1499
@@ -207,10 +217,16 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
         #[starlark(default = NoneOr::None, require = named)] network_access: NoneOr<&str>,
         #[starlark(default = NoneOr::None, require = named)]
         remote_execution_resource_units: NoneOr<i64>,
-        #[starlark(default=UnpackList::default(), require = named)]
-        remote_execution_dependencies: UnpackList<BuckMutInsertionMap<&'v str, &'v str>>,
-        #[starlark(default=UnpackList::default(), require = named)]
-        remote_execution_gang_workers: UnpackList<BuckMutInsertionMap<&'v str, &'v str>>,
+        #[starlark(default = ValueOf::empty_list(), require = named)]
+        remote_execution_dependencies: ValueOf<
+            'v,
+            ListType<ValueOf<'v, DictType<&'v str, &'v str>>>,
+        >,
+        #[starlark(default = ValueOf::empty_list(), require = named)]
+        remote_execution_gang_workers: ValueOf<
+            'v,
+            ListType<ValueOf<'v, DictType<&'v str, &'v str>>>,
+        >,
         #[starlark(default = NoneType, require = named)] remote_execution_dynamic_image: Value<'v>,
         #[starlark(default = NoneOr::None, require = named)] meta_internal_extra_params: NoneOr<
             DictRef<'v>,
@@ -232,13 +248,17 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
                 parse_remote_execution_properties(remote_execution_properties.to_value())?;
 
             let re_dependencies = remote_execution_dependencies
-                .into_iter()
-                .map(RemoteExecutorDependency::parse)
+                .try_items()
+                .map(|d| {
+                    RemoteExecutorDependency::parse(
+                        d?.try_items().collect::<starlark::Result<_>>()?,
+                    )
+                })
                 .collect::<buck2_error::Result<Vec<RemoteExecutorDependency>>>()?;
 
             let re_gang_workers = remote_execution_gang_workers
-                .into_iter()
-                .map(ReGangWorker::parse)
+                .try_items()
+                .map(|w| ReGangWorker::parse(w?.try_items().collect::<starlark::Result<_>>()?))
                 .collect::<buck2_error::Result<Vec<ReGangWorker>>>()?;
 
             let re_dynamic_image = parse_custom_re_image(
@@ -526,6 +546,19 @@ fn parse_remote_execution_policy(
                 ))
             })?;
 
+            let queue_timeout_s = match re_policy_dict.get_str("queue_timeout_s") {
+                None => None,
+                Some(v) => match v.unpack_i32() {
+                    Some(seconds) if seconds > 0 => Some(seconds),
+                    _ => {
+                        return Err(CommandExecutorConfigErrors::ReQueueTimeoutNotPositive(
+                            v.to_repr(),
+                        )
+                        .into());
+                    }
+                },
+            };
+
             Ok(RemoteExecutionPolicy {
                 setup_preference_key: re_policy_dict
                     .get_str("setup_preference_key")
@@ -539,6 +572,7 @@ fn parse_remote_execution_policy(
                     .get_str("priority")
                     .and_then(|v| v.unpack_i32())
                     .map(|i| i.to_owned()),
+                queue_timeout_s,
             })
         }
     }
@@ -604,6 +638,11 @@ pub fn parse_meta_internal_extra_params<'v>(
         .and_then(|v| v.unpack_bool())
         .unwrap_or(false);
 
+    let cancel_on_client_disconnect = params
+        .get_str("cancel_on_client_disconnect")
+        .and_then(|v| v.unpack_bool())
+        .unwrap_or(false);
+
     let result = MetaInternalExtraParams {
         remote_execution_policy: parse_remote_execution_policy(
             params.get_str("remote_execution_policy"),
@@ -613,6 +652,7 @@ pub fn parse_meta_internal_extra_params<'v>(
         )?,
         gang,
         allow_unsandboxed_action_cache_uploads,
+        cancel_on_client_disconnect,
     };
 
     if result == MetaInternalExtraParams::default() {
@@ -700,9 +740,12 @@ mod tests {
     use buck2_interpreter::factory::BuckStarlarkModule;
     use buck2_interpreter::factory::StarlarkEvaluatorProvider;
     use dice_futures::cancellation::CancellationContext;
+    use starlark::values::Heap;
     use starlark::values::dict::AllocDict;
+    use starlark::values::dict::DictRef;
     use starlark::values::list::AllocList;
 
+    use crate::interpreter::rule_defs::command_executor_config::parse_meta_internal_extra_params;
     use crate::interpreter::rule_defs::command_executor_config::parse_remote_execution_properties;
 
     #[test]
@@ -736,6 +779,24 @@ mod tests {
             )?;
             let (profiling, _) = finished_eval.finish()?;
             Ok((profiling, ()))
+        })
+    }
+
+    #[test]
+    fn test_parse_meta_internal_extra_params_cancel_on_client_disconnect() -> buck2_error::Result<()>
+    {
+        Heap::temp(|heap| {
+            let params = heap.alloc(AllocDict([("cancel_on_client_disconnect", true)]));
+            let params = parse_meta_internal_extra_params(DictRef::from_value(params))?;
+            assert!(params.cancel_on_client_disconnect);
+
+            let params = heap.alloc(AllocDict([(
+                "allow_unsandboxed_action_cache_uploads",
+                true,
+            )]));
+            let params = parse_meta_internal_extra_params(DictRef::from_value(params))?;
+            assert!(!params.cancel_on_client_disconnect, "defaults to false");
+            Ok(())
         })
     }
 }

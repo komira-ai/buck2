@@ -27,11 +27,12 @@ use std::sync::atomic::AtomicPtr;
 use allocative::Allocative;
 use dupe::Dupe;
 use starlark_derive::NoSerialize;
-use starlark_derive::ProvidesStaticType;
 use starlark_derive::StarlarkPagable;
 use starlark_derive::starlark_value;
 
 use crate as starlark;
+use crate::any::IsStaticType;
+use crate::any::ProvidesStaticType;
 use crate::docs::DocItem;
 use crate::docs::DocString;
 use crate::docs::DocType;
@@ -53,7 +54,7 @@ use crate::values::Trace;
 use crate::values::Tracer;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::list::UnpackList;
+use crate::values::list::ListRef;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::typing::TypeCompiled;
 use crate::values::typing::callable::param::StarlarkCallableParamAny;
@@ -111,11 +112,10 @@ See also [`typing.Callable` in the Python documentation][1].
         heap: Heap<'v>,
         _private: Private,
     ) -> crate::Result<Value<'v>> {
-        let param_types = UnpackList::<Value>::unpack_value_err(param_types)?;
+        let param_types = <&ListRef>::unpack_value_err(param_types)?;
         let ret = TypeCompiled::new(ret, heap)?.as_ty().dupe();
         let param_types: Vec<Ty> = param_types
-            .items
-            .into_iter()
+            .iter()
             .map(|p| Ok(TypeCompiled::new(p, heap)?.as_ty().dupe()))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -174,6 +174,20 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Clone for StarlarkCa
 
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Dupe for StarlarkCallable<'v, P, R> {}
 
+// SAFETY: the static type is the same type with the heap lifetime erased; `P` and `R` only
+// describe the signature and carry no heap lifetime.
+unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static>
+    ProvidesStaticType<'v> for StarlarkCallable<'v, P, R>
+{
+    type StaticType = StarlarkCallable<'static, P, R>;
+}
+
+impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static> IsStaticType
+    for StarlarkCallable<'static, P, R>
+{
+    type Reinfect<'lt> = StarlarkCallable<'lt, P, R>;
+}
+
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Debug for StarlarkCallable<'v, P, R> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("StarlarkCallable").field(&self.0).finish()
@@ -219,7 +233,7 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
 
     #[inline]
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        if value.vtable().starlark_value.HAS_invoke {
+        if value.vtable().starlark_value.ty.HAS_invoke {
             Ok(Some(StarlarkCallable::unchecked_new(value)))
         } else {
             Ok(None)
@@ -292,6 +306,19 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Dupe
 {
 }
 
+// SAFETY: as for `StarlarkCallable`.
+unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static>
+    ProvidesStaticType<'v> for StarlarkCallableChecked<'v, P, R>
+{
+    type StaticType = StarlarkCallableChecked<'static, P, R>;
+}
+
+impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static> IsStaticType
+    for StarlarkCallableChecked<'static, P, R>
+{
+    type Reinfect<'lt> = StarlarkCallableChecked<'lt, P, R>;
+}
+
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Debug
     for StarlarkCallableChecked<'v, P, R>
 {
@@ -337,10 +364,16 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkTypeRepr
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+#[error("Callable of type `{actual}` does not match the expected signature `{expected}`")]
+struct CallableSignatureMismatch {
+    expected: Ty,
+    actual: Ty,
+}
+
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
-    /// Only internal error is possible.
     type Error = crate::Error;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
@@ -352,9 +385,15 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
         // We need generic statics to cache this.
         let ty = Ty::callable(P::params(), R::starlark_type_repr());
 
-        match Ty::of_value(value).check_intersects(&ty)? {
+        let actual = Ty::of_value(value);
+        match actual.check_intersects(&ty)? {
             true => Ok(Some(StarlarkCallableChecked(value, PhantomData))),
-            false => Ok(None),
+            // The runtime type `typing.Callable` accepts any callable, so a signature mismatch
+            // is a conversion failure, not a type mismatch.
+            false => Err(crate::Error::new_value(CallableSignatureMismatch {
+                expected: ty,
+                actual,
+            })),
         }
     }
 }
@@ -551,7 +590,7 @@ def test():
 
 test()
         "#,
-            "Type of parameter `_f` doesn't match",
+            "does not match the expected signature `typing.Callable[[], None]`",
         );
     }
 }

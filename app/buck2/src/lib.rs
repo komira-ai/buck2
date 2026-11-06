@@ -8,8 +8,6 @@
  * above-listed licenses.
  */
 
-#![feature(used_with_arg)]
-
 use std::thread;
 
 use buck2_client::commands::build::BuildCommand;
@@ -37,8 +35,9 @@ use buck2_client::commands::subscribe::SubscribeCommand;
 use buck2_client::commands::targets::TargetsCommand;
 use buck2_client::commands::test::TestCommand;
 use buck2_client_ctx::agent_context::AgentContext;
+use buck2_client_ctx::agent_context::AgentContextEntries;
 use buck2_client_ctx::agent_context::AgentContextEntry;
-use buck2_client_ctx::agent_context::parse_agent_context;
+use buck2_client_ctx::agent_context::parse_agent_context_entries;
 use buck2_client_ctx::agent_invocation_info::AgentInvocationInfo;
 use buck2_client_ctx::argfiles::expand_argv;
 use buck2_client_ctx::client_ctx::BuckSubcommand;
@@ -59,8 +58,6 @@ use buck2_common::argv::Argv;
 use buck2_common::invocation_paths::RESERVED_BUCK_OUT_PREFIX;
 use buck2_common::invocation_paths_result::InvocationPathsResult;
 use buck2_common::invocation_roots::get_invocation_paths_result;
-use buck2_common::settings::args::SettingOverride;
-use buck2_common::settings::args::parse_setting_flag_arg;
 use buck2_core::buck2_env;
 use buck2_core::buck2_env_name;
 use buck2_data::ErrorReport;
@@ -71,6 +68,8 @@ use buck2_error::buck2_error;
 use buck2_error::conversion::clap::buck_error_clap_parser;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_settings::args::SettingOverride;
+use buck2_settings::args::parse_setting_flag_arg;
 use buck2_util::threads::thread_spawn_scoped;
 use clap::CommandFactory;
 use clap::FromArgMatches;
@@ -159,18 +158,17 @@ struct BeforeSubcommandOptions {
 
     /// Agent context key=value pairs for telemetry.
     /// Used by AI agents to pass structured metadata. Schema is defined via buckconfig.
-    /// Entries can be comma-separated or passed as separate flags.
     /// Examples:
     ///   --agent-context intent=fix,attempt=2,prior_error=missing_target
     ///   --agent-context intent=build --agent-context attempt=1
+    ///   --agent-context "reason=fix the build, then test"
     #[clap(
         id = AGENT_CONTEXT_ARG_ID,
         long = "agent-context",
         value_name = "AGENT_CONTEXT",
-        value_delimiter = ',',
-        value_parser = buck_error_clap_parser(parse_agent_context)
+        value_parser = buck_error_clap_parser(parse_agent_context_entries)
     )]
-    agent_context: Vec<AgentContextEntry>,
+    agent_context: Vec<AgentContextEntries>,
 
     /// Do not launch a daemon process, run buck server in client process.
     ///
@@ -237,7 +235,8 @@ impl Opt {
     fn from_clap_matches(mut matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut opt = Self::from_arg_matches(matches)?;
         while let Some((_, subcommand)) = matches.subcommand() {
-            if let Some(entries) = subcommand.get_many::<AgentContextEntry>(AGENT_CONTEXT_ARG_ID) {
+            if let Some(entries) = subcommand.get_many::<AgentContextEntries>(AGENT_CONTEXT_ARG_ID)
+            {
                 opt.common_opts.agent_context.extend(entries.cloned());
             }
             matches = subcommand;
@@ -324,7 +323,7 @@ pub fn exec(process: ProcessContext<'_>) -> ExitResult {
         opt.opt
             .common_opts
             .agent_context
-            .splice(0..0, agent_env_metadata);
+            .insert(0, AgentContextEntries(agent_env_metadata));
     }
 
     // If --client-metadata=? was not set and from_env did not find "id", then
@@ -577,7 +576,13 @@ impl CommandKind {
             common_opts.oncall,
             common_opts.client_metadata,
             common_opts.isolation_dir,
-            AgentInvocationInfo::from_client(AgentContext::new(common_opts.agent_context)),
+            AgentInvocationInfo::from_client(AgentContext::new(
+                common_opts
+                    .agent_context
+                    .into_iter()
+                    .flat_map(|entries| entries.0)
+                    .collect(),
+            )),
         );
         if let Some(recorder) = events_ctx.recorder.as_mut() {
             recorder.update_for_client_ctx(&command_ctx, self.command_name());
@@ -617,6 +622,10 @@ impl CommandKind {
             CommandKind::Targets(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Utargets(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Ctargets(cmd) => command_ctx.exec(cmd, matches, events_ctx),
+            // Settings are resolved on the client; no daemon is involved.
+            CommandKind::Audit(AuditCommand::Settings(cmd)) => {
+                cmd.exec(matches, command_ctx).into()
+            }
             CommandKind::Audit(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Starlark(cmd) => cmd.exec(matches, command_ctx, events_ctx),
             CommandKind::Run(cmd) => command_ctx.exec(cmd, matches, events_ctx),
@@ -687,6 +696,8 @@ impl CommandKind {
 
 #[cfg(test)]
 mod tests {
+    use buck2_client_ctx::agent_context::parse_agent_context;
+
     use super::*;
 
     fn agent_context(args: &[&str]) -> Vec<AgentContextEntry> {
@@ -697,6 +708,9 @@ mod tests {
             .expect("test arguments should construct Opt")
             .common_opts
             .agent_context
+            .into_iter()
+            .flat_map(|entries| entries.0)
+            .collect()
     }
 
     fn entries(values: &[&str]) -> Vec<AgentContextEntry> {
@@ -771,6 +785,19 @@ mod tests {
                 "direct_call=false",
                 "advice_ack=other",
             ]),
+        );
+    }
+
+    #[test]
+    fn agent_context_keeps_commas_in_values() {
+        assert_eq!(
+            agent_context(&[
+                "--agent-context",
+                "reason=fix the build, then test,direct_call=true",
+                "build",
+                "//foo:bar",
+            ]),
+            entries(&["reason=fix the build, then test", "direct_call=true"]),
         );
     }
 

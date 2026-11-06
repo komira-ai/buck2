@@ -24,7 +24,10 @@ use buck2_hash::IntentionallyStdHashMap;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::file_type::StarlarkFileType;
+use buck2_node::attrs::arena::OwnedCoercedAttr;
+use buck2_node::attrs::attr_type::AttrType;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
+use buck2_node::attrs::configurable::AttrIsConfigurable;
 use dupe::Dupe;
 use starlark::environment::Globals;
 use starlark::environment::Module;
@@ -32,6 +35,7 @@ use starlark::eval::Evaluator;
 use starlark::syntax::AstModule;
 use starlark::values::Value;
 
+use crate::attrs::coerce::attr_type::AttrTypeExt;
 use crate::attrs::coerce::ctx::BuildAttrCoercionContext;
 use crate::interpreter::buckconfig::LegacyConfigsViewForStarlark;
 use crate::interpreter::build_context::BuildContext;
@@ -40,11 +44,37 @@ use crate::interpreter::bzl_eval_ctx::BzlEvalCtx;
 use crate::interpreter::cell_info::InterpreterCellInfo;
 use crate::interpreter::functions::host_info::HostInfo;
 
-pub fn coercion_ctx() -> impl AttrCoercionContext {
+pub fn coercion_ctx() -> BuildAttrCoercionContext {
     coercion_ctx_listing(PackageListing::testing_empty())
 }
 
-pub fn coercion_ctx_listing(package_listing: PackageListing) -> impl AttrCoercionContext {
+pub fn coercion_ctx_listing(package_listing: PackageListing) -> BuildAttrCoercionContext {
+    build_coercion_ctx(package_listing)
+}
+
+/// Coercion for tests that assert on the encoded value: coerces into this
+/// context's arena and copies the result into its own single-value storage.
+pub trait CoerceSealed {
+    fn coerce_sealed<'v>(
+        &self,
+        attr: &AttrType,
+        value: Value<'v>,
+    ) -> buck2_error::Result<OwnedCoercedAttr>;
+}
+
+impl CoerceSealed for BuildAttrCoercionContext {
+    fn coerce_sealed<'v>(
+        &self,
+        attr: &AttrType,
+        value: Value<'v>,
+    ) -> buck2_error::Result<OwnedCoercedAttr> {
+        let token = attr.coerce(AttrIsConfigurable::Yes, self, value)?;
+        let arena = self.attr_arena();
+        OwnedCoercedAttr::new_with(|b| b.encode_view(arena.view(token.word())))
+    }
+}
+
+pub(crate) fn build_coercion_ctx(package_listing: PackageListing) -> BuildAttrCoercionContext {
     let package = PackageLabel::testing();
     let aliases = IntentionallyStdHashMap::from([(
         NonEmptyCellAlias::new("cell1".to_owned()).unwrap(),
@@ -67,7 +97,6 @@ pub fn coercion_ctx_listing(package_listing: PackageListing) -> impl AttrCoercio
         cell_resolver,
         cell_alias_resolver,
         (package, package_listing),
-        false,
         CellPathWithAllowedRelativeDir::backwards_relative_not_supported(
             package.as_cell_path().to_owned(),
         ),

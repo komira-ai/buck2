@@ -14,7 +14,6 @@ use std::sync::Arc;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisActions;
 use buck2_cli_proto::build_request::Materializations;
 use buck2_cli_proto::build_request::Uploads;
-use buck2_common::dice::data::HasIoProvider;
 use buck2_common::events::HasEvents;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::paths::CellRelativePath;
@@ -40,9 +39,9 @@ use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::none::NoneOr;
 use starlark::values::none::NoneType;
 use starlark::values::structs::StructRef;
@@ -110,23 +109,11 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
     /// Returns the absolute path to the root of the repository
     ///
     /// This function is not available on the `bxl_ctx` when called from `dynamic_output`.
-    fn root<'v>(
-        this: &'v BxlContext<'v>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<String> {
+    fn root<'v>(this: &'v BxlContext<'v>) -> starlark::Result<String> {
         let _root_type = this.context_type.unpack_root().map_err(|_| {
             buck2_error::Error::from(BxlContextError::Unsupported("root".to_owned()))
         })?;
-        Ok(this.via_dice(eval, |ctx| {
-            buck2_error::Ok(
-                ctx.global_data()
-                    .get_io_provider()
-                    .project_root()
-                    .root()
-                    .to_str()?
-                    .to_owned(),
-            )
-        })?)
+        Ok(this.project_root().root().to_str()?.to_owned())
     }
 
     /// Returns the absolute path to the cell of the repository
@@ -162,13 +149,15 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] labels: ConfiguredTargetListExprArg<'v>,
         #[starlark(default = ValueAsStarlarkTargetLabel::NONE)]
         target_platform: ValueAsStarlarkTargetLabel<'v>,
-        #[starlark(require = named, default = NoneOr::None)] modifiers: NoneOr<UnpackList<String>>,
+        #[starlark(require = named, default = NoneOr::None)] modifiers: NoneOr<
+            ValueOf<'v, ListType<String>>,
+        >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<
         Either<NoneOr<StarlarkConfiguredTargetNode>, StarlarkTargetSet<ConfiguredTargetNode>>,
     > {
         let cli_modifiers = match modifiers.into_option() {
-            Some(cli_modifiers) => cli_modifiers.items,
+            Some(cli_modifiers) => cli_modifiers.try_to_vec()?,
             None => Vec::new(),
         };
         let global_cfg_options = this.resolve_global_cfg_options(target_platform, cli_modifiers)?;
@@ -176,14 +165,13 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
         Ok(this.via_dice(eval, |dice| {
             dice.via(|ctx| {
                 async move {
-                    let target_expr =
-                        TargetListExpr::<'v, ConfiguredTargetNode>::unpack_allow_unconfigured(
-                            labels,
-                            &global_cfg_options,
-                            this,
-                            ctx,
-                        )
-                        .await?;
+                    let target_expr = TargetListExpr::<'v, ConfiguredTargetNode>::unpack(
+                        labels,
+                        &global_cfg_options,
+                        this,
+                        ctx,
+                    )
+                    .await?;
 
                     if let Some(one) = target_expr.get_one(ctx).await? {
                         let result = filter_incompatible(iter::once(one), this)?;
@@ -292,10 +280,13 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(default = ValueAsStarlarkTargetLabel::NONE)]
         target_platform: ValueAsStarlarkTargetLabel<'v>,
         #[starlark(require = named, default = false)] keep_going: bool,
-        #[starlark(require = named, default = UnpackList::default())] modifiers: UnpackList<String>,
+        #[starlark(require = named, default = ValueOf::empty_list())] modifiers: ValueOf<
+            'v,
+            ListType<String>,
+        >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkTargetUniverse<'v>> {
-        let modifiers = modifiers.items;
+        let modifiers = modifiers.try_to_vec()?;
         let global_cfg_options = this.resolve_global_cfg_options(target_platform, modifiers)?;
 
         Ok(this.via_dice(eval, |ctx| {
@@ -306,7 +297,6 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
                         &global_cfg_options,
                         &this,
                         ctx,
-                        true, // allow_unconfigured
                         keep_going,
                     )
                     .await?;
@@ -573,7 +563,7 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
             >,
         >,
     > {
-        let providers = labels.unpack();
+        let providers = labels.unpack()?;
 
         let res: buck2_error::Result<_> = this.via_dice(eval, |dice| {
             dice.via(|dice| {
@@ -661,9 +651,7 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
     ///
     /// This attribute is not available on the bxl context within the a dynamic lambda.
     #[starlark(attribute)]
-    fn cli_args<'v>(
-        this: &'v BxlContext<'v>,
-    ) -> starlark::Result<ValueOfUnchecked<'v, StructRef<'v>>> {
+    fn cli_args<'v>(this: &'v BxlContext<'v>) -> starlark::Result<ValueOf<'v, StructRef<'v>>> {
         let cli_args = this
             .context_type
             .unpack_root()

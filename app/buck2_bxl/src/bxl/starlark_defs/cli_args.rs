@@ -63,10 +63,11 @@ use starlark::values::StarlarkValue;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueError;
+use starlark::values::ValueOf;
 use starlark::values::float::StarlarkFloat;
 use starlark::values::list::AllocList;
 use starlark::values::list::ListRef;
-use starlark::values::list_or_tuple::UnpackListOrTuple;
+use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::none::NoneType;
 use starlark::values::starlark_value;
 use variant_name::VariantName;
@@ -541,9 +542,11 @@ impl CliArgType {
                 .value_parser(|x: &str| x.parse::<bool>().map(|_| x.to_owned())),
             CliArgType::Int => clap
                 .num_args(1)
+                .allow_negative_numbers(true)
                 .value_parser(|x: &str| x.parse::<BigInt>().map(|_| x.to_owned())),
             CliArgType::Float => clap
                 .num_args(1)
+                .allow_negative_numbers(true)
                 .value_parser(|x: &str| x.parse::<f64>().map(|_| x.to_owned())),
             CliArgType::String => clap.num_args(1),
             CliArgType::Enumeration(variants) => clap
@@ -669,14 +672,22 @@ impl CliArgType {
                         .collect::<buck2_error::Result<_>>()?,
                     )),
                 },
-                CliArgType::Option(inner) => Some(if clap.value_of().is_some() {
-                    inner
-                        .parse_clap(clap, ctx)
-                        .await?
-                        .expect("arg is verified to be present")
-                } else {
-                    CliArgValue::None
-                }),
+                CliArgType::Option(inner) => {
+                    if clap.is_present() {
+                        // A flag present with no values (a bare `--flag` for a list) parses
+                        // like the inner type does.
+                        Some(
+                            inner
+                                .parse_clap(clap, ctx)
+                                .await?
+                                .unwrap_or(CliArgValue::None),
+                        )
+                    } else {
+                        // Absent: `CliArgs::parse_clap` applies the declared default, which
+                        // `option()` set to `None` when the script gave none.
+                        None
+                    }
+                }
                 CliArgType::TargetLabel => clap.value_of().map_or(Ok(None), |x| {
                     let r: buck2_error::Result<_> = try {
                         CliArgValue::TargetLabel(
@@ -1046,7 +1057,7 @@ pub(crate) fn cli_args_module(registry: &mut GlobalsBuilder) {
     /// buck2 bxl //my.bxl:target -- --mode debug
     /// ```
     fn r#enum<'v>(
-        #[starlark(require = pos)] variants: UnpackListOrTuple<String>,
+        #[starlark(require = pos)] variants: ValueOf<'v, ListOrTupleType<String>>,
         default: Option<Value<'v>>,
         #[starlark(default = "")] doc: &str,
         #[starlark(require = named)] short: Option<Value<'v>>,
@@ -1057,7 +1068,7 @@ pub(crate) fn cli_args_module(registry: &mut GlobalsBuilder) {
         Ok(CliArgs::new(
             default,
             doc,
-            CliArgType::enumeration(variants.into_iter().collect()),
+            CliArgType::enumeration(variants.try_items().collect::<starlark::Result<_>>()?),
             short,
         )?)
     }
@@ -1279,6 +1290,14 @@ pub(crate) enum ArgAccessor<'a> {
 }
 
 impl<'a> ArgAccessor<'a> {
+    /// Whether the flag was given at all, including with no values.
+    fn is_present(&self) -> bool {
+        match self {
+            ArgAccessor::Clap { clap, arg } => clap.value_source(arg).is_some(),
+            ArgAccessor::Literal(_) => true,
+        }
+    }
+
     fn value_of(&self) -> Option<&str> {
         match self {
             ArgAccessor::Clap { clap, arg } => clap.get_one::<String>(arg).map(|x| x.as_str()),

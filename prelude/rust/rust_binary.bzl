@@ -346,6 +346,7 @@ def _rust_binary_common(
 
     generated_build_info_link_args = []
     generated_build_info_link_objects = []
+    generated_build_info_shared_library_link_args = []
 
     resources = flatten_dict(
         gather_resources(
@@ -553,7 +554,7 @@ def _rust_binary_common(
         if generated_build_info:
             generated_build_info_link_args.extend(generated_build_info.linker_flags)
             generated_build_info_link_args.extend(compile_generated_build_info(ctx, generated_build_info).objects)
-    extra_link_args = executable_shlib_args.extra_link_args + generated_build_info_link_args
+    extra_link_args = executable_shlib_args.extra_link_args + generated_build_info_shared_library_link_args + generated_build_info_link_args
 
     # Compile rust binary. Under `Emit("rlib")`, this only compiles: rustc's
     # synthesized objects are extracted and linked below.
@@ -602,7 +603,7 @@ def _rust_binary_common(
             extraction = extraction,
             dep_link_strategy = params.dep_link_strategy,
             reloc_model = params.reloc_model,
-            extra_link_args = executable_shlib_args.extra_link_args,
+            extra_link_args = executable_shlib_args.extra_link_args + generated_build_info_shared_library_link_args,
             binary_link_args = generated_build_info_link_objects + generated_build_info_link_args,
             inherited_link_args = native_link_args,
             dwo_output_directory = link.compile_output.dwo_output_directory,
@@ -1114,12 +1115,14 @@ rust_binary = prelude_rule(
         | native_common.transformation_spec_arg()
         | buck.allow_cache_upload_arg()
         | {
+            "build_info_as_shared_library": attrs.bool(default = True),
             "_gen_build_info": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "_generated_build_info_args": attrs.list(attrs.arg(), default = []),
             "_generated_build_info_data": attrs.option(attrs.source(), default = None),
             "_generated_build_info_enabled": attrs.bool(default = False),
             "_generated_build_info_mode": attrs.enum(["full", "stable"], default = "stable"),
             "_generated_build_info_spec": BUILD_INFO_ATTR,
+            "_pgo_profile": attrs.option(attrs.dep(), default = None),
         }
     ),
     uses_plugins = [RustProcMacroPlugin],
@@ -1196,7 +1199,7 @@ rust_test = prelude_rule(
                 same command-line parameters and produce the same output as the test framework.
             """,
             ),
-            "supports_test_execution_caching": attrs.bool(default = False),
+            "supports_test_execution_caching": attrs.bool(default = True),
         }
         | miri_interpreted_attr()
         | re_test_common.test_args()
@@ -1206,6 +1209,7 @@ rust_test = prelude_rule(
         | native_common.transformation_spec_arg()
         | test_common.attributes()
         | {
+            "build_info_as_shared_library": attrs.bool(default = True),
             "_gen_build_info": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "_generated_build_info_args": attrs.list(attrs.arg(), default = []),
             "_generated_build_info_data": attrs.option(attrs.source(), default = None),

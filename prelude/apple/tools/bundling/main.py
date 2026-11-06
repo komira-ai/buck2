@@ -217,6 +217,11 @@ def _args_parser() -> argparse.ArgumentParser:
         help="Include the build info file in the assembled bundle.",
     )
     parser.add_argument(
+        "--build-info-hot-code-reload",
+        choices=["true", "false"],
+        help="Record in the build info file whether this is a hot code reload build.",
+    )
+    parser.add_argument(
         "--bundle-telemetry-logger",
         metavar="<path/to/logger>",
         type=Path,
@@ -368,6 +373,7 @@ def _main(spec_temp_dir: str) -> None:
             spec=spec,
             resources_destination=args.resources_destination,
             tmp_dir=Path(spec_temp_dir),
+            hot_code_reload=args.build_info_hot_code_reload,
         )
 
     incremental_state = assemble_bundle(
@@ -697,6 +703,7 @@ def _amend_spec_with_build_uuid(
     spec: List[BundleSpecItem],
     resources_destination: Optional[Path],
     tmp_dir: Path,
+    hot_code_reload: Optional[str] = None,
 ) -> None:
     build_id = os.environ.get("BUCK_BUILD_ID")
     if not build_id:
@@ -720,8 +727,11 @@ def _amend_spec_with_build_uuid(
     # Build Y runs no actions at all (nothing invalidated because synthesized
     # files are not inputs to the action), so `BuildInfo.json` would contain
     # uuid X.
+    build_info = {"build_uuid": build_id}
+    if hot_code_reload is not None:
+        build_info["hot_code_reload"] = hot_code_reload == "true"
     src = tmp_dir / "BuildInfo.json"
-    src.write_text(json.dumps({"build_uuid": build_id}, indent=2))
+    src.write_text(json.dumps(build_info, indent=2))
     dst = str(resources_destination / "BuildInfo.json")
 
     spec.append(BundleSpecItem(src=str(src), dst=dst))

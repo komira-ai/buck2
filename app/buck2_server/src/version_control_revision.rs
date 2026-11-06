@@ -8,9 +8,10 @@
  * above-listed licenses.
  */
 
+use std::io;
 use std::iter;
 
-use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_data::VersionControlRevision;
 use buck2_error::ErrorTag;
 use buck2_events::dispatch::EventDispatcher;
@@ -22,6 +23,10 @@ use buck2_util::properly_reaped_child::reap_on_drop_command;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio_stream::StreamExt;
+
+/// What `command_error` says for a directory that is not a repository buck2 knows. It is
+/// recorded like any other reason for having no revision, but it is not a failure to report.
+const NOT_A_REPOSITORY: &str = "Unknown repository type";
 
 /// Spawn tasks to collect version control information
 /// and return a droppable handle that will cancel them on drop.
@@ -43,13 +48,13 @@ pub(crate) fn spawn_version_control_collector(
         )));
 
         while let Some(event) = tasks.next().await {
-            if let Some(error) = &event.command_error {
-                soft_error!(
+            if let Some(error) = &event.command_error
+                && error != NOT_A_REPOSITORY
+            {
+                soft_error_or_panic!(
                     "spawn_version_control_collector_failed",
-                    buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "{}", error),
-                    quiet: true
-                )
-                .ok();
+                    buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "{}", error)
+                );
             }
 
             dispatch.instant_event(event);
@@ -92,7 +97,7 @@ async fn create_revision_data(
         RepoVcs::Hg => create_hg_data(&mut revision, revision_type, repo_root).await,
         RepoVcs::Git => create_git_data(&mut revision, revision_type, repo_root).await,
         RepoVcs::Unknown => {
-            revision.command_error = Some("Unknown repository type".to_owned());
+            revision.command_error = Some(NOT_A_REPOSITORY.to_owned());
         }
     }
     revision
@@ -120,13 +125,19 @@ async fn get_hg_revision(
         .join(ForwardRelativePath::new(".hg").unwrap())
         .join(ForwardRelativePath::new("dirstate").unwrap());
 
-    if let Err(e) = async_fs_util::read(&dirstate, &mut buffer).await {
-        revision.command_error = Some(format!(
-            "Failed to read the first 20 bytes of {}: {:#}",
-            dirstate.display(),
-            e.categorize_internal(),
-        ));
-        return;
+    match async_fs_util::read(&dirstate, &mut buffer).await {
+        Ok(_) => {}
+        // `hg init` writes no dirstate; the first `hg status` does, and the status collector may
+        // be running it right now. No dirstate is no working copy parent, not a failure.
+        Err(e) if e.io_error_kind() == Some(io::ErrorKind::NotFound) => return,
+        Err(e) => {
+            revision.command_error = Some(format!(
+                "Failed to read the first 20 bytes of {}: {:#}",
+                dirstate.display(),
+                e.categorize_internal(),
+            ));
+            return;
+        }
     }
 
     let curr_revision = buffer.iter().map(|b| format!("{b:02x}")).collect();
@@ -403,6 +414,20 @@ mod tests {
 
         assert_eq!(revision.command_error, None);
         assert_eq!(revision.has_local_changes, Some(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_hg_revision_without_dirstate() -> buck2_error::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::create_dir(temp_dir.path().join(".hg"))?;
+        let repo_root = temp_repo_root(&temp_dir)?;
+
+        let mut revision = VersionControlRevision::default();
+        get_hg_revision(&mut revision, &repo_root).await;
+
+        assert_eq!(revision.command_error, None);
+        assert_eq!(revision.hg_revision, None);
         Ok(())
     }
 

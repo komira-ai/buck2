@@ -26,13 +26,15 @@ use buck2_dynamic_actions::params::DynamicLambdaStaticFields;
 use buck2_dynamic_actions::storage::DynamicLambdaParamsStorageImpl;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_error::internal_error;
-use buck2_hash::BuckMutInsertionMap;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use starlark::environment::MethodsBuilder;
 use starlark::starlark_module;
 use starlark::values::Value;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list_or_tuple::UnpackListOrTuple;
+use starlark::values::dict::DictType;
+use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::none::NoneType;
 use starlark::values::typing::StarlarkCallable;
 
@@ -46,7 +48,7 @@ enum DynamicOutputError {
 fn output_artifacts_to_lambda_build_artifacts<'v>(
     dynamic_key: &DynamicLambdaResultsKey,
     outputs: Vec<ValueTyped<'v, StarlarkOutputArtifact<'v>>>,
-) -> buck2_error::Result<Box<[ValueTyped<'v, StarlarkOutputArtifact<'v>>]>> {
+) -> buck2_error::Result<MiniBoxSlice<ValueTyped<'v, StarlarkOutputArtifact<'v>>>> {
     let outputs = dedupe_output_artifacts(outputs);
     let mut bind = DynamicActionsOutputArtifactBinder::new(dynamic_key);
 
@@ -97,19 +99,23 @@ pub(crate) fn analysis_actions_methods_dynamic_output(methods: &mut MethodsBuild
     /// the actions it outputs is actually requested as part of the build.
     fn dynamic_output<'v>(
         this: &'v AnalysisActions<'v>,
-        #[starlark(require = named)] dynamic: UnpackListOrTuple<UnpackNonPromiseInputArtifact>,
-        #[starlark(require = named)] inputs: Option<
-            UnpackListOrTuple<UnpackNonPromiseInputArtifact>,
+        #[starlark(require = named)] dynamic: ValueOf<
+            'v,
+            ListOrTupleType<UnpackNonPromiseInputArtifact<'v>>,
         >,
-        #[starlark(require = named)] outputs: UnpackListOrTuple<
-            ValueTyped<'v, StarlarkOutputArtifact<'v>>,
+        #[starlark(require = named)] inputs: Option<
+            ValueOf<'v, ListOrTupleType<UnpackNonPromiseInputArtifact<'v>>>,
+        >,
+        #[starlark(require = named)] outputs: ValueOf<
+            'v,
+            ListOrTupleType<ValueTyped<'v, StarlarkOutputArtifact<'v>>>,
         >,
         #[starlark(require = named)] f: StarlarkCallable<
             'v,
             (
                 Value<'static>,
-                BuckMutInsertionMap<StarlarkArtifact, StarlarkArtifactValue>,
-                BuckMutInsertionMap<StarlarkArtifact, StarlarkDeclaredArtifact>,
+                DictType<StarlarkArtifact, StarlarkArtifactValue>,
+                DictType<StarlarkArtifact, StarlarkDeclaredArtifact>,
             ),
             NoneType,
         >,
@@ -118,15 +124,15 @@ pub(crate) fn analysis_actions_methods_dynamic_output(methods: &mut MethodsBuild
         let _unused = inputs;
 
         // Parameter validation
-        if outputs.items.is_empty() {
+        let outputs = outputs.try_to_vec()?;
+        if outputs.is_empty() {
             return Err(buck2_error::Error::from(DynamicOutputError::EmptyOutput).into());
         }
 
         // Conversion
         let artifact_values = dynamic
-            .items
-            .iter()
-            .map(|x| x.artifact())
+            .try_items()
+            .map(|x| x?.artifact())
             .collect::<buck2_error::Result<_>>()?;
 
         let attributes = this.attributes;
@@ -140,7 +146,7 @@ pub(crate) fn analysis_actions_methods_dynamic_output(methods: &mut MethodsBuild
             DynamicLambdaParamsStorageImpl::get(&mut this.analysis_value_storage)?;
 
         let key = lambda_params_storage.next_dynamic_actions_key()?;
-        let outputs = output_artifacts_to_lambda_build_artifacts(&key, outputs.items)?;
+        let outputs = output_artifacts_to_lambda_build_artifacts(&key, outputs)?;
 
         // Registration
         let lambda_params = DynamicLambdaParams {
@@ -151,7 +157,7 @@ pub(crate) fn analysis_actions_methods_dynamic_output(methods: &mut MethodsBuild
             outputs,
             static_fields: DynamicLambdaStaticFields {
                 artifact_values,
-                dynamic_values: Box::new([]),
+                dynamic_values: MiniBoxSlice::new(),
                 execution_platform,
             },
         };
@@ -250,7 +256,7 @@ pub(crate) fn analysis_actions_methods_dynamic_output(methods: &mut MethodsBuild
 
         attr_values.bind(&key)?;
 
-        let outputs = attr_values.outputs();
+        let outputs = attr_values.outputs()?;
         let artifact_values = attr_values.artifact_values();
         let dynamic_values = attr_values.dynamic_values();
 

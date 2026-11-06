@@ -22,7 +22,6 @@ use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::soft_error;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_error::BuckErrorContext;
 use buck2_hash::BuckMutInsertionSet;
@@ -46,7 +45,7 @@ use starlark::values::Heap;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueOf;
-use starlark::values::list::UnpackList;
+use starlark::values::list::ListType;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::bxl::starlark_defs::context::BxlContext;
@@ -145,14 +144,14 @@ pub(crate) enum ConfiguredTargetNodeArg<'v> {
 #[derive(StarlarkTypeRepr, UnpackValue)]
 pub(crate) enum TargetSetOrTargetList<'v> {
     TargetSet(&'v StarlarkTargetSet<TargetNode>),
-    TargetList(UnpackList<ValueOf<'v, TargetNodeOrTargetLabelOrStr<'v>>>),
+    TargetList(ValueOf<'v, ListType<ValueOf<'v, TargetNodeOrTargetLabelOrStr<'v>>>>),
 }
 
 #[derive(StarlarkTypeRepr, UnpackValue)]
 pub(crate) enum ConfiguredTargetListArg<'v> {
     ConfiguredTargetSet(&'v StarlarkTargetSet<ConfiguredTargetNode>),
     TargetSet(&'v StarlarkTargetSet<TargetNode>),
-    TargetList(UnpackList<ConfiguredTargetNodeArg<'v>>),
+    TargetList(ValueOf<'v, ListType<ConfiguredTargetNodeArg<'v>>>),
 }
 
 #[derive(StarlarkTypeRepr, UnpackValue)]
@@ -212,10 +211,6 @@ pub(crate) enum TargetExprError {
         "Expected a single target like item, but was `{0}`. If you have passed in a `label`, make sure to call `configured_target()` to get the underlying configured target label."
     )]
     NotATarget(String),
-    #[error(
-        "Unconfigured target with label `{0}` was passed into cquery. Targets passed into cquery should be configured (recommendation is to use `ctx.target_universe()`)."
-    )]
-    UnconfiguredTargetInCquery(String),
 }
 
 impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
@@ -274,35 +269,21 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
         global_cfg_options: &GlobalCfgOptions,
         ctx: &BxlContext<'v>,
         dice: &mut DiceComputations<'_>,
-        allow_unconfigured: bool,
         keep_going: bool,
     ) -> buck2_error::Result<TargetListExpr<'v, ConfiguredTargetNode>> {
         match arg {
             ConfiguredTargetListExprArg::Target(arg) => {
-                Self::unpack_literal(
-                    arg,
-                    global_cfg_options,
-                    ctx,
-                    dice,
-                    allow_unconfigured,
-                    keep_going,
-                )
-                .await
+                Self::unpack_literal(arg, global_cfg_options, ctx, dice, keep_going).await
             }
             ConfiguredTargetListExprArg::List(arg) => {
-                Self::unpack_iterable(
-                    arg,
-                    global_cfg_options,
-                    ctx,
-                    dice,
-                    allow_unconfigured,
-                    keep_going,
-                )
-                .await
+                Self::unpack_iterable(arg, global_cfg_options, ctx, dice, keep_going).await
             }
         }
     }
 
+    /// FIXME(JakobDegen): The cquery callers of this should reject an unconfigured target that
+    /// arrives without a target platform instead of configuring it with the default one;
+    /// `configured_targets()` is the caller that legitimately accepts them.
     pub(crate) async fn unpack(
         // TODO(nga): this does not accept unconfigured targets, so should be narrower type here.
         arg: ConfiguredTargetListExprArg<'v>,
@@ -310,34 +291,7 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
         ctx: &BxlContext<'v>,
         dice: &mut DiceComputations<'_>,
     ) -> buck2_error::Result<TargetListExpr<'v, ConfiguredTargetNode>> {
-        Self::unpack_opt(arg, global_cfg_options, ctx, dice, false, false).await
-    }
-
-    pub(crate) async fn unpack_allow_unconfigured(
-        arg: ConfiguredTargetListExprArg<'v>,
-        global_cfg_options: &GlobalCfgOptions,
-        ctx: &BxlContext<'v>,
-        dice: &mut DiceComputations<'_>,
-    ) -> buck2_error::Result<TargetListExpr<'v, ConfiguredTargetNode>> {
-        Self::unpack_opt(arg, global_cfg_options, ctx, dice, true, false).await
-    }
-
-    fn check_allow_unconfigured(
-        allow_unconfigured: bool,
-        unconfigured_label: &str,
-        global_cfg_options: &GlobalCfgOptions,
-    ) -> buck2_error::Result<()> {
-        if !allow_unconfigured {
-            if global_cfg_options.target_platform.is_none() {
-                soft_error!(
-                    "bxl_unconfigured_target_in_cquery",
-                    TargetExprError::UnconfiguredTargetInCquery(unconfigured_label.to_owned())
-                        .into(),
-                    error_on_oss: true
-                )?;
-            }
-        }
-        Ok(())
+        Self::unpack_opt(arg, global_cfg_options, ctx, dice, false).await
     }
 
     /// When `keep_going` is true, resolution errors cause the target to be
@@ -348,7 +302,6 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
         global_cfg_options: &GlobalCfgOptions,
         ctx: &BxlContext<'_>,
         dice: &mut DiceComputations<'_>,
-        allow_unconfigured: bool,
         keep_going: bool,
     ) -> buck2_error::Result<TargetListExpr<'v, ConfiguredTargetNode>> {
         let result = match arg {
@@ -359,21 +312,12 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
                 TargetListExpr::One(TargetExpr::Label(Cow::Borrowed(configured_target.label()))),
             ),
             ConfiguredTargetNodeArg::Str(s) => {
-                Self::check_allow_unconfigured(allow_unconfigured, s, global_cfg_options)?;
                 Self::unpack_string_literal(s, global_cfg_options, ctx, dice, keep_going).await
             }
-            ConfiguredTargetNodeArg::Unconfigured(label) => {
-                Self::check_allow_unconfigured(
-                    allow_unconfigured,
-                    &label.label().to_string(),
-                    global_cfg_options,
-                )?;
-                dice.get_configured_target(label.label(), global_cfg_options)
-                    .await
-                    .map(|configured| {
-                        TargetListExpr::One(TargetExpr::Label(Cow::Owned(configured)))
-                    })
-            }
+            ConfiguredTargetNodeArg::Unconfigured(label) => dice
+                .get_configured_target(label.label(), global_cfg_options)
+                .await
+                .map(|configured| TargetListExpr::One(TargetExpr::Label(Cow::Owned(configured)))),
         };
 
         if !keep_going {
@@ -461,21 +405,15 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
         global_cfg_options: &GlobalCfgOptions,
         ctx: &BxlContext<'_>,
         dice: &mut DiceComputations<'_>,
-        allow_unconfigured: bool,
         keep_going: bool,
     ) -> buck2_error::Result<TargetListExpr<'v, ConfiguredTargetNode>> {
-        match value.typed {
+        match value.try_unpack()? {
             ConfiguredTargetListArg::ConfiguredTargetSet(s) => {
                 Ok(Self::TargetSet(Cow::Borrowed(s)))
             }
             ConfiguredTargetListArg::TargetSet(s) => {
                 let results: Vec<ResultMaybeCompatible<ConfiguredTargetNode>> = dice
                     .compute_join(s.0.iter(), async |dice, node| {
-                        Self::check_allow_unconfigured(
-                            allow_unconfigured,
-                            &node.label().to_string(),
-                            global_cfg_options,
-                        )?;
                         let label = dice
                             .get_configured_target(node.label(), global_cfg_options)
                             .await?;
@@ -494,21 +432,16 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
                 // FIXME(JakobDegen): These iterations don't run in parallel, which is pretty sad.
                 // Unfortunately, that's also not easy to fix because for some reason this code
                 // prints to console
-                for item in unpack.items {
-                    let unpacked = match Self::unpack_literal(
-                        item,
-                        global_cfg_options,
-                        ctx,
-                        dice,
-                        allow_unconfigured,
-                        keep_going,
-                    )
-                    .await
-                    {
-                        Ok(expr) => expr,
-                        Err(_) if keep_going => continue,
-                        Err(e) => return Err(e),
-                    };
+                for item in unpack.try_items() {
+                    let item = item?;
+                    let unpacked =
+                        match Self::unpack_literal(item, global_cfg_options, ctx, dice, keep_going)
+                            .await
+                        {
+                            Ok(expr) => expr,
+                            Err(_) if keep_going => continue,
+                            Err(e) => return Err(e),
+                        };
 
                     match unpacked {
                         TargetListExpr::One(node) => resolved.push(node),
@@ -522,10 +455,10 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
                                 resolved.extend(items);
                             } else {
                                 let error: buck2_error::Error =
-                                    TargetExprError::NotATarget(value.value.to_repr()).into();
+                                    TargetExprError::NotATarget(value.to_value().to_repr()).into();
                                 return Err(error.context(format!(
                                     "Error resolving list `{}`",
-                                    truncate(&value.value.to_repr(), 150)
+                                    truncate(&value.to_value().to_repr(), 150)
                                 )));
                             }
                         }
@@ -600,8 +533,9 @@ impl<'v> TargetListExpr<'v, TargetNode> {
             TargetSetOrTargetList::TargetList(items) => {
                 let mut resolved = vec![];
 
-                for item in items.items {
-                    let unpacked = Self::unpack_literal(item.typed, ctx, dice).await?;
+                for item in items.try_items() {
+                    let item = item?;
+                    let unpacked = Self::unpack_literal(item.unpack(), ctx, dice).await?;
 
                     match unpacked {
                         TargetListExpr::One(node) => resolved.push(node),
@@ -611,7 +545,7 @@ impl<'v> TargetListExpr<'v, TargetNode> {
                         }
                         .for_each(|t| resolved.push(TargetExpr::Node(t))),
                         TargetListExpr::Iterable(_) => {
-                            return Err(TargetExprError::NotATarget(item.value.to_repr()))
+                            return Err(TargetExprError::NotATarget(item.to_value().to_repr()))
                                 .buck_error_context("list in a list");
                         }
                     }
@@ -877,8 +811,8 @@ pub(crate) enum OwnedTargetListExprArg {
 }
 
 impl OwnedTargetListExprArg {
-    pub(crate) fn from_ref(expr: &TargetListExprArg<'_>) -> Self {
-        match expr {
+    pub(crate) fn from_ref(expr: &TargetListExprArg<'_>) -> buck2_error::Result<Self> {
+        Ok(match expr {
             TargetListExprArg::Target(target) => {
                 OwnedTargetListExprArg::Target(OwnedTargetNodeArg::from_ref(target))
             }
@@ -888,14 +822,13 @@ impl OwnedTargetListExprArg {
                 }
                 TargetSetOrTargetList::TargetList(list) => {
                     let owned_targets = list
-                        .items
-                        .iter()
-                        .map(|item| OwnedTargetNodeArg::from_ref(&item.typed))
-                        .collect();
+                        .try_items()
+                        .map(|item| buck2_error::Ok(OwnedTargetNodeArg::from_ref(&item?.unpack())))
+                        .collect::<buck2_error::Result<_>>()?;
                     OwnedTargetListExprArg::TargetList(owned_targets)
                 }
             },
-        }
+        })
     }
 
     pub(crate) async fn to_unconfigured_target_set(

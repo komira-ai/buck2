@@ -55,7 +55,7 @@ load(
     "get_default_info",
     "get_java_version_attributes",
 )
-load("@prelude//jvm:attrs.bzl", "dex_min_sdk_version", "jvm_common")
+load("@prelude//jvm:attrs.bzl", "jvm_common", "min_sdk_version")
 load("@prelude//jvm:nullsafe.bzl", "get_nullsafe_info")
 load(
     "@prelude//kotlin:kotlin_toolchain.bzl",
@@ -349,6 +349,15 @@ def get_language_version_arg(ctx: AnalysisContext) -> list[str]:
     language_version = get_language_version(ctx)
     return ["-language-version=" + language_version]
 
+def _kotlinc_arg_text(arg) -> str:
+    """The text kotlincd gives kotlinc for one `extra_kotlinc_arguments`
+    element: KotlinCStepsBuilder passes each element unchanged. `str()` of an
+    `attrs.arg()` value is that text in one pair of double quotes, with a
+    macro written as `$(location ...)`."""
+    if isinstance(arg, str):
+        return arg
+    return str(arg)[1:-1]
+
 def filter_out_language_version(extra_arguments: list) -> list:
     return [arg for arg in extra_arguments if not (isinstance(arg, str) and "-language-version" in arg)]
 
@@ -401,6 +410,10 @@ def build_kotlin_library(
 ) -> JavaProviders:
     srcs = ctx.attrs.srcs
     has_kotlin_srcs = lazy.is_any(lambda src: src.extension == ".kt" or src.basename.endswith(".src.zip") or src.basename.endswith("-sources.jar"), srcs)
+    kotlin_toolchain = ctx.attrs._kotlin_toolchain[KotlinToolchainInfo]
+    abi_generation_mode = get_abi_generation_mode(ctx.attrs.abi_generation_mode)
+    if abi_generation_mode == AbiGenerationMode("source_only") and kotlin_toolchain.kosabi_stubs_gen_k2_plugin == None:
+        abi_generation_mode = AbiGenerationMode("class")
 
     if not has_kotlin_srcs:
         return build_java_library(
@@ -408,8 +421,7 @@ def build_kotlin_library(
             ctx.attrs.srcs,
             custom_jdk_info = custom_jdk_info,
             additional_classpath_entries = additional_classpath_entries,
-            # Match buck1, which always does class ABI generation for Kotlin targets unless explicitly specified.
-            override_abi_generation_mode = get_abi_generation_mode(ctx.attrs.abi_generation_mode) or AbiGenerationMode("class"),
+            override_abi_generation_mode = abi_generation_mode or AbiGenerationMode("class"),
             extra_sub_targets = extra_sub_targets,
             validation_deps_outputs = validation_deps_outputs,
             extra_arguments = extra_arguments,
@@ -440,7 +452,6 @@ def build_kotlin_library(
         javac_tool = derive_javac(ctx.attrs.javac) if getattr(ctx.attrs, "javac", None) else None
         source_level, target_level = get_java_version_attributes(ctx)
 
-        kotlin_toolchain = ctx.attrs._kotlin_toolchain[KotlinToolchainInfo]
         if javac_tool or kotlin_toolchain.kotlinc_protocol == "classic":
             kotlinc_classes, kapt_generated_sources, ksp_generated_sources = _create_kotlin_sources(
                 ctx,
@@ -513,7 +524,6 @@ def build_kotlin_library(
                 hidden = validation_deps_outputs or [],
             )
 
-            abi_generation_mode = get_abi_generation_mode(ctx.attrs.abi_generation_mode)
             kosabi_applicability_runs = abi_generation_mode == AbiGenerationMode("source_only") and kotlin_toolchain.kosabi_applicability_plugin != None
             # Applicability verdicts need whole-target analysis; incremental frontends can omit findings from unchanged files.
             incremental = ctx.attrs.incremental and not kosabi_applicability_runs
@@ -606,6 +616,7 @@ def build_kotlin_library(
                     generated_sources,
                     annotation_processor_properties,
                     ksp_annotation_processor_properties,
+                    target_level,
                 )
 
             class_to_src_map, sources_jar, class_to_src_map_sub_targets = get_class_to_source_map_info(
@@ -773,6 +784,7 @@ def _typecheck_subtarget(
     generated_sources: list[Artifact],
     annotation_processor_properties,
     ksp_annotation_processor_properties,
+    target_level: int,
 ) -> dict:
     if not kotlin_toolchain.typechecker_enabled:
         return extra_sub_targets
@@ -829,13 +841,14 @@ def _typecheck_subtarget(
     # would only make this action wait for kotlincd.
     checked_generated_sources = generated_sources if has_processors else []
 
-    # extra_kotlinc_arguments holds attrs.arg() objects, not strings (compare
-    # the str(arg) inspection in get_language_version above). Normalize each
-    # element (strip whitespace/quotes) and compare exactly: a substring
-    # test would false-match -Werror inside unrelated values.
+    # kotlinc matches a flag on the exact text of its argument, so each
+    # decision below reads an element's text as kotlinc receives it. A
+    # substring test would false-match -Werror inside unrelated values, and
+    # `"-Werror"` (quotes included) or ` -Werror` is a source path to kotlinc,
+    # not -Werror.
     def has_flag(*names):
         return lazy.is_any(
-            lambda a: str(a).strip().strip('"') in names,
+            lambda a: _kotlinc_arg_text(a) in names,
             ctx.attrs.extra_kotlinc_arguments or [],
         )
 
@@ -847,11 +860,29 @@ def _typecheck_subtarget(
     # kotlinc reports, so the checker must see them too.
     warning_levels = []
     for a in ctx.attrs.extra_kotlinc_arguments or []:
-        flag = str(a).strip().strip('"')
+        flag = _kotlinc_arg_text(a)
         if flag.startswith("-Xwarning-level="):
             warning_levels.append(flag[len("-Xwarning-level=") :])
         elif flag.startswith("-Xsuppress-warning="):
             warning_levels.append(flag[len("-Xsuppress-warning=") :] + ":disabled")
+
+    # Every other kotlinc argument reaches the checker, in the order kotlincd
+    # passes them (KotlinCStepsBuilder.getKotlincExtraArguments), so repeated
+    # flags resolve the same: each compiler plugin's options, the JVM target,
+    # -Xjspecify-annotations=strict (both compile paths add it), then
+    # extra_kotlinc_arguments without the flags handled above, each with the
+    # text it was tested on. A `__codegen_dir__` option value passes as the
+    # literal: the checker runs no plugin and writes no plugin output.
+    kotlinc_args = []
+    for plugin, options in ctx.attrs.kotlin_compiler_plugins:
+        if options and not _is_ksp_plugin(str(plugin)):
+            kotlinc_args += ["-P", ",".join(["{}={}".format(key, value) for key, value in options.items()])]
+    kotlinc_args += ["-jvm-target", get_kotlinc_compatible_target(str(target_level)), "-Xjspecify-annotations=strict"]
+    for a in ctx.attrs.extra_kotlinc_arguments or []:
+        flag = _kotlinc_arg_text(a)
+        handled = flag in ("-Werror", "-nowarn", "-W") or "-language-version" in flag
+        if not handled and not flag.startswith("-Xwarning-level=") and not flag.startswith("-Xsuppress-warning="):
+            kotlinc_args.append(a)
 
     report = ctx.actions.declare_output("typecheck_report.json")
     args = cmd_args([
@@ -873,6 +904,8 @@ def _typecheck_subtarget(
         args.add("--nowarn")
     for level in warning_levels:
         args.add(["--warning-level", level])
+    for a in kotlinc_args:
+        args.add(cmd_args("--kotlinc-arg=", a, delimiter = ""))
     if has_plugins:
         args.add("--plugins")
 
@@ -1007,6 +1040,7 @@ kotlin_library = prelude_rule(
             "keep_synthetics_in_class_abi": attrs.option(attrs.bool(), default = None),
             "manifest_file": attrs.option(attrs.source(), default = None),
             "maven_coords": attrs.option(attrs.string(), default = None),
+            "min_sdk_version": attrs.default_only(attrs.option(attrs.int(), default = min_sdk_version())),
             "proguard_config": attrs.option(attrs.source(), default = None),
             "required_for_source_only_abi": attrs.bool(default = False),
             "resources_root": attrs.option(attrs.string(), default = None),
@@ -1016,7 +1050,6 @@ kotlin_library = prelude_rule(
             "target": attrs.option(attrs.string(), default = None),
             VALIDATION_DEPS_ATTR_NAME: attrs.set(attrs.dep(), sorted = True, default = []),
             "_build_only_native_code": attrs.default_only(attrs.bool(default = is_build_only_native_code())),
-            "_dex_min_sdk_version": attrs.option(attrs.int(), default = dex_min_sdk_version()),
             "_dex_toolchain": toolchains_common.dex(),
             "_exec_os_type": buck.exec_os_type_arg(),
             "_is_building_android_binary": is_building_android_binary_attr(),

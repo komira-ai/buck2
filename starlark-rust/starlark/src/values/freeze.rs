@@ -44,8 +44,11 @@ use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 
+use either::Either;
 use mini_map::MiniMutInsertionMap;
 use mini_map::MiniMutInsertionSet;
+use mini_vec::MiniBoxSlice;
+use mini_vec::MiniVec;
 use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
@@ -290,6 +293,34 @@ where
     }
 }
 
+impl<'v, T> Freeze<'v> for MiniVec<T>
+where
+    T: Freeze<'v>,
+{
+    type Frozen<'fv> = MiniVec<T::Frozen<'fv>>;
+
+    fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
+        // Not `collect`: its `size_hint` through `Result` has a zero lower bound, which would
+        // leave growth slack behind in the frozen heap.
+        let mut frozen = MiniVec::with_capacity(self.len());
+        for v in self {
+            frozen.push(v.freeze(freezer)?);
+        }
+        Ok(frozen)
+    }
+}
+
+impl<'v, T> Freeze<'v> for MiniBoxSlice<T>
+where
+    T: Freeze<'v>,
+{
+    type Frozen<'fv> = MiniBoxSlice<T::Frozen<'fv>>;
+
+    fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
+        Ok(MiniBoxSlice::from(MiniVec::from(self).freeze(freezer)?))
+    }
+}
+
 impl<'v, T> Freeze<'v> for Option<T>
 where
     T: Freeze<'v>,
@@ -390,6 +421,17 @@ where
             new.insert_hashed_unique_unchecked(value);
         }
         Ok(new)
+    }
+}
+
+impl<'v, L: Freeze<'v>, R: Freeze<'v>> Freeze<'v> for Either<L, R> {
+    type Frozen<'fv> = Either<L::Frozen<'fv>, R::Frozen<'fv>>;
+
+    fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
+        match self {
+            Either::Left(l) => Ok(Either::Left(l.freeze(freezer)?)),
+            Either::Right(r) => Ok(Either::Right(r.freeze(freezer)?)),
+        }
     }
 }
 

@@ -84,8 +84,6 @@ use crate::values::layout::heap::repr::AValueHeapEntryState;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::layout::pointer::Pointer;
 use crate::values::layout::pointer::RawPointer;
-use crate::values::layout::static_string::VALUE_EMPTY_STRING;
-use crate::values::layout::vtable::AValueDyn;
 use crate::values::layout::vtable::AValueDynFull;
 use crate::values::layout::vtable::AValueVTable;
 use crate::values::list::value::VALUE_EMPTY_FROZEN_LIST;
@@ -298,12 +296,6 @@ impl<'v> Value<'v> {
         Self::new_int(InlineInt::try_from(x).ok().unwrap())
     }
 
-    /// Create a new blank string.
-    #[inline]
-    pub(crate) fn new_empty_string() -> Self {
-        VALUE_EMPTY_STRING.erase().at().to_value()
-    }
-
     /// Create a new empty tuple.
     #[inline]
     pub(crate) fn new_empty_tuple() -> Self {
@@ -470,16 +462,13 @@ impl<'v> Value<'v> {
 
     /// Get a pointer to a [`AValue`].
     #[inline]
-    pub(crate) fn get_ref(self) -> AValueDyn<'v> {
-        match self.0.unpack() {
+    pub(crate) fn get_ref(self) -> AValueDynFull<'v> {
+        let avalue = match self.0.unpack() {
             Either::Left(x) => x.unpack(),
             Either::Right(x) => x.as_avalue_dyn(),
-        }
-    }
-
-    #[inline]
-    fn get_ref_full(self) -> AValueDynFull<'v> {
-        unsafe { AValueDynFull::new(self.get_ref(), self) }
+        };
+        // SAFETY: `avalue` was just read from `self`.
+        unsafe { AValueDynFull::new(avalue, self) }
     }
 
     #[inline]
@@ -690,7 +679,7 @@ impl<'v> Value<'v> {
         // Note `int` is not `ptr_eq` because `int` can be equal to `float`.
 
         // If a value does not override equality, it is `ptr_eq`.
-        !self.get_ref().vtable().starlark_value.HAS_equals
+        !self.get_ref().vtable().starlark_value.ty.HAS_equals
             // Strings of length <= 1 are statically allocated.
             || matches!(self.unpack_str(), Some(s) if s.len() <= 1)
             // Empty tuple is statically allocated.
@@ -703,9 +692,7 @@ impl<'v> Value<'v> {
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
-        eval.with_call_stack(self, location, |eval| {
-            self.get_ref_full().invoke(args, eval)
-        })
+        eval.with_call_stack(self, location, |eval| self.get_ref().invoke(args, eval))
     }
 
     /// Callable parameters if known.
@@ -752,7 +739,7 @@ impl<'v> Value<'v> {
     }
 
     fn check_callable(self) -> crate::Result<()> {
-        if !self.vtable().starlark_value.HAS_invoke {
+        if !self.vtable().starlark_value.ty.HAS_invoke {
             return Err(value_error!(
                 "Value is not callable: {}",
                 self.to_string_for_type_error()
@@ -840,8 +827,8 @@ impl<'v> Value<'v> {
         self.vtable().type_starlark_repr()
     }
 
-    /// Add two [`Value`]s together. Will first try using [`add`](StarlarkValue::add),
-    /// before falling back to [`radd`](StarlarkValue::radd).
+    /// Add two [`Value`]s together. Will first try using [`add`](crate::values::StarlarkType::add),
+    /// before falling back to [`radd`](crate::values::StarlarkType::radd).
     pub fn add(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         // Fast special case for ints.
         if let Some(ls) = self.unpack_inline_int() {
@@ -911,17 +898,17 @@ impl<'v> Value<'v> {
         serde_json::to_value(self).map_err(|e| anyhow::anyhow!(e))
     }
 
-    /// Forwards to [`StarlarkValue::set_attr`].
+    /// Forwards to [`StarlarkType::set_attr`](crate::values::StarlarkType::set_attr).
     pub fn set_attr(self, attribute: &str, alloc_value: Value<'v>) -> crate::Result<()> {
         self.get_ref().set_attr(attribute, alloc_value)
     }
 
-    /// Forwards to [`StarlarkValue::set_at`].
+    /// Forwards to [`StarlarkType::set_at`](crate::values::StarlarkType::set_at).
     pub fn set_at(self, index: Value<'v>, alloc_value: Value<'v>) -> crate::Result<()> {
         self.get_ref().set_at(index, alloc_value)
     }
 
-    /// Forwards to [`StarlarkValue::documentation`].
+    /// Forwards to [`StarlarkType::documentation`](crate::values::StarlarkType::documentation).
     pub fn documentation(self) -> DocItem {
         self.get_ref().documentation()
     }
@@ -1013,6 +1000,7 @@ impl<'v> Value<'v> {
 
     /// Get a reference to underlying data or [`None`]
     /// if contained object has different type than requested.
+    #[inline]
     pub fn downcast_ref<T: StarlarkValue<'v>>(self) -> Option<&'v T> {
         if T::static_type_id() == StarlarkStr::static_type_id() {
             if self.is_str() {

@@ -223,6 +223,7 @@ load(
 load(
     ":link_groups.bzl",
     "BuildLinkGroupsContext",
+    "LINK_GROUPS_INFO_SUB_TARGET",
     "LINK_GROUP_MAP_DATABASE_SUB_TARGET",
     "collect_linkables",
     "get_filtered_labels_to_links_map",
@@ -232,6 +233,7 @@ load(
     "get_link_group_info",
     "get_link_group_map_json",
     "get_link_group_preferred_linkage",
+    "get_link_groups_info_json",
 )
 load(
     ":link_types.bzl",
@@ -524,7 +526,7 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
 
     preferred_linkage = cxx_attr_preferred_linkage(ctx)
 
-    exported_needs_coverage = build_exported_needs_coverage(ctx, deps_all_exported_first)
+    compilation_needs_coverage = build_exported_needs_coverage(ctx, deps_all_exported_first)
     compiled_srcs = cxx_compile_srcs(
         actions = ctx.actions,
         target_label = ctx.label,
@@ -536,11 +538,18 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
         inherited_exported_preprocessor_infos = inherited_exported_preprocessor_infos,
         preferred_linkage = preferred_linkage,
         compile_pch = compile_pch,
-        add_coverage_instrumentation_compiler_flags = needs_coverage(exported_needs_coverage),
+        add_coverage_instrumentation_compiler_flags = needs_coverage(compilation_needs_coverage),
     )
 
     sub_targets = {}
     providers = []
+
+    for name, preprocessor in (
+        ("private-header-map", own_non_exported_preprocessor_info),
+        ("exported-header-map", own_exported_preprocessor_info),
+    ):
+        for header_map in preprocessor.args.header_maps:
+            sub_targets[name] = [DefaultInfo(default_output = header_map)]
 
     attr_validation_specs = get_attrs_validation_specs(ctx)
     if attr_validation_specs:
@@ -587,6 +596,11 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
 
         providers.append(pch_provider)
 
+    # Callers see exported headers; PCHs and reexport_all_header_dependencies can also expose private headers.
+    if impl_params.coverage_profile_list_srcs and not compile_pch and not impl_params.precompiled_header and not _attr_reexport_all_header_dependencies(ctx):
+        exported_needs_coverage = build_exported_needs_coverage(ctx, exported_deps)
+    else:
+        exported_needs_coverage = compilation_needs_coverage
     providers.append(exported_needs_coverage)
 
     if len(ctx.attrs.tests) > 0 and impl_params.generate_providers.preprocessor_for_tests:
@@ -772,9 +786,12 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
         frameworks_linkable,
         swiftmodule_linkable,
         force_static_follows_dependents = impl_params.link_groups_force_static_follows_dependents,
+        link_groups_info_extras = impl_params.generate_sub_targets.xcode_data,
     )
     if impl_params.generate_sub_targets.link_group_map and shared_library_links.link_group_map_database:
         sub_targets[LINK_GROUP_MAP_DATABASE_SUB_TARGET] = [shared_library_links.link_group_map_database]
+    if shared_library_links.link_groups_info:
+        sub_targets[LINK_GROUPS_INFO_SUB_TARGET] = [shared_library_links.link_groups_info]
 
     extra_static_linkables = []
     if frameworks_linkable:
@@ -2102,6 +2119,9 @@ _SharedLibraryLinks = record(
     link_args = field(LinkArgs),
     # The `[link-group-map-database]` output of a link group-aware link.
     link_group_map_database = field(DefaultInfo | None),
+    # The `[link-groups-info]` output of a link group-aware link: every
+    # linkable of the shared library's link in link order.
+    link_groups_info = field(DefaultInfo | None),
     link_execution_preference = field(LinkExecutionPreference),
 )
 
@@ -2118,6 +2138,7 @@ def _get_shared_library_links(
     frameworks_linkable: [FrameworksLinkable, None],
     swiftmodule_linkable: [SwiftmoduleLinkable, None],
     force_static_follows_dependents: bool = True,
+    link_groups_info_extras: bool = False,
 ) -> _SharedLibraryLinks:
     """
     Returns the link args of the library's shared output, with the link group
@@ -2161,6 +2182,7 @@ def _get_shared_library_links(
                 swiftmodule_linkable,
             ),
             link_group_map_database = None,
+            link_groups_info = None,
             link_execution_preference = link_execution_preference,
         )
 
@@ -2219,6 +2241,7 @@ def _get_shared_library_links(
     return _SharedLibraryLinks(
         link_args = LinkArgs(infos = filtered_links),
         link_group_map_database = get_link_group_map_json(ctx, filtered_targets),
+        link_groups_info = get_link_groups_info_json(ctx, filtered_labels_to_links.map, link_groups_info_extras),
         link_execution_preference = link_execution_preference,
     )
 

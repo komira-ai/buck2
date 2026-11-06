@@ -6,7 +6,11 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//apple/swift:swift_toolchain_types.bzl", "SwiftObjectFormat")
+load(
+    "@prelude//apple/swift:swift_toolchain_types.bzl",
+    "SwiftObjectFormat",
+    "SwiftToolchainInfo",  # @unused Used as a type
+)
 load("@prelude//apple/swift:swift_types.bzl", "SwiftCompilationModes")
 load(
     "@prelude//cxx:cxx_sources.bzl",
@@ -182,11 +186,11 @@ def should_build_swiftmodule_incrementally(ctx: AnalysisContext) -> bool:
 def get_incremental_remote_outputs_enabled(ctx: AnalysisContext):
     return getattr(ctx.attrs, "incremental_remote_outputs", False)
 
-def get_uses_content_based_paths(ctx):
+def get_uses_content_based_paths(ctx, toolchain: SwiftToolchainInfo | None = None):
     if getattr(ctx.attrs, "has_content_based_path", None) != None:
         return ctx.attrs.has_content_based_path
 
-    toolchain = get_swift_toolchain_info(ctx)
+    toolchain = toolchain or get_swift_toolchain_info(ctx)
     return toolchain.uses_content_based_paths
 
 def _get_incremental_compilation_flags_and_objects(
@@ -325,7 +329,7 @@ def _get_output_file_map(ctx: AnalysisContext, srcs: list[CxxSrcWithFlags]) -> _
             }
             swiftdeps.append(swiftdeps_artifact)
             all_outputs.append(swiftdeps_artifact)
-            if toolchain.use_depsfiles and not get_incremental_file_hashing_enabled(ctx):
+            if toolchain.use_depsfiles and not get_incremental_file_hashing_enabled(ctx) and not get_incremental_split_actions(ctx):
                 deps_artifact = ctx.actions.declare_output("__swift_incremental__/objects/" + file_name + ".d", has_content_based_path = uses_content_based_paths)
                 depfiles.append(deps_artifact)
                 all_outputs.append(deps_artifact)

@@ -19,6 +19,7 @@ buck2_fs.workspace = true
 buck2_hash.workspace = true
 buck2_query.workspace = true
 buck2_query_parser.workspace = true
+buck2_settings.workspace = true
 buck2_util.workspace = true
 cmp_any.workspace = true
 derive_more.workspace = true
@@ -28,6 +29,7 @@ display_container.workspace = true
 dupe.workspace = true
 either.workspace = true
 futures.workspace = true
+hashbrown.workspace = true
 itertools.workspace = true
 memchr.workspace = true
 mini_vec.workspace = true
@@ -41,6 +43,7 @@ starlark_map.workspace = true
 static_interner.workspace = true
 strong_hash.workspace = true
 strsim.workspace = true
+strum.workspace = true
 triomphe.workspace = true
 
 [dev-dependencies]

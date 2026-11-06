@@ -15,124 +15,74 @@
  * limitations under the License.
  */
 
-//! Utility for unpacking a value of type `list[T]` or `tuple[T, ...]` into a vec.
-
-use std::slice;
-use std::vec;
+//! `list[T] | tuple[T, ...]`, the usual type of a parameter that takes a sequence.
 
 use either::Either;
 
-use crate::typing::Ty;
 use crate::values::UnpackValue;
-use crate::values::Value;
-use crate::values::list::UnpackList;
-use crate::values::tuple::UnpackTuple;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::ValueOf;
+use crate::values::list::ListRef;
+use crate::values::list::ListType;
+use crate::values::tuple::TupleType;
 
-/// Unpack a value of type `list[T]` or `tuple[T, ...]` into a vec.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct UnpackListOrTuple<T> {
-    /// Unpacked items of the list or tuple.
-    pub items: Vec<T>,
-}
+/// `list[T] | tuple[T, ...]`, the usual type of a parameter that takes a sequence of `T`.
+pub type ListOrTupleType<T> = Either<ListType<T>, TupleType<T>>;
 
-impl<T> Default for UnpackListOrTuple<T> {
-    fn default() -> Self {
-        UnpackListOrTuple { items: Vec::new() }
-    }
-}
-
-impl<T: StarlarkTypeRepr> StarlarkTypeRepr for UnpackListOrTuple<T> {
-    type Canonical = <Either<UnpackList<T>, UnpackTuple<T>> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        Either::<UnpackList<T>, UnpackTuple<T>>::starlark_type_repr()
-    }
-}
-
-impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for UnpackListOrTuple<T> {
-    type Error = <T as UnpackValue<'v>>::Error;
-
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        match Either::<UnpackList<T>, UnpackTuple<T>>::unpack_value_impl(value)
-            .map_err(|e| e.into_inner())?
-        {
-            Some(Either::Left(l)) => Ok(Some(UnpackListOrTuple { items: l.items })),
-            Some(Either::Right(r)) => Ok(Some(UnpackListOrTuple { items: r.items })),
-            None => Ok(None),
+impl<'v, T: UnpackValue<'v>> ValueOf<'v, ListOrTupleType<T>> {
+    /// The items, as [`ValueOf<ListType<T>>::iter`](ValueOf::iter) or
+    /// [`ValueOf<TupleType<T>>::iter`](ValueOf::iter) gives them.
+    pub fn iter(self) -> impl Iterator<Item = crate::Result<ValueOf<'v, T>>> + 'v {
+        let value = self.to_value();
+        // A list and a tuple are different representations, so which side this is cannot
+        // change; the items are re-checked by that side's `iter` as for any sequence.
+        if ListRef::from_value(value).is_some() {
+            Either::Left(ValueOf::<ListType<T>>::new_unchecked(value).iter())
+        } else {
+            Either::Right(ValueOf::<TupleType<T>>::new_unchecked(value).iter())
         }
     }
-}
 
-impl<T> IntoIterator for UnpackListOrTuple<T> {
-    type Item = T;
-    type IntoIter = vec::IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter()
+    /// The items, unpacked, as [`ValueOf<ListType<T>>::try_items`](ValueOf::try_items) or
+    /// [`ValueOf<TupleType<T>>::try_items`](ValueOf::try_items) gives them.
+    pub fn try_items(self) -> impl Iterator<Item = crate::Result<T>> + 'v
+    where
+        T: 'v,
+    {
+        let value = self.to_value();
+        if ListRef::from_value(value).is_some() {
+            Either::Left(ValueOf::<ListType<T>>::new_unchecked(value).try_items())
+        } else {
+            Either::Right(ValueOf::<TupleType<T>>::new_unchecked(value).try_items())
+        }
     }
-}
 
-impl<'a, T> IntoIterator for &'a UnpackListOrTuple<T> {
-    type Item = &'a T;
-    type IntoIter = slice::Iter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.iter()
-    }
-}
-
-impl<'a, T> IntoIterator for &'a mut UnpackListOrTuple<T> {
-    type Item = &'a mut T;
-    type IntoIter = slice::IterMut<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.iter_mut()
+    /// The items, unpacked into a `Vec`, as [`try_items`](Self::try_items) gives them.
+    pub fn try_to_vec(self) -> crate::Result<Vec<T>>
+    where
+        T: 'v,
+    {
+        self.try_items().collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::values::Heap;
-    use crate::values::UnpackValue;
-    use crate::values::types::list_or_tuple::UnpackListOrTuple;
+    use crate::values::Value;
+    use crate::values::ValueOf;
+    use crate::values::list_or_tuple::ListOrTupleType;
 
     #[test]
     fn test_unpack() {
+        fn unpack<'v>(v: Value<'v>) -> Option<Vec<&'v str>> {
+            ValueOf::<ListOrTupleType<&'v str>>::new(v).map(|v| v.try_to_vec().unwrap())
+        }
         Heap::temp(|heap| {
-            let list = heap.alloc(vec!["a", "b"]);
-            let tuple = heap.alloc(("a", "b"));
-            let list_of_ints = heap.alloc(vec![1, 2]);
-            let tuple_of_ints = heap.alloc((1, 2));
-            assert_eq!(
-                vec!["a", "b"],
-                UnpackListOrTuple::<&str>::unpack_value(list)
-                    .unwrap()
-                    .unwrap()
-                    .items
-            );
-            assert_eq!(
-                vec!["a", "b"],
-                UnpackListOrTuple::<&str>::unpack_value(tuple)
-                    .unwrap()
-                    .unwrap()
-                    .items
-            );
-            assert!(
-                UnpackListOrTuple::<&str>::unpack_value(list_of_ints)
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                UnpackListOrTuple::<&str>::unpack_value(tuple_of_ints)
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                UnpackListOrTuple::<&str>::unpack_value(heap.alloc(1))
-                    .unwrap()
-                    .is_none()
-            );
+            assert_eq!(Some(vec!["a", "b"]), unpack(heap.alloc(vec!["a", "b"])));
+            assert_eq!(Some(vec!["a", "b"]), unpack(heap.alloc(("a", "b"))));
+            assert_eq!(None, unpack(heap.alloc(vec![1, 2])));
+            assert_eq!(None, unpack(heap.alloc((1, 2))));
+            assert_eq!(None, unpack(heap.alloc(1)));
         });
     }
 }

@@ -31,6 +31,7 @@ use artifact_tree::ArtifactMaterializationMethod;
 use artifact_tree::ArtifactMaterializationStage;
 use artifact_tree::ProcessingFuture;
 use async_trait::async_trait;
+use buck2_common::cancellation::CancellationScope;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
@@ -43,6 +44,7 @@ use buck2_directory::directory::directory_iterator::DirectoryIteratorPathStack;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::unordered_entry_walk;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::current_span;
 use buck2_events::dispatch::get_dispatcher;
@@ -60,6 +62,7 @@ use buck2_execute::materialize::materializer::CleanStaleArtifactsArgs;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
+use buck2_execute::materialize::materializer::HeldContent;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
@@ -133,6 +136,10 @@ pub struct DeferredMaterializerAccessor<T: IoHandler + 'static> {
     #[allocative(skip)]
     #[cfg_attr(not(test), expect(dead_code))]
     command_thread: Option<std::thread::JoinHandle<()>>,
+    #[allocative(skip)]
+    cancellation: Arc<CancellationScope>,
+    #[allocative(skip)]
+    runtime: Handle,
     /// Whether final outputs that are not required get materialized at all.
     materialize_final_artifacts: bool,
     defer_write_actions: bool,
@@ -219,8 +226,14 @@ pub type NoDiskDeferredMaterializer = DeferredMaterializerAccessor<NoDiskIoHandl
 
 impl<T: IoHandler> Drop for DeferredMaterializerAccessor<T> {
     fn drop(&mut self) {
-        // We don't try to stop the underlying thread, since in practice when we drop the
-        // DeferredMaterializer we are about to just terminate the process.
+        self.cancellation.cancel();
+        let cancellation = self.cancellation.clone();
+        let io = self.io.dupe();
+        let _cleanup = self.runtime.spawn(async move {
+            cancellation.wait().await;
+            drop(io);
+        });
+        let _ignored = self.command_sender.send(MaterializerCommand::Abort);
     }
 }
 
@@ -277,6 +290,10 @@ pub struct DeferredMaterializerConfigs {
     /// Whether the files a materializer tracks are read-only from the moment it tracks them
     /// (`buck2.readonly_outputs`).
     pub readonly_outputs: bool,
+    /// Removes a tracked intermediate root from disk the moment its last lease is released, so
+    /// that a reader that outlives its lease fails where it would otherwise work by luck. For
+    /// buck2's own tests of the disk-state core; the deferred core ignores it.
+    pub strict_leases: bool,
 }
 
 pub struct TtlRefreshConfiguration {
@@ -439,7 +456,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         MaterializerBackgroundCleanupGuard::new(guard)
     }
 
-    async fn declare_existing_impl(
+    async fn declare_existing(
         &self,
         _lease: &WriteLease,
         artifacts: Vec<DeclareArtifactPayload>,
@@ -458,7 +475,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
 
     /// Requires the artifacts to have been declared, as every caller does today; the values are
     /// carried for the materializer that consumes them, this one only ensures the paths.
-    async fn materialize_impl(
+    async fn materialize(
         &self,
         request: MaterializeRequest,
     ) -> buck2_error::Result<MaterializeResponse> {
@@ -477,7 +494,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
             if outputs.is_empty() {
                 Ok(None)
             } else {
-                self.prepare_outputs_impl(outputs).await.map(Some)
+                self.prepare_outputs(outputs).await.map(Some)
             }
         };
         let ensure = async {
@@ -569,6 +586,20 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         Ok(())
     }
 
+    fn is_disk_state(&self) -> bool {
+        false
+    }
+
+    async fn hold_or_take(
+        &self,
+        path: ProjectRelativePathBuf,
+        _value: ArtifactValue,
+    ) -> buck2_error::Result<HeldContent> {
+        Err(internal_error!(
+            "`{path}` was asked for under `hold_or_take`, which the deferred core does not answer: producers declare to it"
+        ))
+    }
+
     async fn declare_write<'a>(
         &self,
         generate: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
@@ -656,7 +687,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         Ok(has_artifact)
     }
 
-    async fn prepare_outputs_impl(
+    async fn prepare_outputs(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<WriteLease> {
@@ -672,7 +703,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         self.io.make_outputs_writable(paths).await
     }
 
-    async fn publish_impl(
+    async fn publish(
         &self,
         lease: &WriteLease,
         src: ProjectRelativePathBuf,
@@ -685,7 +716,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         // nothing here provides; that is a property of the rewritten materializer. Leaving `src`
         // behind is harmless: nothing reads it until the action that owns it runs again, and
         // that run deletes it first.
-        self.declare_existing_impl(
+        self.declare_existing(
             lease,
             vec![DeclareArtifactPayload {
                 path: src.clone(),
@@ -876,9 +907,8 @@ impl<T: IoHandler + Allocative> DeferredMaterializerAccessor<T> {
         invalidate_fut.await
     }
 
-    /// Spawns two threads (`materialization_loop` and `command_loop`).
-    /// Creates and returns a new `DeferredMaterializer` that aborts those
-    /// threads when dropped.
+    /// Spawns the command loop. Dropping the accessor stops the loop; outstanding I/O retains
+    /// its handler until it finishes.
     fn new_with_io(
         io: Arc<T>,
         configs: DeferredMaterializerConfigs,
@@ -927,12 +957,14 @@ impl<T: IoHandler + Allocative> DeferredMaterializerAccessor<T> {
         let tree = ArtifactTree::initialize(sqlite_state);
 
         let background_cleanup_gate = Arc::new(BackgroundCleanupGate::default());
+        let cancellation = Arc::new(CancellationScope::new());
         let command_processor = {
             let command_sender = command_sender.dupe();
             let rt = Handle::current();
             let stats = stats.dupe();
             let io = io.dupe();
             let background_cleanup_gate = background_cleanup_gate.dupe();
+            let cancellation = cancellation.clone();
             move |cancellations| {
                 DeferredMaterializerCommandProcessor::new(
                     io,
@@ -949,6 +981,7 @@ impl<T: IoHandler + Allocative> DeferredMaterializerAccessor<T> {
                     configs.clean_stale_config.clone(),
                     rematerialization_ttl,
                     background_cleanup_gate,
+                    cancellation,
                 )
             }
         };
@@ -973,6 +1006,8 @@ impl<T: IoHandler + Allocative> DeferredMaterializerAccessor<T> {
 
         Ok(Self {
             command_thread: Some(command_thread),
+            cancellation,
+            runtime: Handle::current(),
             command_sender,
             materialize_final_artifacts: configs.materialize_final_artifacts,
             defer_write_actions: configs.defer_write_actions,
@@ -1047,6 +1082,7 @@ impl DeferredMaterializerAccessor<NoDiskIoHandler> {
                 verbose_materializer_log: false,
                 clean_stale_config: CleanStaleConfig::default(),
                 readonly_outputs: false,
+                strict_leases: false,
             },
             EventDispatcher::null(),
         )

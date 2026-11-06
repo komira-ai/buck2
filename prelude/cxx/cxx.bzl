@@ -124,6 +124,7 @@ load(
     "value_or",
 )
 load(":attrs.bzl", "BUILD_INFO_ATTR", "cxx_library_extra_attrs")
+load(":clang_profile_list.bzl", "get_coverage_profile_list_srcs")
 load(":cxx_context.bzl", "get_cxx_toolchain_info")
 load(":cxx_executable.bzl", "cxx_executable")
 load(
@@ -281,6 +282,7 @@ def cxx_library_generate(ctx: AnalysisContext, rule_type: str) -> list[Provider]
         use_content_based_paths = cxx_attr_use_content_based_paths(ctx),
         coverage_instrumentation_compiler_flags = ctx.attrs.coverage_instrumentation_compiler_flags,
         coverage_profile_list = ctx.attrs.coverage_profile_list[DefaultInfo].default_outputs[0] if ctx.attrs.coverage_profile_list else None,
+        coverage_profile_list_srcs = get_coverage_profile_list_srcs(ctx.attrs.coverage_profile_list),
         separate_debug_info = ctx.attrs.separate_debug_info,
         cuda_compile_style = CudaCompileStyle(ctx.attrs.cuda_compile_style),
         # @oss-disable[end= ]: extra_linker_outputs_factory = get_extra_linker_outputs,
@@ -364,6 +366,7 @@ def cxx_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         use_content_based_paths = cxx_attr_use_content_based_paths(ctx),
         coverage_instrumentation_compiler_flags = ctx.attrs.coverage_instrumentation_compiler_flags,
         coverage_profile_list = ctx.attrs.coverage_profile_list[DefaultInfo].default_outputs[0] if ctx.attrs.coverage_profile_list else None,
+        coverage_profile_list_srcs = get_coverage_profile_list_srcs(ctx.attrs.coverage_profile_list),
         separate_debug_info = ctx.attrs.separate_debug_info,
         cuda_compile_style = CudaCompileStyle(ctx.attrs.cuda_compile_style),
         link_preference = LinkPreference(ctx.attrs.link_preference),
@@ -1011,6 +1014,10 @@ def prebuilt_cxx_library_impl(ctx: AnalysisContext) -> list[Provider]:
             )
         )
         sub_targets["prefer-{}".format(linkage.value)] = lproviders_with_default
+    # Usually zero or one exported header map.
+    exported_header_maps = generic_exported_pre.args.header_maps
+    if len(exported_header_maps) == 1:
+        sub_targets["exported-header-map"] = [DefaultInfo(default_output = exported_header_maps[0])]
     providers.append(
         DefaultInfo(
             default_output = output,
@@ -1083,6 +1090,7 @@ def cxx_test_impl(ctx: AnalysisContext) -> list[Provider]:
         use_content_based_paths = cxx_attr_use_content_based_paths(ctx),
         coverage_instrumentation_compiler_flags = ctx.attrs.coverage_instrumentation_compiler_flags,
         coverage_profile_list = ctx.attrs.coverage_profile_list[DefaultInfo].default_outputs[0] if ctx.attrs.coverage_profile_list else None,
+        coverage_profile_list_srcs = get_coverage_profile_list_srcs(ctx.attrs.coverage_profile_list),
         separate_debug_info = ctx.attrs.separate_debug_info,
         cuda_compile_style = CudaCompileStyle(ctx.attrs.cuda_compile_style),
         link_preference = LinkPreference(ctx.attrs.link_preference),
@@ -1113,6 +1121,17 @@ def cxx_test_impl(ctx: AnalysisContext) -> list[Provider]:
 
     command = [cmd_args(output.binary, hidden = output.runtime_files)] + ctx.attrs.args
 
+    test_env = dict(ctx.attrs.env)
+    static_lister = test_env.get("STATIC_LIST_TESTS_BINARY")
+    if static_lister != None:
+        listing_binary = test_env.get("BUCK_BASE_BINARY", output.binary)
+        static_listing_library = test_env.get("STATIC_LISTING_DYLIB_NAME")
+        if static_listing_library != None:
+            libraries = [shlib.lib.output for shlib in output.shared_libs if shlib.soname.is_str and static_listing_library == shlib.soname.ensure_str()]
+            listing_binary = libraries[0] if len(libraries) == 1 else None
+        if listing_binary != None:
+            test_env["TPX_LIST_TESTS_COMMAND"] = cmd_args(static_lister, listing_binary)
+
     # Setup RE executors based on the `remote_execution` param.
     re_executors = get_re_executors_from_props(ctx)
 
@@ -1133,7 +1152,7 @@ def cxx_test_impl(ctx: AnalysisContext) -> list[Provider]:
             ExternalRunnerTestInfo(
                 type = "gtest",
                 command = command,
-                env = ctx.attrs.env,
+                env = test_env,
                 labels = ctx.attrs.labels,
                 contacts = ctx.attrs.contacts,
                 default_executor = re_executors.default_executor,
@@ -1223,6 +1242,7 @@ cxx_binary = prelude_rule(
     attrs = (
         cxx_binary_base_attrs()
         | {
+            "build_info_as_shared_library": attrs.bool(default = True),
             "_gen_build_info": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "_generated_build_info_data": attrs.option(attrs.source(), default = None),
             "_generated_build_info_enabled": attrs.bool(default = False),
@@ -1539,7 +1559,7 @@ cxx_test = prelude_rule(
             "post_linker_flags": attrs.list(attrs.arg(anon_target_compatible = True), default = []),
             "prefer_stripped_objects": attrs.bool(default = False),
             "prefix_header": attrs.option(attrs.source(), default = None),
-            "supports_test_execution_caching": attrs.bool(default = False),
+            "supports_test_execution_caching": attrs.bool(default = True),
             "thin_lto": attrs.bool(default = False),
             "use_default_test_main": attrs.option(attrs.bool(), default = None),
             "use_header_units": attrs.one_of(
@@ -1565,6 +1585,7 @@ cxx_test = prelude_rule(
         | cxx_binary_and_test_attrs()
         | re_test_common.test_args()
         | {
+            "build_info_as_shared_library": attrs.bool(default = True),
             "_gen_build_info": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "_generated_build_info_data": attrs.option(attrs.source(), default = None),
             "_generated_build_info_enabled": attrs.bool(default = False),

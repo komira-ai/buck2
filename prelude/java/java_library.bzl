@@ -55,7 +55,7 @@ load(
     "get_java_version_attributes",
     "to_java_version",
 )
-load("@prelude//jvm:attrs.bzl", "dex_min_sdk_version", "jvm_common")
+load("@prelude//jvm:attrs.bzl", "jvm_common", "min_sdk_version")
 load("@prelude//jvm:cd_jar_creator_util.bzl", "postprocess_jar")
 load("@prelude//jvm:nullsafe.bzl", "get_nullsafe_info")
 load("@prelude//linking:shared_libraries.bzl", "SharedLibraryInfo")
@@ -1057,12 +1057,12 @@ java_library = prelude_rule(
             "jar_postprocessor": attrs.option(attrs.exec_dep(), default = None),
             "manifest_file": attrs.option(attrs.source(), default = None),
             "maven_coords": attrs.option(attrs.string(), default = None),
+            "min_sdk_version": attrs.default_only(attrs.option(attrs.int(), default = min_sdk_version())),
             "proguard_config": attrs.option(attrs.source(), default = None),
             "resources_root": attrs.option(attrs.string(), default = None),
             "runtime_deps": attrs.list(attrs.dep(), default = []),
             VALIDATION_DEPS_ATTR_NAME: attrs.set(attrs.dep(), sorted = True, default = []),
             "_build_only_native_code": attrs.default_only(attrs.bool(default = is_build_only_native_code())),
-            "_dex_min_sdk_version": attrs.option(attrs.int(), default = dex_min_sdk_version()),
             "_dex_toolchain": toolchains_common.dex(),
             "_exec_os_type": buck.exec_os_type_arg(),
             "_is_building_android_binary": is_building_android_binary_attr(),

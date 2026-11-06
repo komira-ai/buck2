@@ -23,7 +23,6 @@ use buck2_common::dice::data::testing::SetTestingIoProvider;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_common::package_listing::listing::testing::PackageListingExt;
-use buck2_common::settings::PackageVisibilityDefaultIntersection;
 use buck2_configured::execution::ExecutionPlatformsKey;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
@@ -64,6 +63,7 @@ use buck2_node::super_package::SuperPackage;
 use buck2_node::visibility::VisibilityIntersection;
 use buck2_node::visibility::VisibilityLayerOrigin;
 use buck2_node::visibility::VisibilitySpecification;
+use buck2_settings::PackageVisibilityDefaultIntersection;
 use buck2_util::arc_str::ThinArcSlice;
 use dice::DetectCycles;
 use dice::Dice;
@@ -191,7 +191,7 @@ async fn test_analysis_calculation() -> buck2_error::Result<()> {
         .await
         .require_compatible()?;
 
-    assert_eq!(analysis.analysis_values().iter_actions().count(), 0);
+    assert_eq!(analysis.analysis_values()?.num_actions(), 0);
 
     assert_eq!(
         analysis
@@ -351,6 +351,7 @@ foo_binary(
                     intersection.dupe(),
                     base.super_package().within_view_cap().dupe(),
                     base.super_package().cfg_constructor().cloned(),
+                    base.super_package().cfg_modifiers().cloned(),
                     base.super_package().test_config_unification_rollout(),
                 )
                 .unwrap(),

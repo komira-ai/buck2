@@ -17,7 +17,7 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::actions::impls::json;
 use buck2_build_api::actions::impls::json::JsonUnpack;
 use buck2_build_api::artifact_groups::ArtifactGroup;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineSink;
@@ -27,6 +27,7 @@ use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_execute::artifact::fs::ExecutorFs;
 use derive_more::Display;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
@@ -51,7 +52,7 @@ pub(crate) enum DepFileFingerprintFormat {
     },
     Args {
         is_executable: bool,
-        macro_files: Option<Box<[Artifact]>>,
+        macro_files: Option<MiniBoxSlice<Artifact>>,
     },
 }
 
@@ -118,8 +119,8 @@ impl<'v> StarlarkDepFileFingerprint<'v> {
         fs: &ExecutorFs<'_>,
     ) -> buck2_error::Result<(ProjectRelativePathBuf, [u8; 32])> {
         let mapper = DepFilesPlaceholderArtifactPathMapper {};
-        let artifact = ValueAsInputArtifactLike::unpack_value_err(self.artifact)?
-            .0
+        let artifact = StarlarkArtifactView::unpack_value_err(self.artifact)?
+            .as_input_artifact_like()
             .get_bound_artifact()?;
         let path = artifact.resolve_path(fs.fs(), mapper.get(&artifact))?;
         let mut digest = blake3::Hasher::new();

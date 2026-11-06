@@ -37,11 +37,14 @@ use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkRepresentations;
+use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::dict::DictType;
 use starlark::values::starlark_value;
 use starlark::values::typing::StarlarkCallable;
 
@@ -55,7 +58,7 @@ use crate::bxl::starlark_defs::cli_args::CliArgValue;
 pub(crate) fn register_bxl_prefixed_main_function(builder: &mut GlobalsBuilder) {
     fn bxl_main<'v>(
         #[starlark(require = named)] r#impl: StarlarkCallable<'v>,
-        #[starlark(require = named)] cli_args: UnpackDictEntries<&'v str, &'v CliArgs>,
+        #[starlark(require = named)] cli_args: ValueOf<'v, DictType<&'v str, &'v CliArgs>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
@@ -67,7 +70,7 @@ pub(crate) fn register_bxl_prefixed_main_function(builder: &mut GlobalsBuilder) 
 pub(crate) fn register_bxl_main_function(builder: &mut GlobalsBuilder) {
     fn main<'v>(
         #[starlark(require = named)] r#impl: StarlarkCallable<'v>,
-        #[starlark(require = named)] cli_args: UnpackDictEntries<&'v str, &'v CliArgs>,
+        #[starlark(require = named)] cli_args: ValueOf<'v, DictType<&'v str, &'v CliArgs>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
@@ -77,7 +80,7 @@ pub(crate) fn register_bxl_main_function(builder: &mut GlobalsBuilder) {
 
 fn bxl_impl<'v>(
     r#impl: StarlarkCallable<'v>,
-    cli_args: UnpackDictEntries<&'v str, &'v CliArgs>,
+    cli_args: ValueOf<'v, DictType<&'v str, &'v CliArgs>>,
     doc: &str,
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> starlark::Result<Value<'v>> {
@@ -96,7 +99,8 @@ fn bxl_impl<'v>(
     let mut unresolved_cli_args = BuckMutInsertionMap::new();
     let mut short_args = BuckMutInsertionSet::new();
 
-    for (arg, def) in cli_args.entries {
+    for entry in cli_args.try_items() {
+        let (arg, def) = entry?;
         if let Some(short) = def.short {
             if short_args.contains(&short) {
                 let buck2_error: buck2_error::Error =
@@ -157,19 +161,33 @@ impl<'v> AllocValue<'v> for BxlFunction<'v> {
     }
 }
 
+/// A bxl function in either of its representations.
+#[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+pub(crate) enum BxlFunctionView<'v> {
+    Unfrozen(ValueTyped<'v, BxlFunction<'v>>),
+    Frozen(ValueTyped<'v, FrozenBxlFunction<'v>>),
+}
+
 #[starlark_value(type = "bxl")]
-impl<'v> StarlarkValue<'v> for BxlFunction<'v> {
+impl<'v> StarlarkType<'v> for BxlFunctionView<'v> {
     fn export_as(
         &self,
         variable_name: &str,
         _eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<()> {
-        *self.id.borrow_mut() = Some(BxlFunctionLabel {
-            bxl_path: self.bxl_path.clone(),
-            name: variable_name.to_owned(),
-        });
+        if let BxlFunctionView::Unfrozen(this) = self {
+            *this.id.borrow_mut() = Some(BxlFunctionLabel {
+                bxl_path: this.bxl_path.clone(),
+                name: variable_name.to_owned(),
+            });
+        }
         Ok(())
     }
+}
+
+#[starlark_value]
+impl<'v> StarlarkValue<'v> for BxlFunction<'v> {
+    type Type = BxlFunctionView<'v>;
 }
 
 impl<'v> Freeze<'v> for BxlFunction<'v> {
@@ -216,9 +234,9 @@ pub(crate) struct FrozenBxlFunction<'v> {
 /// A bxl function kept alive by its owning frozen heap; usable across threads and awaits.
 pub(crate) type OwnedBxlFunction = OwnedFrozen<ValueTyped<'static, FrozenBxlFunction<'static>>>;
 
-#[starlark_value(type = "bxl", frozen_vtable)]
+#[starlark_value(frozen_vtable)]
 impl<'v> StarlarkValue<'v> for FrozenBxlFunction<'v> {
-    type Canonical = BxlFunction<'v>;
+    type Type = BxlFunctionView<'v>;
 }
 
 impl<'v> FrozenBxlFunction<'v> {

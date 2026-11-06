@@ -12,6 +12,7 @@ allocative.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
+buck2_agent_interactive.workspace = true
 buck2_analysis.workspace = true
 buck2_build_api.workspace = true
 buck2_build_signals.workspace = true
@@ -39,6 +40,7 @@ buck2_re_configuration.workspace = true
 buck2_resource_control.workspace = true
 buck2_server_ctx.workspace = true
 buck2_server_starlark_debug.workspace = true
+buck2_settings.workspace = true
 buck2_subscription_proto.workspace = true
 buck2_test.workspace = true
 buck2_util.workspace = true
@@ -76,6 +78,8 @@ variant_name.workspace = true
 
 [dev-dependencies]
 assert_matches.workspace = true
+crossbeam-channel.workspace = true
+derive_more.workspace = true
 indoc.workspace = true
 tempfile.workspace = true
 

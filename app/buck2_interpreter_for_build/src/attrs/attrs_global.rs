@@ -11,14 +11,16 @@
 use std::sync::Arc;
 
 use buck2_core::configuration::transition::id::TransitionId;
+use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::plugins::PluginKindSet;
 use buck2_error::BuckErrorContext;
 use buck2_interpreter::coerce::COERCE_PROVIDERS_LABEL_FOR_BZL;
+use buck2_interpreter::execution_group::ExecutionGroupArg;
 use buck2_interpreter::types::provider::callable::ValueAsProviderCallableLike;
-use buck2_interpreter::types::transition::transition_id_from_value;
+use buck2_interpreter::types::transition::ValueAsTransition;
 use buck2_node::attrs::attr::Attribute;
 use buck2_node::attrs::attr_type::AttrType;
-use buck2_node::attrs::attr_type::any::AnyAttrType;
+use buck2_node::attrs::attr_type::configuration_dep::ConfigurationDepKind;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
 use buck2_node::attrs::configurable::AttrIsConfigurable;
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
@@ -34,12 +36,14 @@ use starlark::values::Value;
 use starlark::values::ValueError;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list_or_tuple::UnpackListOrTuple;
-use starlark::values::tuple::UnpackTuple;
+use starlark::values::list_or_tuple::ListOrTupleType;
+use starlark::values::none::NoneOr;
+use starlark::values::tuple::TupleType;
 
 use crate::attrs::coerce::attr_type::AttrTypeExt;
 use crate::attrs::coerce::ctx::BuildAttrCoercionContext;
 use crate::attrs::starlark_attribute::StarlarkAttribute;
+use crate::attrs::starlark_attribute::ToolMarks;
 use crate::attrs::starlark_attribute::register_attr_type;
 use crate::interpreter::build_context::BuildContext;
 use crate::interpreter::selector::StarlarkSelector;
@@ -67,6 +71,7 @@ pub(crate) trait AttributeExt {
         default: Option<Value<'v>>,
         doc: &str,
         coercer: AttrType,
+        tool_marks: ToolMarks,
     ) -> buck2_error::Result<StarlarkAttribute>;
 }
 
@@ -77,26 +82,31 @@ impl AttributeExt for Attribute {
         default: Option<Value<'v>>,
         doc: &str,
         coercer: AttrType,
+        tool_marks: ToolMarks,
     ) -> buck2_error::Result<StarlarkAttribute> {
         let default = match default {
             None => None,
-            Some(x) => Some(Arc::new(
-                coercer
-                    .coerce(
-                        AttrIsConfigurable::Yes,
-                        &attr_coercion_context_for_bzl(eval)?,
-                        x,
-                    )
-                    .buck_error_context("Error coercing attribute default")?,
-            )),
+            Some(x) => {
+                let ctx = attr_coercion_context_for_bzl(eval)?;
+                let coerced = coercer
+                    .coerce(AttrIsConfigurable::Yes, &ctx, x)
+                    .buck_error_context("Error coercing attribute default")?;
+                Some((ctx.take_attr_arena_builder(), coerced))
+            }
         };
-        Ok(StarlarkAttribute::new(Attribute::new(
-            default, doc, coercer,
-        )?))
+        Ok(StarlarkAttribute::new(
+            Attribute::new_from_builder(default, doc, coercer)?,
+            tool_marks,
+        ))
     }
 }
 
-/// Coerction context for evaluating bzl files (attr default, transition rules).
+/// Coercion context for evaluating bzl files (attr default, transition rules).
+///
+/// Coercion through this context is unmemoized: a fresh context per call, no
+/// `MemoizedCoercionCtx`. TODO(jtbraun): wrapping it in a `MemoizedCoercionCtx`
+/// over the module's `InterpreterExtraValue` table would share coercions of
+/// repeated default values across a whole bzl evaluation.
 pub(crate) fn attr_coercion_context_for_bzl<'v>(
     eval: &Evaluator<'v, '_, '_>,
 ) -> buck2_error::Result<BuildAttrCoercionContext> {
@@ -115,11 +125,13 @@ pub(crate) fn init_coerce_providers_label_for_bzl() {
 }
 
 /// Common code to handle `providers` argument of dep-like attrs.
-fn dep_like_attr_handle_providers_arg(providers: Vec<Value>) -> buck2_error::Result<ProviderIdSet> {
+fn dep_like_attr_handle_providers_arg<'v>(
+    providers: ValueOf<'v, ListOrTupleType<Value<'v>>>,
+) -> buck2_error::Result<ProviderIdSet> {
     Ok(ProviderIdSet::from(
         providers
-            .iter()
-            .map(|v| match v.as_provider_callable() {
+            .try_items()
+            .map(|v| match v?.as_provider_callable() {
                 Some(callable) => buck2_error::Ok(callable.id()?.dupe()),
                 None => Err(
                     starlark::Error::from(ValueError::IncorrectParameterTypeNamed(
@@ -160,7 +172,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
         let _unused = validate;
-        Ok(Attribute::attr(eval, default, doc, AttrType::string())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::string(),
+            ToolMarks::NONE,
+        )?)
     }
 
     /// Takes a list from the user, supplies a list to the rule.
@@ -171,115 +189,185 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
         let coercer = AttrType::list(inner.coercer_for_inner()?);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            inner.tool_marks(),
+        )?)
     }
 
     /// Takes a target from the user, as a string, and supplies a dependency to the rule.
     /// The dependency will transition to the execution platform. Use `exec_dep` if you
     /// plan to execute things from this dependency as part of the compilation.
+    ///
+    /// With `exec_group`, the dependency is configured for the execution platform of that
+    /// group instead, and constrains only that group's execution platform resolution. The rule
+    /// must declare the group in `rule(exec_groups = ...)`. A rule that declares named execution
+    /// groups must pass `exec_group`, with `DefaultExecGroup` for the default group.
     fn exec_dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = "")] doc: &str,
+        #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<StarlarkAttribute> {
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
+        let (coercer, marks) = match exec_group.into_option() {
+            None => (
+                AttrType::exec_dep(required_providers),
+                ToolMarks::UNMARKED_EXEC_DEP,
+            ),
+            Some(ExecutionGroupArg { group }) => (
+                AttrType::exec_dep_in_group(required_providers, group),
+                ToolMarks::NONE,
+            ),
+        };
+        Ok(Attribute::attr(eval, default, doc, coercer, marks)?)
+    }
+
+    /// Takes a list of constraints from the user that the execution platform of `exec_group`
+    /// must satisfy, in addition to the target's `exec_compatible_with`, which applies to every
+    /// group. With `DefaultExecGroup`, the constraints apply to the default group only. A rule
+    /// may have at most one such attribute per group, and must declare the group in
+    /// `rule(exec_groups = ...)` (`DefaultExecGroup` is declared implicitly by rules
+    /// without named groups). Supplies the constraint labels as strings to the rule.
+    fn exec_compatible_with<'v>(
+        #[starlark(require = named)] exec_group: ExecutionGroupArg,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
-        let coercer = AttrType::exec_dep(required_providers);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        let coercer = AttrType::list(AttrType::configuration_dep(
+            ConfigurationDepKind::CompatibilityAttribute,
+        ));
+        let attr = Attribute::attr(eval, default, doc, coercer, ToolMarks::NONE)?;
+        Ok(StarlarkAttribute::new_exec_compatible_with(
+            attr.clone_attribute(),
+            exec_group.group,
+        ))
     }
 
     /// Takes a target from the user, as a string, and supplies a dependency to the rule.
     /// The dependency will be a toolchain dependency, meaning that its execution platform
     /// dependencies will be used to select the execution platform for this rule.
+    ///
+    /// With `exec_group`, the toolchain's execution platform dependencies select the
+    /// execution platform of that group instead, and the toolchain is configured with that
+    /// group's execution platform. The rule must declare the group in
+    /// `rule(exec_groups = ...)`. A rule that declares named execution groups must pass
+    /// `exec_group`, with `DefaultExecGroup` for the default group.
     fn toolchain_dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
+        #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
-        let coercer = AttrType::toolchain_dep(required_providers);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
+        let (coercer, marks) = match exec_group.into_option() {
+            None => (
+                AttrType::toolchain_dep(required_providers),
+                ToolMarks::UNMARKED_TOOLCHAIN_DEP,
+            ),
+            Some(ExecutionGroupArg { group }) => (
+                AttrType::toolchain_dep_in_group(required_providers, group),
+                ToolMarks::NONE,
+            ),
+        };
+        Ok(Attribute::attr(eval, default, doc, coercer, marks)?)
     }
 
     fn transition_dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
-        #[starlark(require = named)] cfg: Option<Value<'v>>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
+        #[starlark(require = named)] cfg: Option<Either<StringValue<'v>, ValueAsTransition<'v>>>,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
         let label_coercion_ctx = attr_coercion_context_for_bzl(eval)?;
 
-        // FIXME(JakobDegen): Use a proper unpack for this. Easier to do after deleting old API
-        let transition_id = if let Some(cfg) = cfg {
-            Some(if let Some(s) = StringValue::new(cfg) {
-                let transition_target = label_coercion_ctx.coerce_providers_label(&s)?;
-                Arc::new(TransitionId::Target(transition_target))
-            } else {
-                transition_id_from_value(cfg)?
-            })
-        } else {
-            None
+        let transition_id = match cfg {
+            Some(Either::Left(target)) => Some(Arc::new(TransitionId::Target(
+                label_coercion_ctx.coerce_providers_label(&target)?,
+            ))),
+            Some(Either::Right(transition)) => Some(transition.transition_id()?),
+            None => None,
         };
 
         let coercer = AttrType::transition_dep(required_providers, transition_id);
         let coerced_default = match default {
             None => None,
             Some(default) => {
-                Some(coercer.coerce(AttrIsConfigurable::Yes, &label_coercion_ctx, default)?)
+                let coerced =
+                    coercer.coerce(AttrIsConfigurable::Yes, &label_coercion_ctx, default)?;
+                Some((label_coercion_ctx.take_attr_arena_builder(), coerced))
             }
         };
 
-        Ok(StarlarkAttribute::new(Attribute::new(
-            coerced_default.map(Arc::new),
-            doc,
-            coercer,
-        )?))
+        Ok(StarlarkAttribute::new(
+            Attribute::new_from_builder(coerced_default, doc, coercer)?,
+            ToolMarks::NONE,
+        ))
     }
 
     fn configured_dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
         let coercer = AttrType::configured_dep(required_providers);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            ToolMarks::NONE,
+        )?)
     }
 
     fn split_transition_dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
-        #[starlark(require = named)] cfg: Value<'v>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
+        #[starlark(require = named)] cfg: ValueAsTransition<'v>,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
-        let transition_id = transition_id_from_value(cfg)?;
-        let coercer = AttrType::split_transition_dep(required_providers, transition_id);
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
+        let coercer = AttrType::split_transition_dep(required_providers, cfg.transition_id()?);
 
         let coerced_default = match default {
             None => None,
-            Some(default) => Some(coercer.coerce(
-                AttrIsConfigurable::Yes,
-                &attr_coercion_context_for_bzl(eval)?,
-                default,
-            )?),
+            Some(default) => {
+                let ctx = attr_coercion_context_for_bzl(eval)?;
+                let coerced = coercer.coerce(AttrIsConfigurable::Yes, &ctx, default)?;
+                Some((ctx.take_attr_arena_builder(), coerced))
+            }
         };
 
-        Ok(StarlarkAttribute::new(Attribute::new(
-            coerced_default.map(Arc::new),
-            doc,
-            coercer,
-        )?))
+        Ok(StarlarkAttribute::new(
+            Attribute::new_from_builder(coerced_default, doc, coercer)?,
+            ToolMarks::NONE,
+        ))
     }
 
     /// Takes a target label from the user and registers it as a plugin dependency.
@@ -300,6 +388,7 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             default,
             doc,
             AttrType::plugin_dep(kind.plugin_kind),
+            ToolMarks::NONE,
         )?)
     }
 
@@ -313,36 +402,47 @@ fn attr_module(registry: &mut GlobalsBuilder) {
     /// The `pulls_plugins` and `pulls_and_pushes_plugins` parameters control plugin propagation.
     /// See the [`plugins`](../plugins) namespace documentation for a full explanation.
     fn dep<'v>(
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        providers: UnpackListOrTuple<Value<'v>>,
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        pulls_plugins: UnpackListOrTuple<PluginKindArg>,
-        #[starlark(require = named, default = Either::Left(UnpackListOrTuple::default()))]
-        pulls_and_pushes_plugins: Either<UnpackListOrTuple<PluginKindArg>, &'v AllPlugins>,
+        #[starlark(require = named, default = ValueOf::empty_list())] providers: ValueOf<
+            'v,
+            ListOrTupleType<Value<'v>>,
+        >,
+        #[starlark(require = named, default = ValueOf::empty_list())] pulls_plugins: ValueOf<
+            'v,
+            ListOrTupleType<PluginKindArg>,
+        >,
+        #[starlark(require = named, default = Either::Left(ValueOf::empty_list()))]
+        pulls_and_pushes_plugins: Either<
+            ValueOf<'v, ListOrTupleType<PluginKindArg>>,
+            &'v AllPlugins,
+        >,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        let required_providers = dep_like_attr_handle_providers_arg(providers.items)?;
+        let required_providers = dep_like_attr_handle_providers_arg(providers)?;
         let plugin_kinds = match pulls_and_pushes_plugins {
             Either::Right(_) => PluginKindSet::ALL,
             Either::Left(pulls_and_pushes_plugins) => {
                 let pulls_and_pushes_plugins: Vec<_> = pulls_and_pushes_plugins
-                    .items
-                    .into_iter()
-                    .map(|PluginKindArg { plugin_kind }| plugin_kind)
-                    .collect();
+                    .try_items()
+                    .map(|arg| arg.map(|PluginKindArg { plugin_kind }| plugin_kind))
+                    .collect::<starlark::Result<_>>()?;
                 let pulls_plugins: Vec<_> = pulls_plugins
-                    .items
-                    .into_iter()
-                    .map(|PluginKindArg { plugin_kind }| plugin_kind)
-                    .collect();
+                    .try_items()
+                    .map(|arg| arg.map(|PluginKindArg { plugin_kind }| plugin_kind))
+                    .collect::<starlark::Result<_>>()?;
                 PluginKindSet::new(pulls_plugins, pulls_and_pushes_plugins)?
             }
         };
 
         let coercer = AttrType::dep(required_providers, plugin_kinds);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            ToolMarks::NONE,
+        )?)
     }
 
     /// Takes most builtin literals and passes them to the rule as a string.
@@ -352,7 +452,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, default, doc, AttrType::any())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::any(),
+            ToolMarks::NONE,
+        )?)
     }
 
     /// Takes a boolean and passes it to the rule as a boolean.
@@ -361,7 +467,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, default, doc, AttrType::bool())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::bool(),
+            ToolMarks::NONE,
+        )?)
     }
 
     /// Takes a value that may be `None` or some inner type, and passes either `None` or the
@@ -377,9 +489,9 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
         let coercer = AttrType::option(inner.coercer_for_inner()?);
-        let attr = Attribute::attr(eval, default, doc, coercer)?;
+        let attr = Attribute::attr(eval, default, doc, coercer, inner.tool_marks())?;
 
-        match attr.default() {
+        match attr.attribute().default_as_ref() {
             Some(default) if !default.may_return_none() => Err(buck2_error::Error::from(
                 AttrError::OptionDefaultNone(default.as_display_no_ctx().to_string()),
             )
@@ -398,14 +510,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = pos)] inner: &StarlarkAttribute,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> starlark::Result<StarlarkAttribute> {
-        let Some(default) = inner.default().duped() else {
+        let Some(default) = inner.attribute().default_as_owned().duped() else {
             return Err(buck2_error::Error::from(AttrError::DefaultOnlyMustHaveDefault).into());
         };
-        Ok(StarlarkAttribute::new(Attribute::new_default_only(
-            default,
-            doc,
-            inner.coercer_for_default_only(),
-        )))
+        Ok(StarlarkAttribute::new(
+            Attribute::new_default_only(default, doc, inner.coercer_for_default_only()?),
+            inner.tool_marks(),
+        ))
     }
 
     /// Takes a target (as per `deps`) and passes a `label` to the rule.
@@ -415,7 +526,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, default, doc, AttrType::label())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::label(),
+            ToolMarks::NONE,
+        )?)
     }
 
     /// Takes a dict from the user, supplies a dict to the rule.
@@ -429,7 +546,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
         let coercer = AttrType::dict(key.coercer_for_inner()?, value.coercer_for_inner()?, sorted);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            key.tool_marks().union(value.tool_marks()),
+        )?)
     }
 
     /// Takes a command line argument from the user and supplies a `cmd_args` compatible value to the rule.
@@ -437,26 +560,49 @@ fn attr_module(registry: &mut GlobalsBuilder) {
     /// will be replaced with references to those values in the rule. Takes in an optional `anon_target_compatible`
     /// flag, which indicates whether the args can be passed into anon targets. Note that there is a slight memory
     /// hit when using this flag.
+    ///
+    /// With `exec_group`, the dependencies of `$(exe)`, `$(location_exec)` and
+    /// `$(location_toolchain)` macros are configured for the execution platform of that group
+    /// instead, and constrain only that group's execution platform resolution. The rule must
+    /// declare the group in `rule(exec_groups = ...)`. In a rule that declares named execution
+    /// groups, an arg without `exec_group` may hold flags but not tools: a target whose value
+    /// refers to a tool through these macros is an error. Pass `exec_group`, with
+    /// `DefaultExecGroup` for the default group, for args that refer to tools.
     fn arg<'v>(
         #[starlark(require = named, default = false)] json: bool,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named, default = false)] anon_target_compatible: bool,
+        #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
         let _unused = json;
+        let (exec_group, marks) = match exec_group.into_option() {
+            Some(ExecutionGroupArg {
+                group: ExecutionGroup::Named(group),
+            }) => (Some(group), ToolMarks::NONE),
+            Some(ExecutionGroupArg {
+                group: ExecutionGroup::Default,
+            }) => (None, ToolMarks::DEFAULT_GROUP_ARG),
+            None => (None, ToolMarks::UNMARKED_ARG),
+        };
         Ok(Attribute::attr(
             eval,
             default,
             doc,
-            AttrType::arg(anon_target_compatible),
+            AttrType::arg_in_group(
+                anon_target_compatible,
+                exec_group,
+                marks == ToolMarks::UNMARKED_ARG,
+            ),
+            marks,
         )?)
     }
 
     /// Takes a string from one of the variants given, and gives that string to the rule.
     /// Strings are matched case-insensitively, and always passed to the rule lowercase.
     fn r#enum<'v>(
-        #[starlark(require = pos)] variants: UnpackListOrTuple<String>,
+        #[starlark(require = pos)] variants: ValueOf<'v, ListOrTupleType<String>>,
         #[starlark(require = named)] default: Option<
             ValueOf<'v, Either<StringValue<'v>, ValueTyped<'v, StarlarkSelector<'v>>>>,
         >,
@@ -468,9 +614,10 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         // it ends up being `Type` which doesn't match the data we see.
         Ok(Attribute::attr(
             eval,
-            default.map(|v| v.value),
+            default.map(|v| v.to_value()),
             doc,
-            AttrType::enumeration(variants.items)?,
+            AttrType::enumeration(variants.try_to_vec()?)?,
+            ToolMarks::NONE,
         )?)
     }
 
@@ -485,6 +632,7 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             None,
             doc,
             AttrType::dep(ProviderIdSet::EMPTY, PluginKindSet::EMPTY),
+            ToolMarks::NONE,
         )?)
     }
 
@@ -494,7 +642,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, default, doc, AttrType::string())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::string(),
+            ToolMarks::NONE,
+        )?)
     }
 
     fn set<'v>(
@@ -506,7 +660,13 @@ fn attr_module(registry: &mut GlobalsBuilder) {
     ) -> starlark::Result<StarlarkAttribute> {
         let _unused = sorted;
         let coercer = AttrType::list(value_type.coercer_for_inner()?);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            value_type.tool_marks(),
+        )?)
     }
 
     fn named_set<'v>(
@@ -521,39 +681,49 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             AttrType::dict(AttrType::string(), value_coercer.dupe(), sorted),
             AttrType::list(value_coercer),
         ]);
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            coercer,
+            value_type.tool_marks(),
+        )?)
     }
 
     /// Given a list of alternative attributes, selects the first that matches and gives that to the rule.
     fn one_of<'v>(
-        #[starlark(args)] args: UnpackTuple<&StarlarkAttribute>,
+        #[starlark(args)] args: ValueOf<'v, TupleType<&'v StarlarkAttribute>>,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
+        let marks = args
+            .items()
+            .fold(ToolMarks::NONE, |marks, arg| marks.union(arg.tool_marks()));
         let coercer = AttrType::one_of(
-            args.items
-                .into_iter()
+            args.items()
                 .map(|arg| arg.coercer_for_inner())
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(eval, default, doc, coercer, marks)?)
     }
 
     /// Takes a tuple of values and gives a tuple to the rule.
     fn tuple<'v>(
-        #[starlark(args)] args: UnpackTuple<&StarlarkAttribute>,
+        #[starlark(args)] args: ValueOf<'v, TupleType<&'v StarlarkAttribute>>,
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
+        let marks = args
+            .items()
+            .fold(ToolMarks::NONE, |marks, arg| marks.union(arg.tool_marks()));
         let coercer = AttrType::tuple(
-            args.items
-                .into_iter()
+            args.items()
                 .map(|arg| arg.coercer_for_inner())
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        Ok(Attribute::attr(eval, default, doc, coercer)?)
+        Ok(Attribute::attr(eval, default, doc, coercer, marks)?)
     }
 
     /// Takes an int from the user, supplies an int to the rule.
@@ -562,14 +732,26 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, default, doc, AttrType::int())?)
+        Ok(Attribute::attr(
+            eval,
+            default,
+            doc,
+            AttrType::int(),
+            ToolMarks::NONE,
+        )?)
     }
 
     fn query<'v>(
         #[starlark(require = named, default = "")] doc: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAttribute> {
-        Ok(Attribute::attr(eval, None, doc, AttrType::query())?)
+        Ok(Attribute::attr(
+            eval,
+            None,
+            doc,
+            AttrType::query(),
+            ToolMarks::NONE,
+        )?)
     }
 
     fn versioned<'v>(
@@ -584,11 +766,10 @@ fn attr_module(registry: &mut GlobalsBuilder) {
         ]);
         let coercer = AttrType::list(element_type.dupe());
 
-        Ok(StarlarkAttribute::new(Attribute::new(
-            Some(Arc::new(AnyAttrType::empty_list())),
-            doc,
-            coercer,
-        )?))
+        Ok(StarlarkAttribute::new(
+            Attribute::new(Some(|b| b.encode_list(&[])), doc, coercer)?,
+            value_type.tool_marks(),
+        ))
     }
 
     /// Takes a source file from the user, supplies an artifact to the rule.
@@ -606,6 +787,7 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             default,
             doc,
             AttrType::source(allow_directory),
+            ToolMarks::NONE,
         )?)
     }
 }

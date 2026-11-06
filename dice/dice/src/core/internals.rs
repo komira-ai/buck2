@@ -11,8 +11,10 @@
 use dice_core::BranchId;
 use pagable::DataKey;
 
+use crate::api::invalidation_tracking::InvalidationSources;
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
+use crate::core::graph::BackedSnapshot;
 use crate::core::graph::ComputedValueUpdate;
 use crate::core::graph::VersionedGraph;
 use crate::core::graph::introspection::VersionedGraphIntrospectable;
@@ -34,10 +36,10 @@ use crate::storage::EvictionPolicy;
 use crate::storage::PagingSetup;
 use crate::updater::ChangeType;
 use crate::value::DiceValidValue;
+use crate::value::HydratedValue;
 use crate::value::MaybeResidentComputedValue;
 use crate::value::PageOutResult;
 use crate::value::ResidentComputedValue;
-use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
 
 /// Everything the actor thread owns: the graph and the transactions in flight.
@@ -116,8 +118,11 @@ impl ActorState {
         self.graph.get(key)
     }
 
-    pub(super) fn recovery_epsilon(&self, key: VersionedGraphKey) -> Option<EpsilonToken> {
-        self.graph.recovery_epsilon(key)
+    pub(super) fn recovery_untracked(
+        &self,
+        key: VersionedGraphKey,
+    ) -> Option<(EpsilonToken, InvalidationSources)> {
+        self.graph.recovery_untracked(key)
     }
 
     pub(super) fn update_computed(
@@ -125,10 +130,10 @@ impl ActorState {
         key: VersionedGraphKey,
         storage: StorageType,
         update: ComputedValueUpdate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> ResidentComputedValue {
         self.update_value(storage, |graph| {
-            graph.update_computed(key, update, invalidation_paths)
+            graph.update_computed(key, update, invalidation_sources)
         })
     }
 
@@ -137,10 +142,10 @@ impl ActorState {
         key: VersionedGraphKey,
         storage: StorageType,
         candidate: Candidate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> MaybeResidentComputedValue {
         self.update_value(storage, |graph| {
-            graph.revalidate(key, candidate, invalidation_paths)
+            graph.revalidate(key, candidate, invalidation_sources)
         })
     }
 
@@ -185,12 +190,18 @@ impl ActorState {
         }
     }
 
-    pub(super) fn evict_backed(&mut self, limit: usize) -> u64 {
+    pub(super) fn backed_snapshot(&self) -> BackedSnapshot {
+        self.graph.backed_snapshot()
+    }
+
+    pub(super) fn evict_backed(&mut self, keys: &[DiceKey], cutoff: u64) -> u64 {
         let window = AllocWindow::open();
-        let evicted = self.graph.evict_backed(limit);
+        let evicted = self.graph.evict_backed(keys, cutoff);
         if let Some(metrics) = &self.paging_memory {
+            let freed = window.net_freed();
             metrics.record_nodes_paged_out(evicted);
-            metrics.record_offloaded(window.net_freed());
+            metrics.record_offloaded(freed);
+            metrics.record_evicted(evicted, freed);
         }
         evicted
     }
@@ -237,8 +248,9 @@ impl ActorState {
 
     /// Replaces the value of `key` paged out at `data_key` with its hydrated form. No-op if no
     /// such value is retained any more.
-    pub(super) fn rehydrate(&mut self, key: DiceKey, data_key: DataKey, value: DiceValidValue) {
-        self.graph.rehydrate(key, data_key, value);
+    pub(super) fn rehydrate(&mut self, key: DiceKey, data_key: DataKey, hydrated: HydratedValue) {
+        self.graph
+            .rehydrate(key, data_key, hydrated.value, hydrated.serialized_bytes);
     }
 
     /// Returns some metrics about the current state of DICE. Don't do expensive things here.
@@ -280,6 +292,7 @@ mod tests {
 
     use crate::DiceKeyDyn;
     use crate::api::computations::DiceComputations;
+    use crate::api::invalidation_tracking::InvalidationSources;
     use crate::api::key::InvalidationSourcePriority;
     use crate::api::key::Key;
     use crate::api::key::NoValueSerialize;
@@ -301,7 +314,6 @@ mod tests {
     use crate::updater::ChangeType;
     use crate::value::DiceKeyValue;
     use crate::value::DiceValidValue;
-    use crate::value::TrackedInvalidationPaths;
     use crate::versions::VersionNumber;
 
     #[test]
@@ -373,7 +385,7 @@ mod tests {
                     deps: SeriesParallelDeps::None,
                     epsilon: EpsilonToken::INITIAL,
                 },
-                TrackedInvalidationPaths::clean(),
+                InvalidationSources::NONE,
             );
         };
         compute(&mut core, 0);

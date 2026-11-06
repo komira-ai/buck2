@@ -33,11 +33,12 @@ use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessObserverSync;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_core::tag_error;
 use buck2_data::CleanStaleResultKind;
 use buck2_data::CleanStaleStats;
 use buck2_data::clean_stale_result::AdaptiveOutcome;
+use buck2_data::clean_stale_result::Origin;
 use buck2_data::clean_stale_result::Trigger;
 use buck2_error::ErrorTag;
 use buck2_error::internal_error;
@@ -68,6 +69,7 @@ use crate::materializers::deferred::artifact_tree::ArtifactClassification;
 use crate::materializers::deferred::artifact_tree::UnmaterializationEligibility;
 use crate::materializers::deferred::artifact_tree::UnmaterializationIneligibilityReason;
 use crate::materializers::deferred::artifact_tree::UnmaterializationIneligibleArtifact;
+use crate::materializers::deferred::clean_stale::CleanDiskSpace;
 use crate::materializers::deferred::clean_stale::CleanFailure;
 use crate::materializers::deferred::clean_stale::CleanFailurePhase;
 use crate::materializers::deferred::clean_stale::CleanOutcome;
@@ -85,7 +87,7 @@ use crate::materializers::deferred::clean_stale::TrackedState;
 use crate::materializers::deferred::clean_stale::apply_adaptive_low_disk;
 use crate::materializers::deferred::clean_stale::clean_artifact;
 use crate::materializers::deferred::clean_stale::create_result;
-use crate::materializers::deferred::clean_stale::default_root_abs_path;
+use crate::materializers::deferred::clean_stale::disk_space_probe_path;
 use crate::materializers::deferred::clean_stale::get_size;
 use crate::materializers::deferred::clean_stale::initial_stats;
 use crate::materializers::deferred::clean_stale::rematerialization_deadline;
@@ -115,7 +117,7 @@ pub(crate) struct Cleaner<T> {
     shared: Arc<Shared>,
     config: CleanStaleConfig,
     rematerialization_ttl: Option<SignedDuration>,
-    root_abs_path: Option<Arc<AbsPathBuf>>,
+    buck_out_abs_path: Option<Arc<AbsPathBuf>>,
     daemon_dispatcher: EventDispatcher,
     /// When this daemon started; what it has read or written since is active.
     started: Timestamp,
@@ -136,6 +138,7 @@ impl<T: IoHandler> Cleaner<T> {
         daemon_dispatcher: EventDispatcher,
         store: &'static BlobStore,
     ) -> Arc<Self> {
+        let buck_out_abs_path = disk_space_probe_path(io.fs(), io.buck_out_path());
         Arc::new(Self {
             io,
             blocking_executor,
@@ -145,7 +148,7 @@ impl<T: IoHandler> Cleaner<T> {
             // The daemon-wide walk refreshes CAS TTLs under this core whatever
             // `buck2.ttl_refresh_enabled` says of the deferred core's own refresher.
             rematerialization_ttl: SignedDuration::try_from(configs.ttl_refresh.frequency).ok(),
-            root_abs_path: default_root_abs_path(),
+            buck_out_abs_path,
             daemon_dispatcher,
             started: Timestamp::now(),
             gate: Arc::new(BackgroundCleanupGate::default()),
@@ -176,11 +179,12 @@ impl<T: IoHandler> Cleaner<T> {
                 };
                 let command = CleanStaleArtifactsCommand::configured(
                     &cleaner.config,
-                    cleaner.root_abs_path.dupe(),
+                    cleaner.buck_out_abs_path.dupe(),
                     cleaner.daemon_dispatcher.dupe(),
                     false,
                     false,
                     Trigger::Scheduled,
+                    Origin::DaemonSchedule,
                 );
                 let _ignored = cleaner.run(command).await;
             }
@@ -207,7 +211,7 @@ impl<T: IoHandler> Cleaner<T> {
         let command = CleanStaleArtifactsCommand::from_args(
             args,
             &self.config,
-            self.root_abs_path.dupe(),
+            self.buck_out_abs_path.dupe(),
             get_dispatcher(),
         );
         self.run(command)
@@ -243,9 +247,11 @@ impl<T: IoHandler> Cleaner<T> {
         let cleaner = self.dupe();
         async move {
             let start = Instant::now();
+            let disk_space = CleanDiskSpace::new(cleaner.buck_out_abs_path.as_deref());
             let observer = cleaner.begin();
-            let result = cleaner.dupe().run_inner(command.clone(), observer).await;
+            let mut result = cleaner.dupe().run_inner(command.clone(), observer).await;
             cleaner.interrupt();
+            disk_space.record(&mut result);
             let trace_id = match command.trigger {
                 Trigger::Scheduled => None,
                 _ => Some(command.dispatcher.trace_id().dupe()),
@@ -256,6 +262,7 @@ impl<T: IoHandler> Cleaner<T> {
                 command.dispatcher.daemon_id(),
                 (Instant::now() - start).as_secs(),
                 command.trigger,
+                command.origin,
                 command.policy_mode,
                 command.tracked_only,
             ));
@@ -321,7 +328,6 @@ impl<T: IoHandler> Cleaner<T> {
                     let error = error.context(format!(
                         "Error checking clean-stale artifact directory `{dir_abs}`"
                     ));
-                    tracing::warn!("Skipping clean-stale artifact directory: {error:#}");
                     scan_error.get_or_insert(PendingCleanFailure {
                         phase: CleanFailurePhase::RootDiscovery,
                         error,
@@ -389,8 +395,8 @@ impl<T: IoHandler> Cleaner<T> {
 
         let mut record_unmaterialization_ineligibility = false;
         if let Some(params) = command.adaptive_low_disk.as_ref() {
-            adaptive_outcome = match self.root_abs_path.as_ref() {
-                Some(root_abs_path) => match disk_space_stats(&**root_abs_path) {
+            adaptive_outcome = match self.buck_out_abs_path.as_ref() {
+                Some(buck_out_abs_path) => match disk_space_stats(&**buck_out_abs_path) {
                     Ok(disk_stats) => {
                         let mut params = params.clone();
                         params.unmaterialize_active &= self.rematerialization_ttl.is_some();
@@ -408,7 +414,7 @@ impl<T: IoHandler> Cleaner<T> {
                         adaptive.outcome
                     }
                     Err(e) => {
-                        let _unused = soft_error!("disk_space_stats", e);
+                        soft_error_or_panic!("disk_space_stats", e);
                         AdaptiveOutcome::DiskStatFailure
                     }
                 },
@@ -455,8 +461,7 @@ impl<T: IoHandler> Cleaner<T> {
                     db_size: index.iter().len(),
                     stats,
                 }
-                .into(),
-                quiet: true
+                .into()
             );
             return Err(CleanFailure::new(
                 CleanFailurePhase::StateValidation,
@@ -628,7 +633,6 @@ impl<T: IoHandler> Cleaner<T> {
             .upload_materialized_artifact(path.clone(), action_entry, info.dupe())
             .await
         {
-            tracing::warn!(path = %path, "Failed to upload artifact before unmaterialization: {error:#}");
             return (
                 CleanPathOutcome::UploadFailed { size, error },
                 CleanupOrigin::Uploaded,
@@ -971,7 +975,6 @@ impl<T: IoHandler> Scan<T> {
                         "Error scanning clean-stale artifact directory `{}`",
                         self.io.fs().resolve(&dir)
                     ));
-                    tracing::warn!("Skipping the rest of a clean-stale artifact directory: {e:#}");
                     stats.failed_directory += 1;
                     error.get_or_insert(PendingCleanFailure {
                         phase: CleanFailurePhase::Scan,
@@ -1000,7 +1003,6 @@ impl<T: IoHandler> Scan<T> {
             Err(e) if e.has_tag(ErrorTag::IoPermissionDenied) => {
                 // Tracked roots beneath an unreadable directory stay as they are: they cannot
                 // be deleted through it anyway, and a later scan sees them again.
-                tracing::warn!("Skipping unreadable directory in clean --stale scan: {e:#}");
                 stats.unreadable += 1;
                 return Ok(());
             }
@@ -1010,7 +1012,6 @@ impl<T: IoHandler> Scan<T> {
             let child = match child {
                 Ok(child) => child,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::warn!("Skipping unreadable entry in clean --stale scan: {e:#}");
                     stats.unreadable += 1;
                     continue;
                 }
@@ -1029,7 +1030,6 @@ impl<T: IoHandler> Scan<T> {
             let file_type = match child.file_type() {
                 Ok(file_type) => FileType::from(file_type),
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::warn!("Skipping unstatable entry in clean --stale scan: {e:#}");
                     stats.unreadable += 1;
                     continue;
                 }

@@ -41,6 +41,7 @@ use buck2_common::argv::SanitizedArgv;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_hash::BuckMutSet;
+use buck2_wrapper_common::BUCK_WRAPPER_PID_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_UUID_ENV_VAR;
 use buck2_wrapper_common::BUCK2_WRAPPER_ENV_VAR;
@@ -51,8 +52,9 @@ use crate::commands::build::print_build_failed;
 use crate::commands::build::print_build_result;
 use crate::commands::build::print_build_succeeded;
 
-const WRAPPER_ENV_VARS: [&str; 3] = [
+const WRAPPER_ENV_VARS: [&str; 4] = [
     BUCK2_WRAPPER_ENV_VAR,
+    BUCK_WRAPPER_PID_ENV_VAR,
     BUCK_WRAPPER_UUID_ENV_VAR,
     BUCK_WRAPPER_START_TIME_ENV_VAR,
 ];
@@ -241,7 +243,14 @@ impl StreamingCommand for RunCommand {
             }
         }
 
-        let chdir = self.chdir.map(|chdir| chdir.resolve(&ctx.working_dir));
+        // Under --no-buckd the in-process daemon owns this process' working directory and
+        // moves it into buck-out, so the exec'd target would start there instead of where the
+        // user invoked `buck run`: hand it the invocation directory, which was captured before
+        // any daemon ran. An explicit --chdir wins.
+        let chdir = Some(match self.chdir {
+            Some(chdir) => chdir.resolve(&ctx.working_dir),
+            None => ctx.working_dir.path().to_buf().into_abs_path_buf(),
+        });
 
         ExitResult::exec(
             run_args[0].clone().into(),

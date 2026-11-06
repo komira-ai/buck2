@@ -25,7 +25,6 @@ use starlark_derive::ProvidesStaticType;
 use starlark_derive::StarlarkPagable;
 use starlark_derive::starlark_module;
 use starlark_derive::starlark_value;
-use starlark_map::small_map::SmallMap;
 use starlark_syntax::golden_test_template::golden_test_template;
 
 use crate as starlark;
@@ -48,7 +47,8 @@ use crate::values::AllocValue;
 use crate::values::Heap;
 use crate::values::StarlarkValue;
 use crate::values::Value;
-use crate::values::ValueOfUnchecked;
+use crate::values::ValueOf;
+use crate::values::dict::DictType;
 use crate::values::layout::heap::name::StarlarkTestHeapName;
 use crate::values::none::NoneType;
 use crate::values::typing::StarlarkCallable;
@@ -57,6 +57,7 @@ use crate::values::typing::StarlarkIter;
 
 mod call;
 mod callable;
+mod calls_and_bindings;
 mod list;
 mod special_function;
 mod tuple;
@@ -116,14 +117,14 @@ impl StarlarkCallableParamSpec for NamedXy {
 #[starlark_types(MyCustomType as MyCustomType)]
 fn register_typecheck_globals(globals: &mut GlobalsBuilder) {
     fn accepts_iterable<'v>(
-        #[starlark(require = pos)] xs: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
+        #[starlark(require = pos)] xs: ValueOf<'v, StarlarkIter<Value<'v>>>,
     ) -> anyhow::Result<NoneType> {
         let _ignore = xs;
         Ok(NoneType)
     }
 
-    fn accepts_typed_kwargs(
-        #[starlark(kwargs)] x: SmallMap<String, u32>,
+    fn accepts_typed_kwargs<'v>(
+        #[starlark(kwargs)] x: ValueOf<'v, DictType<String, u32>>,
     ) -> anyhow::Result<NoneType> {
         let _ignore = x;
         Ok(NoneType)

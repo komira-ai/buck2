@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::file_digest_interner;
@@ -44,6 +45,9 @@ use buck2_execute::materialize::materializer::MaterializeResponse;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::WriteLease;
 use buck2_execute::materialize::materializer::WriteRequest;
+use buck2_execute::materialize::produce::Produced;
+use buck2_execute::materialize::produce::produce_locally;
+use buck2_execute::materialize::produce::write_locally;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutMap;
@@ -137,7 +141,29 @@ fn configs() -> DeferredMaterializerConfigs {
         verbose_materializer_log: false,
         clean_stale_config: CleanStaleConfig::default(),
         readonly_outputs: false,
+        strict_leases: false,
     }
+}
+
+/// A materializer under `strict_leases`, with or without a stash to put released roots back
+/// from.
+fn make_strict(
+    fs: &ProjectRoot,
+    with_stash: bool,
+) -> (
+    Arc<DiskStateMaterializer<StubIoHandler>>,
+    Arc<StubIoHandler>,
+) {
+    let mut configs = configs();
+    configs.strict_leases = true;
+    make_with_configs_and_stash(
+        fs,
+        StubIoHandler::new(fs.dupe()),
+        None,
+        None,
+        configs,
+        with_stash,
+    )
 }
 
 fn make(
@@ -193,18 +219,36 @@ fn make_with_configs(
     Arc<DiskStateMaterializer<StubIoHandler>>,
     Arc<StubIoHandler>,
 ) {
+    make_with_configs_and_stash(fs, io, db, state, configs, true)
+}
+
+fn make_with_configs_and_stash(
+    fs: &ProjectRoot,
+    io: StubIoHandler,
+    db: Option<MaterializerStateSqliteDb>,
+    state: Option<crate::sqlite::materializer_db::MaterializerState>,
+    configs: DeferredMaterializerConfigs,
+    with_stash: bool,
+) -> (
+    Arc<DiskStateMaterializer<StubIoHandler>>,
+    Arc<StubIoHandler>,
+) {
     let io = Arc::new(io);
     // A store of this materializer's own, over the process's table as in the daemon, with its
-    // stash under this test's buck-out.
+    // stash under this test's buck-out. Every test in the process shares the table, and so sees
+    // the records every other test's stash makes: a test whose outcome rests on whether the
+    // stash holds its content stashes bytes no other test does.
     let store: &'static BlobStore = Box::leak(Box::new(BlobStore::new(file_digest_interner())));
-    assert!(
-        store.attach_stash(
-            fs.root()
-                .join(ForwardRelativePath::unchecked_new("buck-out/v2/stash")),
-            CasDigestConfig::testing_default(),
-            Arc::new(DummyBlockingExecutor { fs: fs.dupe() }),
-        )
-    );
+    if with_stash {
+        assert!(
+            store.attach_stash(
+                fs.root()
+                    .join(ForwardRelativePath::unchecked_new("buck-out/v2/stash")),
+                CasDigestConfig::testing_default(),
+                Arc::new(DummyBlockingExecutor { fs: fs.dupe() }),
+            )
+        );
+    }
     let dm = DiskStateMaterializer::new_with_io(
         io.dupe(),
         store,
@@ -243,6 +287,13 @@ async fn in_store(
         .await?[0])
 }
 
+/// The inode of the file at `path`: the same before and after only if nothing replaced it.
+#[cfg(unix)]
+fn inode_of(path: &AbsNormPath) -> buck2_error::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.ino())
+}
+
 /// Clean-stale arguments under which everything this daemon has not used is stale.
 fn clean_unused() -> CleanStaleArtifactsArgs {
     CleanStaleArtifactsArgs {
@@ -254,6 +305,7 @@ fn clean_unused() -> CleanStaleArtifactsArgs {
         },
         dry_run: false,
         tracked_only: false,
+        origin: buck2_data::clean_stale_result::Origin::CleanCommand,
     }
 }
 
@@ -270,7 +322,7 @@ async fn restarted_with(
     let (dm, _io) = make(fs, Some(db), None);
     for (path, value) in &roots {
         drop(report(&dm, path, value.dupe()).await?);
-        // Content of the size the value says, which is what the next instance checks it by.
+        // The content on disk, as the rows will say it is.
         let size = match value.entry() {
             DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) => file.digest.size(),
             _ => panic!("restarted_with takes file values"),
@@ -319,7 +371,7 @@ async fn materialize_held(
     dm: &DiskStateMaterializer<StubIoHandler>,
     artifacts: Vec<(ProjectRelativePathBuf, ArtifactValue)>,
 ) -> buck2_error::Result<MaterializeResponse> {
-    let mut response = dm.as_dyn().materialize(request(artifacts)).await?;
+    let mut response = dm.materialize(request(artifacts)).await?;
     for result in std::mem::take(&mut response.results) {
         result?;
     }
@@ -332,16 +384,15 @@ async fn report(
     path: &ProjectRelativePathBuf,
     value: ArtifactValue,
 ) -> buck2_error::Result<WriteLease> {
-    let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
-    dm.as_dyn()
-        .declare_existing(
-            &lease,
-            vec![DeclareArtifactPayload {
-                path: path.clone(),
-                artifact: value,
-            }],
-        )
-        .await?;
+    let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+    dm.declare_existing(
+        &lease,
+        vec![DeclareArtifactPayload {
+            path: path.clone(),
+            artifact: value,
+        }],
+    )
+    .await?;
     Ok(lease)
 }
 
@@ -395,7 +446,7 @@ async fn test_reported_content_is_not_fetched() -> buck2_error::Result<()> {
         assert_eq!(io.take_log(), vec![]);
 
         // Preparing the path for a new output forgets it.
-        drop(dm.as_dyn().prepare_outputs(vec![p.clone()]).await?);
+        drop(dm.prepare_outputs(vec![p.clone()]).await?);
         assert!(!dm.has_artifact_at(p.clone()).await?);
         materialize_ok(&dm, vec![(p.clone(), file("A"))]).await?;
         assert_eq!(io.take_log(), vec![(Op::Materialize, p.clone())]);
@@ -412,9 +463,8 @@ async fn test_a_report_outside_the_lease_is_refused() -> buck2_error::Result<()>
         let (dm, _io) = make(temp.path(), None, None);
         let (a, b) = (path("buck-out/v2/gen/a"), path("buck-out/v2/gen/b"));
 
-        let lease = dm.as_dyn().prepare_outputs(vec![a.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![a.clone()]).await?;
         let err = dm
-            .as_dyn()
             .declare_existing(
                 &lease,
                 vec![DeclareArtifactPayload {
@@ -427,7 +477,7 @@ async fn test_a_report_outside_the_lease_is_refused() -> buck2_error::Result<()>
         assert!(format!("{err:#}").contains("outside the write roots"));
         // A lease this materializer did not grant is refused too.
         let err = dm
-            .declare_existing_impl(
+            .declare_existing(
                 &WriteLease::noop(),
                 vec![DeclareArtifactPayload {
                     path: a.clone(),
@@ -567,7 +617,6 @@ async fn test_each_pair_gets_its_own_result() -> buck2_error::Result<()> {
         io.set_fail_on(vec![bad.clone()]);
 
         let response = dm
-            .as_dyn()
             .materialize(request(vec![
                 (good.clone(), file("G")),
                 (bad.clone(), file("B")),
@@ -657,7 +706,7 @@ async fn test_a_prepared_output_blocks_readers_until_it_is_reported() -> buck2_e
         let (dm, io) = make(temp.path(), None, None);
         let p = path("buck-out/v2/gen/out");
 
-        let lease = dm.as_dyn().prepare_outputs(vec![p.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![p.clone()]).await?;
         let reader = tokio::spawn({
             let dm = dm.dupe();
             let p = p.clone();
@@ -668,15 +717,14 @@ async fn test_a_prepared_output_blocks_readers_until_it_is_reported() -> buck2_e
 
         // Once the producer has reported, the reader finds the content there and shares it,
         // while the producer still holds its lease.
-        dm.as_dyn()
-            .declare_existing(
-                &lease,
-                vec![DeclareArtifactPayload {
-                    path: p.clone(),
-                    artifact: file("A"),
-                }],
-            )
-            .await?;
+        dm.declare_existing(
+            &lease,
+            vec![DeclareArtifactPayload {
+                path: p.clone(),
+                artifact: file("A"),
+            }],
+        )
+        .await?;
         let held = timeout(SLOW, reader)
             .await
             .expect("reported content is readable at once")
@@ -760,7 +808,6 @@ async fn test_a_request_holds_its_outputs_for_writing() -> buck2_error::Result<(
         drop(report(&dm, &output, file("old")).await?);
 
         let response = dm
-            .as_dyn()
             .materialize(MaterializeRequest {
                 artifacts: vec![(input.clone(), file("I"))],
                 outputs: vec![output.clone()],
@@ -772,24 +819,23 @@ async fn test_a_request_holds_its_outputs_for_writing() -> buck2_error::Result<(
         assert!(!dm.has_artifact_at(output.clone()).await?, "untracked");
         // Another producer of the same output waits for this one.
         assert!(
-            timeout(A_BIT, dm.as_dyn().prepare_outputs(vec![output.clone()]))
+            timeout(A_BIT, dm.prepare_outputs(vec![output.clone()]))
                 .await
                 .is_err()
         );
         let (read, outputs) = response.into_leases()?;
         let outputs = outputs.expect("the request had outputs");
-        dm.as_dyn()
-            .declare_existing(
-                &outputs,
-                vec![DeclareArtifactPayload {
-                    path: output.clone(),
-                    artifact: file("new"),
-                }],
-            )
-            .await?;
+        dm.declare_existing(
+            &outputs,
+            vec![DeclareArtifactPayload {
+                path: output.clone(),
+                artifact: file("new"),
+            }],
+        )
+        .await?;
         drop((read, outputs));
         drop(
-            timeout(SLOW, dm.as_dyn().prepare_outputs(vec![output]))
+            timeout(SLOW, dm.prepare_outputs(vec![output]))
                 .await
                 .unwrap()?,
         );
@@ -808,11 +854,10 @@ async fn test_publish_moves_the_content_and_tracks_it() -> buck2_error::Result<(
         let src = path("buck-out/v2/gen/__action__/out");
         let dest = path("buck-out/v2/gen/content/abc/out");
 
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![src.clone()]).await?;
         fs.write_file(&src, "X", false)?;
         drop(
-            dm.as_dyn()
-                .publish(&lease, src.clone(), dest.clone(), file("X"))
+            dm.publish(&lease, src.clone(), dest.clone(), file("X"))
                 .await?,
         );
         drop(lease);
@@ -821,11 +866,10 @@ async fn test_publish_moves_the_content_and_tracks_it() -> buck2_error::Result<(
         assert!(dm.has_artifact_at(dest.clone()).await?);
 
         // The same content published again is redundant: the source goes, the destination stays.
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![src.clone()]).await?;
         fs.write_file(&src, "X", false)?;
         drop(
-            dm.as_dyn()
-                .publish(&lease, src.clone(), dest.clone(), file("X"))
+            dm.publish(&lease, src.clone(), dest.clone(), file("X"))
                 .await?,
         );
         drop(lease);
@@ -921,7 +965,7 @@ async fn test_a_final_output_materialization_promotes_a_tracked_root() -> buck2_
         drop(report(&dm, &p, file("promoted")).await?);
         let mut final_output = request(vec![(p.clone(), file("promoted"))]);
         final_output.purpose = MaterializationPurpose::FinalOutput { required: true };
-        let mut response = dm.as_dyn().materialize(final_output).await?;
+        let mut response = dm.materialize(final_output).await?;
         for result in std::mem::take(&mut response.results) {
             result?;
         }
@@ -946,15 +990,11 @@ async fn test_a_published_output_enters_the_store() -> buck2_error::Result<()> {
         let (dm, _io) = make(&fs, None, None);
         let src = path("buck-out/v2/gen/__action__/out");
         let dest = path("buck-out/v2/gen/content/def/out");
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![src.clone()]).await?;
         fs.write_file(&src, "published here", false)?;
         // Held as the action's value holds it; the store keeps nothing past the last holder.
         let published = file("published here");
-        drop(
-            dm.as_dyn()
-                .publish(&lease, src, dest, published.dupe())
-                .await?,
-        );
+        drop(dm.publish(&lease, src, dest, published.dupe()).await?);
         drop(lease);
         let copy = fs.resolve(path("buck-out/v2/gen/copy"));
         assert!(in_store(&dm, b"published here", &copy).await?);
@@ -1034,7 +1074,7 @@ async fn test_tracked_state_survives_a_restart() -> buck2_error::Result<()> {
 /// A root loaded from sqlite is checked against disk, kind and size, the first time it is read:
 /// one that is not there as the rows said is forgotten and put there again, and its rows with it.
 #[tokio::test]
-async fn test_a_loaded_root_not_on_disk_as_tracked_is_put_there_again() -> buck2_error::Result<()> {
+async fn test_a_loaded_root_is_trusted_as_the_rows_say() -> buck2_error::Result<()> {
     ignore_stack_overflow_checks_for_future(async {
         let temp = ProjectRootTemp::new()?;
         let fs = temp.path().dupe();
@@ -1056,8 +1096,9 @@ async fn test_a_loaded_root_not_on_disk_as_tracked_is_put_there_again() -> buck2
         .await?;
         io.take_log();
         abort(dm);
-        // What the rows say is there, then: one file gone, one of another size, one directory
-        // with a directory where a file was.
+        // Disk disagrees with the rows: one file gone, one of another size, one directory with a
+        // directory where a file was. The rows are trusted all the same, as the deferred core
+        // trusts its own: nothing is checked, nothing is put there again.
         fs.write_file(&changed, "longer", false)?;
         fs.write_file(d.join(ForwardRelativePath::unchecked_new("a")), "A", false)?;
         std::fs::create_dir_all(fs.resolve(d.join(ForwardRelativePath::unchecked_new("b"))))?;
@@ -1073,18 +1114,6 @@ async fn test_a_loaded_root_not_on_disk_as_tracked_is_put_there_again() -> buck2
             ],
         )
         .await?;
-        let mut log = io.take_log();
-        log.sort_by(|a, b| a.1.cmp(&b.1));
-        assert_eq!(
-            log,
-            vec![
-                (Op::Materialize, changed.clone()),
-                (Op::Materialize, d.clone()),
-                (Op::Materialize, gone.clone()),
-            ]
-        );
-        // Seen on disk now, as this daemon put it there: the next read checks nothing.
-        materialize_ok(&dm, vec![(gone.clone(), file("A"))]).await?;
         assert_eq!(io.take_log(), vec![]);
         abort(dm);
         Ok(())
@@ -1109,6 +1138,8 @@ async fn test_clean_stale_deletes_what_this_daemon_has_not_used() -> buck2_error
             .await?
             .stats
             .expect("stats");
+        assert!(stats.used_disk_space_bytes_start.is_some());
+        assert!(stats.used_disk_space_bytes_end.is_some());
         assert_eq!(
             (
                 stats.stale_artifact_count,
@@ -1170,7 +1201,7 @@ async fn test_clean_stale_leaves_what_someone_holds() -> buck2_error::Result<()>
         let (dm, _io) = make(&fs, None, None);
         // An output being produced is untracked on disk and held for writing.
         let out = path("buck-out/v2/gen/out");
-        let lease = dm.as_dyn().prepare_outputs(vec![out.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![out.clone()]).await?;
         fs.write_file(&out, "half", false)?;
 
         let stats = dm
@@ -1213,6 +1244,8 @@ async fn test_clean_stale_dry_run_deletes_nothing() -> buck2_error::Result<()> {
             .await?
             .stats
             .expect("stats");
+        assert!(stats.used_disk_space_bytes_start.is_some());
+        assert!(stats.used_disk_space_bytes_end.is_some());
         assert_eq!(
             (stats.stale_artifact_count, stats.cleaned_artifact_count),
             (1, 0)
@@ -1224,8 +1257,6 @@ async fn test_clean_stale_dry_run_deletes_nothing() -> buck2_error::Result<()> {
     .await
 }
 
-// The low-disk policy looks at `/` (`default_root_abs_path`), which Windows has not.
-#[cfg(unix)]
 #[tokio::test]
 async fn test_an_active_root_stays_when_its_upload_fails() -> buck2_error::Result<()> {
     use crate::materializers::deferred::clean_stale::LowDiskCleanConfig;
@@ -1267,6 +1298,7 @@ async fn test_an_active_root_stays_when_its_upload_fails() -> buck2_error::Resul
                 policy: CleanStaleArtifactsPolicy::Configured,
                 dry_run: false,
                 tracked_only: false,
+                origin: buck2_data::clean_stale_result::Origin::CleanCommand,
             })
             .await?
             .stats
@@ -1311,7 +1343,7 @@ async fn test_a_copy_of_buck_out_content_is_nothing_to_the_core() -> buck2_error
         assert!(!dm.has_artifact_at(dest).await?);
         // The source is not held: it can be taken for writing right away.
         drop(
-            timeout(A_BIT, dm.as_dyn().prepare_outputs(vec![src]))
+            timeout(A_BIT, dm.prepare_outputs(vec![src]))
                 .await
                 .expect("nothing holds the source")?,
         );
@@ -1321,75 +1353,24 @@ async fn test_a_copy_of_buck_out_content_is_nothing_to_the_core() -> buck2_error
     .await
 }
 
-/// A source file is not in buck-out and not known to be in the CAS, so its content enters the
-/// store, checked against the value's digest; the destination is left to whoever materializes it.
+/// A copy of a source file is the action's to make under `hold_or_take`: declared to this core,
+/// it is refused.
 #[tokio::test]
-async fn test_a_copy_from_outside_buck_out_enters_the_store() -> buck2_error::Result<()> {
+async fn test_a_copy_from_outside_buck_out_is_refused() -> buck2_error::Result<()> {
     ignore_stack_overflow_checks_for_future(async {
         let temp = ProjectRootTemp::new()?;
         let (dm, io) = make(temp.path(), None, None);
-        let src = path("src/b.txt");
-        let on_disk = temp.path().resolve(&src);
-        std::fs::create_dir_all(on_disk.parent().unwrap())?;
-        std::fs::write(&on_disk, b"copied from a source")?;
-        let dest = path("buck-out/v2/gen/copy");
-        let (a, b) = (
-            dest.join(ForwardRelativePath::unchecked_new("a")),
-            dest.join(ForwardRelativePath::unchecked_new("b")),
-        );
-        // Held as the copy's value would be held; a walk takes what nothing holds.
-        let _held = TrackedFileDigest::from_content(
-            b"copied from a source",
-            CasDigestConfig::testing_default(),
-        );
-        dm.declare_copy_impl(
-            dest.clone(),
-            dir(&[("a", "A"), ("b", "copied from a source")]),
-            vec![
-                CopiedArtifact::new(
-                    path("buck-out/v2/gen/built"),
-                    a.clone(),
-                    leaf(&file("A")),
-                    None,
-                ),
-                CopiedArtifact::new(
-                    src.clone(),
-                    b.clone(),
-                    leaf(&file("copied from a source")),
-                    None,
-                ),
-            ],
-        )
-        .await?;
-        assert_eq!(io.take_log(), vec![]);
-        assert!(!dm.has_artifact_at(b).await?);
-        assert!(!dm.has_artifact_at(dest.clone()).await?);
-        let out = temp.path().resolve(path("buck-out/v2/gen/out"));
-        assert!(in_store(&dm, b"copied from a source", &out).await?);
-
-        // A source without the content the value claims is refused, unless the store has that
-        // content already, in which case the file no longer matters.
-        std::fs::write(&on_disk, b"changed")?;
-        dm.declare_copy_impl(
-            dest.clone(),
-            file("copied from a source"),
-            vec![CopiedArtifact::new(
-                src.clone(),
-                dest.clone(),
-                leaf(&file("copied from a source")),
-                None,
-            )],
-        )
-        .await?;
+        let (src, dest) = (path("src/b.txt"), path("buck-out/v2/gen/copy"));
         assert!(
             dm.declare_copy_impl(
                 dest.clone(),
-                file("claimed"),
-                vec![CopiedArtifact::new(src, dest, leaf(&file("claimed")), None)],
+                file("B"),
+                vec![CopiedArtifact::new(src, dest, leaf(&file("B")), None)],
             )
             .await
             .is_err()
         );
+        assert_eq!(io.take_log(), vec![]);
         abort(dm);
         Ok(())
     })
@@ -1411,15 +1392,19 @@ async fn test_tracked_files_are_read_only_under_the_knob() -> buck2_error::Resul
         };
 
         let w = path("buck-out/v2/gen/written");
-        let request_path = w.clone();
-        dm.declare_write(Box::new(move || {
-            Ok(vec![WriteRequest {
-                path: request_path,
+        let blocking = DummyBlockingExecutor { fs: fs.dupe() };
+        write_locally(
+            &*dm,
+            &blocking,
+            &fs,
+            DigestConfig::testing_default(),
+            WriteRequest {
+                path: w.clone(),
                 content: b"written".to_vec(),
                 is_executable: false,
                 path_kind: BuckOutPathKind::Configuration,
-            }])
-        }))
+            },
+        )
         .await?;
         assert!(readonly(&w)?, "a write's output");
 
@@ -1443,7 +1428,7 @@ async fn test_tracked_files_are_read_only_under_the_knob() -> buck2_error::Resul
         drop(lease);
 
         // The run of an incremental action may write them again.
-        let lease = dm.as_dyn().prepare_outputs(vec![d.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![d.clone()]).await?;
         dm.make_outputs_writable(vec![d.clone()]).await?;
         assert!(!readonly(&a)? && !readonly(&b)?);
         drop(lease);
@@ -1453,30 +1438,43 @@ async fn test_tracked_files_are_read_only_under_the_knob() -> buck2_error::Resul
     .await
 }
 
-/// A write goes to disk and is tracked, as a local action's output is, and the store holds its
-/// content as it holds theirs.
+/// Content an action makes goes to disk under `hold_or_take` and a report, as a local action's
+/// output does, and the store holds it as it holds theirs; asked for again, the path is found
+/// holding it and nothing is made.
 #[tokio::test]
-async fn test_a_write_goes_to_disk_and_is_tracked() -> buck2_error::Result<()> {
+async fn test_produced_content_is_tracked_and_enters_the_store() -> buck2_error::Result<()> {
     ignore_stack_overflow_checks_for_future(async {
         let temp = ProjectRootTemp::new()?;
         let (dm, io) = make(temp.path(), None, None);
+        let blocking = DummyBlockingExecutor {
+            fs: temp.path().dupe(),
+        };
         let p = path("buck-out/v2/gen/written");
-        let request_path = p.clone();
-        let values = dm
-            .declare_write(Box::new(move || {
-                Ok(vec![WriteRequest {
-                    path: request_path,
-                    content: b"written".to_vec(),
-                    is_executable: true,
-                    path_kind: BuckOutPathKind::Configuration,
-                }])
-            }))
-            .await?;
-        assert_eq!(values, vec![file_exec("written")]);
+        let request = || WriteRequest {
+            path: p.clone(),
+            content: b"made under hold_or_take".to_vec(),
+            is_executable: true,
+            path_kind: BuckOutPathKind::Configuration,
+        };
+        let (value, produced) = write_locally(
+            &*dm,
+            &blocking,
+            temp.path(),
+            DigestConfig::testing_default(),
+            request(),
+        )
+        .await?;
+        assert_eq!(
+            (value.dupe(), produced),
+            (file_exec("made under hold_or_take"), Produced::Made)
+        );
         assert_eq!(io.take_log(), vec![]);
-        assert_eq!(std::fs::read_to_string(temp.path().resolve(&p))?, "written");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().resolve(&p))?,
+            "made under hold_or_take"
+        );
         assert!(dm.has_artifact_at(p.clone()).await?);
-        let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = values[0].entry() else {
+        let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = value.entry() else {
             panic!("a write's value is a file");
         };
         assert!(
@@ -1484,10 +1482,72 @@ async fn test_a_write_goes_to_disk_and_is_tracked() -> buck2_error::Result<()> {
             "the store holds what the CAS is not known to"
         );
 
-        // Asked for again, the path is found tracked as wanted: nothing is written or fetched.
-        materialize_ok(&dm, vec![(p.clone(), file_exec("written"))]).await?;
+        // Made again, the path is found holding it: nothing is written.
+        #[cfg(unix)]
+        let inode = inode_of(&temp.path().resolve(&p))?;
+        let (_, produced) = write_locally(
+            &*dm,
+            &blocking,
+            temp.path(),
+            DigestConfig::testing_default(),
+            request(),
+        )
+        .await?;
+        assert_eq!(produced, Produced::Found);
+        #[cfg(unix)]
+        assert_eq!(
+            inode_of(&temp.path().resolve(&p))?,
+            inode,
+            "the file was not replaced"
+        );
+        // Asked for as a reader, it is found tracked as wanted.
+        materialize_ok(&dm, vec![(p.clone(), file_exec("made under hold_or_take"))]).await?;
         assert_eq!(io.take_log(), vec![]);
-        assert_eq!(std::fs::read_to_string(temp.path().resolve(&p))?, "written");
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+/// Content a previous daemon left on disk, in the rows and not in this daemon's store, is found
+/// under `hold_or_take` and enters the store from its path; nothing is made.
+#[tokio::test]
+async fn test_content_a_previous_daemon_left_is_found_and_enters_the_store()
+-> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let p = path("buck-out/v2/gen/written");
+        let (dm, io) = restarted_with(
+            temp.path(),
+            vec![(p.clone(), file("left by a previous daemon"))],
+        )
+        .await?;
+        temp.path()
+            .write_file(&p, "left by a previous daemon", false)?;
+        let blocking = DummyBlockingExecutor {
+            fs: temp.path().dupe(),
+        };
+        #[cfg(unix)]
+        let inode = inode_of(&temp.path().resolve(&p))?;
+        // Held as a value would hold it; the store keeps content only while something does.
+        let value = file("left by a previous daemon");
+        let produced = produce_locally(&*dm, &blocking, p.clone(), value.dupe(), || {
+            unreachable!("the path holds the content")
+        })
+        .await?;
+        assert_eq!(produced, Produced::Found);
+        assert_eq!(io.take_log(), vec![]);
+        #[cfg(unix)]
+        assert_eq!(
+            inode_of(&temp.path().resolve(&p))?,
+            inode,
+            "the file was not replaced"
+        );
+        let out = temp.path().resolve(path("buck-out/v2/gen/out"));
+        assert!(
+            in_store(&dm, b"left by a previous daemon", &out).await?,
+            "the store took the content from the path"
+        );
         abort(dm);
         Ok(())
     })
@@ -1686,13 +1746,159 @@ async fn test_what_nothing_holds_leaves_the_store() -> buck2_error::Result<()> {
     .await
 }
 
-/// The public API of the materializer under test, which lives on the trait object.
-trait AsDyn {
-    fn as_dyn(&self) -> &dyn Materializer;
+/// Polls `check` until it holds. The deadline is far beyond what the remover needs, since a
+/// loaded test runner, the OSS cargo test run among them, stretches the handful of thread and
+/// task hops a removal takes.
+async fn eventually(
+    mut check: impl AsyncFnMut() -> buck2_error::Result<bool>,
+) -> buck2_error::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if check().await? {
+            return Ok(());
+        }
+        assert!(Instant::now() < deadline, "the condition never held");
+        sleep(Duration::from_millis(5)).await;
+    }
 }
 
-impl AsDyn for DiskStateMaterializer<StubIoHandler> {
-    fn as_dyn(&self) -> &dyn Materializer {
-        self
-    }
+/// Writes `content` at `p` and reports it as `value` under a lease over it, as a producer does.
+/// The caller keeps `value`, as the action's dice value would: the stash holds a blob only
+/// while some tracked digest of it is held.
+async fn write_and_report(
+    dm: &DiskStateMaterializer<StubIoHandler>,
+    fs: &ProjectRoot,
+    p: &ProjectRelativePathBuf,
+    content: &str,
+    value: &ArtifactValue,
+) -> buck2_error::Result<WriteLease> {
+    let lease = dm.prepare_outputs(vec![p.clone()]).await?;
+    fs.write_file(p, content, false)?;
+    dm.declare_existing(
+        &lease,
+        vec![DeclareArtifactPayload {
+            path: p.clone(),
+            artifact: value.dupe(),
+        }],
+    )
+    .await?;
+    Ok(lease)
+}
+
+#[tokio::test]
+async fn test_strict_leases_remove_a_released_root_and_serve_it_again() -> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path();
+        let (dm, _io) = make_strict(fs, true);
+        let p = path("buck-out/v2/gen/out");
+        // Content no other test stashes: the digest table is the process's, and a record another
+        // test's stash made for the same bytes would stand in for this one's.
+        let value = file("removed and served again");
+
+        let lease = write_and_report(&dm, fs, &p, "removed and served again", &value).await?;
+        assert!(dm.has_artifact_at(p.clone()).await?);
+        drop(lease);
+        // Released: the root goes, from the tree and from disk.
+        eventually(async || Ok(!dm.has_artifact_at(p.clone()).await?)).await?;
+        assert!(!fs.resolve(&p).exists());
+
+        // And comes back from the stash when asked for.
+        let response = dm
+            .materialize(request(vec![(p.clone(), value.dupe())]))
+            .await?;
+        let lease = response.ensure_results_ok()?;
+        assert_eq!(
+            std::fs::read_to_string(fs.resolve(&p))?,
+            "removed and served again"
+        );
+        drop(lease);
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_strict_leases_keep_final_outputs_and_what_is_read_after_the_command()
+-> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path();
+        let (dm, _io) = make_strict(fs, true);
+
+        // A final output stays: the user reads it after the command.
+        let out = path("buck-out/v2/gen/out");
+        let x = file("a final output");
+        drop(write_and_report(&dm, fs, &out, "a final output", &x).await?);
+        eventually(async || Ok(!dm.has_artifact_at(out.clone()).await?)).await?;
+        let mut final_output = request(vec![(out.clone(), x.dupe())]);
+        final_output.purpose = MaterializationPurpose::FinalOutput { required: true };
+        drop(dm.materialize(final_output).await?.ensure_results_ok()?);
+
+        // So does a test's output, which the runner reads after the command.
+        let test_output = path("buck-out/v2/test/execution/out");
+        let t = file("a test's output");
+        drop(write_and_report(&dm, fs, &test_output, "a test's output", &t).await?);
+
+        sleep(A_BIT).await;
+        assert!(dm.has_artifact_at(out.clone()).await?);
+        assert!(fs.resolve(&out).exists());
+        assert!(dm.has_artifact_at(test_output.clone()).await?);
+        assert!(fs.resolve(&test_output).exists());
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_strict_leases_remove_a_released_root_nothing_could_put_back()
+-> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path();
+        // No stash: a report's content exists nowhere but at its path.
+        let (dm, _io) = make_strict(fs, false);
+        let p = path("buck-out/v2/gen/out");
+        let value = file("nothing could put this back");
+
+        drop(write_and_report(&dm, fs, &p, "nothing could put this back", &value).await?);
+        // The root goes all the same: a reader without a lease must not find it, and a request
+        // for the content fails at the read instead.
+        eventually(async || Ok(!dm.has_artifact_at(p.clone()).await?)).await?;
+        assert!(!fs.resolve(&p).exists());
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_strict_leases_remove_a_released_root_nothing_holds() -> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path();
+        let (dm, _io) = make_strict(fs, true);
+        let p = path("buck-out/v2/gen/out");
+        let content = "held by its command alone";
+        let value = file(content);
+
+        let lease = write_and_report(&dm, fs, &p, content, &value).await?;
+        // The last handle to the content goes before the lease, as an action's metadata file's
+        // does; the stash drops the blob with it.
+        drop(value);
+        let digest = FileDigest::from_content(
+            content.as_bytes(),
+            DigestConfig::testing_default().cas_digest_config(),
+        );
+        assert!(file_digest_interner().peek(&digest).is_none());
+        // The root goes with its lease as any freed root does.
+        drop(lease);
+        eventually(async || Ok(!dm.has_artifact_at(p.clone()).await?)).await?;
+        assert!(!fs.resolve(&p).exists());
+        abort(dm);
+        Ok(())
+    })
+    .await
 }

@@ -349,6 +349,7 @@ def _maybe_filter_resources(ctx: AnalysisContext, resources: list[AndroidResourc
             manifest_file = resource.manifest_file,
             r_dot_java_package = resource.r_dot_java_package,
             res = filtered_res,
+            source_res = resource.source_res,
             text_symbols = resource.text_symbols,
             unused_resource_dep_validation_has_non_xml_resources = resource.unused_resource_dep_validation_has_non_xml_resources,
         )
@@ -600,6 +601,11 @@ def _merge_assets(
             merged_assets_output_hash = None
 
         merge_assets_cmd.add("--binary-type", "aab" if is_bundle_build else "apk")
+
+        # `apk_build` and the bundle builder inflate every compressed entry of this APK and deflate it
+        # again at their own level, so the level used here never reaches the final APK or bundle.
+        if not is_exopackaged_enabled_for_resources:
+            merge_assets_cmd.add("--compression-level", "1")
 
         return merge_assets_cmd, merged_assets_output_hash
 

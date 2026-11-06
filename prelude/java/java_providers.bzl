@@ -111,9 +111,6 @@ def _args_for_ast_dumper(entry: JavaClasspathEntry):
 def _args_for_compiling(entry: JavaClasspathEntry):
     return entry.abi
 
-def _javacd_json(v):
-    return v.abi
-
 def _abi_snapshot_json(entry: JavaClasspathEntry):
     if entry.abi and entry.abi_jar_snapshot:
         return cmd_args([entry.abi_jar_snapshot], delimiter = " ")
@@ -162,7 +159,6 @@ JavaCompilingDepsTSet = transitive_set(
     },
     json_projections = {
         "abi_snapshot_json": _abi_snapshot_json,
-        "javacd_json": _javacd_json,
     },
     reductions = {
         "compiler_depth": _compiler_depth,
@@ -277,6 +273,7 @@ JavaCompileOutputs = record(
     preprocessed_library = Artifact,
     incremental_state_dir = Artifact | None,
     used_jars_json = Artifact | None,
+    compiler_class_to_source_map = field(Artifact | None, default = None),
 )
 
 JavaProviders = record(
@@ -328,6 +325,7 @@ def make_compile_outputs(
     incremental_state_dir: Artifact | None = None,
     abi_jar_snapshot: Artifact | None = None,
     used_jars_json: Artifact | None = None,
+    compiler_class_to_source_map: Artifact | None = None,
     full_library_compiler_depth: JavaCompilerDepth | None = None,
     abi_compiler_depth: JavaCompilerDepth | None = None,
 ) -> JavaCompileOutputs:
@@ -350,6 +348,7 @@ def make_compile_outputs(
         preprocessed_library = preprocessed_library,
         incremental_state_dir = incremental_state_dir,
         used_jars_json = used_jars_json,
+        compiler_class_to_source_map = compiler_class_to_source_map,
     )
 
 def create_abi(actions: AnalysisActions, class_abi_generator: Dependency, library: Artifact, keepSynthetic: bool = False) -> Artifact:
@@ -446,6 +445,10 @@ def derive_compiling_deps_wrapper(
 
     return actions.tset(JavaCompilingDepsTSetWrapper, children = (children or []) + ([library_output] if library_output else []))
 
+def _is_dexing_enabled(ctx: AnalysisContext) -> bool:
+    dex_toolchain = getattr(ctx.attrs, "_dex_toolchain", None)
+    return dex_toolchain != None and dex_toolchain[DexToolchainInfo].d8_command != None
+
 def create_java_packaging_dep(
     ctx: AnalysisContext,
     library_jar: Artifact | None = None,
@@ -463,8 +466,7 @@ def create_java_packaging_dep(
     gwt_module: Artifact | None = None,
     compiler_depth: JavaCompilerDepth | None = None,
 ) -> JavaPackagingDep:
-    dex_toolchain = getattr(ctx.attrs, "_dex_toolchain", None)
-    if library_jar != None and has_srcs and dex_toolchain != None and ctx.attrs._dex_toolchain[DexToolchainInfo].d8_command != None:
+    if library_jar != None and has_srcs and _is_dexing_enabled(ctx):
         dex = get_dex_produced_from_java_library(
             ctx,
             ctx.attrs._dex_toolchain[DexToolchainInfo],
@@ -795,7 +797,12 @@ def create_java_library_providers(
     first_order_classpath_libs = [dep.output_for_classpath_macro for dep in first_order_classpath_deps]
 
     compiling_deps = get_compiling_deps_tset(ctx.actions, declared_deps + exported_deps + provided_deps + exported_provided_deps)
-    desugar_classpath = compiling_deps.project_as_args("full_library_args") if needs_desugar and compiling_deps != None else None
+    desugar_classpath = None
+    if needs_desugar and compiling_deps != None and _is_dexing_enabled(ctx):
+        # Below API 24, D8 desugars interface method calls and needs synthetic members that ABI jars drop.
+        min_sdk_version = ctx.attrs.min_sdk_version
+        abi_jars_suffice = min_sdk_version != None and int(min_sdk_version) >= 24
+        desugar_classpath = compiling_deps.project_as_args("args_for_compiling" if abi_jars_suffice else "full_library_args")
 
     library_info, packaging_info, global_code_info, shared_library_info, cxx_resource_info, linkable_graph = _create_non_template_providers(
         ctx,

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_core::bzl::ImportPath;
+use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::build_context::starlark_path_from_build_context;
@@ -37,16 +38,20 @@ use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
+use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkPagableViaPagable;
+use starlark::values::StarlarkRepresentations;
+use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
-use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
+use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
 use starlark::values::starlark_value;
-use starlark::values::typing::StarlarkCallable;
 use starlark::values::typing::StarlarkCallableChecked;
 use starlark::values::typing::TypeInstanceId;
 use starlark::values::typing::TypeMatcherFactory;
@@ -62,6 +67,8 @@ use crate::interpreter::rule_defs::type_id_domain::Buck2TypeIdDomain;
 enum TransitiveSetDefinitionError {
     #[error("`transitive_set()` can only be used in `bzl` files")]
     TransitiveSetOnlyInBzl,
+    #[error("Transitive set definition used before the module defining it finished loading")]
+    UsedBeforeLoaded,
 }
 
 #[derive(
@@ -97,12 +104,20 @@ impl TransitiveSetProjectionKind {
     }
 }
 
+/// A projection: `def(value) -> cmd_args | json`.
+pub type ProjectionCallable<'v> =
+    ValueOf<'v, StarlarkCallableChecked<'v, (Value<'static>,), Value<'static>>>;
+/// A reduction: `def(children, value) -> value`.
+pub type ReductionCallable<'v> = ValueOf<
+    'v,
+    StarlarkCallableChecked<'v, (ListType<Value<'static>>, Value<'static>), Value<'static>>,
+>;
+
 #[derive(Debug, Clone, Trace, Freeze, Allocative, StarlarkPagable)]
 pub struct TransitiveSetProjectionSpec<'v> {
     #[freeze(identity)]
     pub kind: TransitiveSetProjectionKind,
-    pub projection:
-        ValueOfUnchecked<'v, StarlarkCallable<'static, (Value<'static>,), Value<'static>>>,
+    pub projection: ProjectionCallable<'v>,
 }
 
 /// A unique identity for a given [`TransitiveSetDefinition`].
@@ -142,13 +157,7 @@ pub struct TransitiveSetOperations<'v> {
 
     /// Callables that will reduce the values contained in transitive sets to a single value per
     /// node. This can be used to e.g. aggregate flags throughout a transitive set;
-    pub(crate) reductions: BuckMutInsertionMap<
-        String,
-        ValueOfUnchecked<
-            'v,
-            StarlarkCallable<'static, (ListType<Value<'static>>, Value<'static>), Value<'static>>,
-        >,
-    >,
+    pub(crate) reductions: BuckMutInsertionMap<String, ReductionCallable<'v>>,
 }
 
 impl<'v> TransitiveSetOperations<'v> {
@@ -235,19 +244,52 @@ impl<'v> AllocValue<'v> for TransitiveSetDefinition<'v> {
     }
 }
 
-#[starlark_value(type = "TransitiveSetDefinition")]
-impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
-    type Canonical = FrozenTransitiveSetDefinition<'v>;
+/// A transitive set definition in either of its representations.
+#[derive(Debug, Clone, Copy, StarlarkRepresentations)]
+pub enum TransitiveSetDefinitionView<'v> {
+    Frozen(ValueTyped<'v, FrozenTransitiveSetDefinition<'v>>),
+    Unfrozen(ValueTyped<'v, TransitiveSetDefinition<'v>>),
+}
 
+impl<'v> TransitiveSetDefinitionView<'v> {
+    /// The definition once its module is loaded, which is what creating a set requires: the set
+    /// keeps the definition, and a definition is only unfrozen while its module loads, when no
+    /// analysis runs.
+    pub fn frozen(
+        self,
+    ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenTransitiveSetDefinition<'v>>> {
+        match self {
+            TransitiveSetDefinitionView::Frozen(this) => FrozenValueTyped::new_err(this.to_value())
+                .internal_error("the frozen representation is only allocated on a frozen heap"),
+            TransitiveSetDefinitionView::Unfrozen(_) => {
+                Err(TransitiveSetDefinitionError::UsedBeforeLoaded.into())
+            }
+        }
+    }
+
+    /// What `export_as` establishes; always present once frozen.
+    fn exported(&self) -> Option<&'v TransitiveSetDefinitionExported> {
+        match self {
+            TransitiveSetDefinitionView::Frozen(this) => Some(&this.as_ref().exported),
+            TransitiveSetDefinitionView::Unfrozen(this) => this.as_ref().exported.get(),
+        }
+    }
+}
+
+#[starlark_value(type = "TransitiveSetDefinition")]
+impl<'v> StarlarkType<'v> for TransitiveSetDefinitionView<'v> {
     fn export_as(
         &self,
         variable_name: &str,
         _: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<()> {
+        let TransitiveSetDefinitionView::Unfrozen(this) = self else {
+            return Ok(());
+        };
         // First export wins
-        self.exported.get_or_try_init(|| {
+        this.exported.get_or_try_init(|| {
             let id = Arc::new(TransitiveSetId {
-                module_id: self.module_id.clone(),
+                module_id: this.module_id.clone(),
                 name: variable_name.to_owned(),
             });
             let set_type_instance_id =
@@ -284,8 +326,7 @@ impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         if attribute == "type" {
             let typ = self
-                .exported
-                .get()
+                .exported()
                 .map_or("TransitiveSetDefinition", |exported| {
                     exported.id.name.as_str()
                 });
@@ -297,16 +338,20 @@ impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
 
     fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
         let exported = self
-            .exported
-            .get()
+            .exported()
             .internal_error("cannot hash a transitive_set_definition without id")?;
         exported.id.hash(hasher);
         Ok(())
     }
 
     fn eval_type(&self) -> Option<Ty> {
-        self.exported.get().map(|exported| exported.set_ty.dupe())
+        self.exported().map(|exported| exported.set_ty.dupe())
     }
+}
+
+#[starlark_value]
+impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
+    type Type = TransitiveSetDefinitionView<'v>;
 }
 
 #[derive(Display, ProvidesStaticType, Allocative, StarlarkPagable)]
@@ -336,35 +381,9 @@ impl<'v> Serialize for FrozenTransitiveSetDefinition<'v> {
     }
 }
 
-#[starlark_value(type = "TransitiveSetDefinition", frozen_vtable)]
+#[starlark_value(frozen_vtable)]
 impl<'v> StarlarkValue<'v> for FrozenTransitiveSetDefinition<'v> {
-    type Canonical = Self;
-
-    fn dir_attr(&self) -> Vec<String> {
-        vec!["type".to_owned()]
-    }
-
-    fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
-        attribute == "type"
-    }
-
-    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
-        if attribute == "type" {
-            let typ = self.exported.id.name.as_str();
-            Some(heap.alloc(typ))
-        } else {
-            None
-        }
-    }
-
-    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
-        self.exported.id.hash(hasher);
-        Ok(())
-    }
-
-    fn eval_type(&self) -> Option<Ty> {
-        Some(self.exported.set_ty.dupe())
-    }
+    type Type = TransitiveSetDefinitionView<'v>;
 }
 
 impl<'v> Freeze<'v> for TransitiveSetDefinition<'v> {
@@ -436,52 +455,50 @@ impl<'v> TransitiveSetDefinitionLike<'v> for FrozenTransitiveSetDefinition<'v> {
 pub fn register_transitive_set(builder: &mut GlobalsBuilder) {
     fn transitive_set<'v>(
         #[starlark(require = named)] args_projections: Option<
-            BuckMutInsertionMap<String, StarlarkCallableChecked<'v, (Value<'v>,), Value<'v>>>,
+            ValueOf<'v, DictType<String, ProjectionCallable<'v>>>,
         >,
         #[starlark(require = named)] json_projections: Option<
-            BuckMutInsertionMap<String, StarlarkCallableChecked<'v, (Value<'v>,), Value<'v>>>,
+            ValueOf<'v, DictType<String, ProjectionCallable<'v>>>,
         >,
         #[starlark(require = named)] reductions: Option<
-            BuckMutInsertionMap<
-                String,
-                StarlarkCallableChecked<'v, (ListType<Value<'v>>, Value<'v>), Value<'v>>,
-            >,
+            ValueOf<'v, DictType<String, ReductionCallable<'v>>>,
         >,
         eval: &mut Evaluator,
     ) -> starlark::Result<TransitiveSetDefinition<'v>> {
         let projections: BuckMutInsertionMap<_, _> = args_projections
             .into_iter()
-            .flat_map(|v| v.into_iter())
-            .map(|(k, v)| {
-                (
+            .flat_map(|v| v.try_items())
+            .map(|entry| {
+                let (k, v) = entry?;
+                Ok::<_, starlark::Error>((
                     k,
                     TransitiveSetProjectionSpec {
                         kind: TransitiveSetProjectionKind::Args,
-                        projection: ValueOfUnchecked::new(v.0),
+                        projection: v,
                     },
-                )
+                ))
             })
             .chain(
                 json_projections
                     .into_iter()
-                    .flat_map(|v| v.into_iter())
-                    .map(|(k, v)| {
-                        (
+                    .flat_map(|v| v.try_items())
+                    .map(|entry| {
+                        let (k, v) = entry?;
+                        Ok::<_, starlark::Error>((
                             k,
                             TransitiveSetProjectionSpec {
                                 kind: TransitiveSetProjectionKind::Json,
-                                projection: ValueOfUnchecked::new(v.0),
+                                projection: v,
                             },
-                        )
+                        ))
                     }),
             )
-            .collect();
+            .collect::<starlark::Result<_>>()?;
 
-        let reductions = reductions
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, ValueOfUnchecked::new(v.0)))
-            .collect();
+        let reductions = match reductions {
+            Some(reductions) => reductions.try_items().collect::<starlark::Result<_>>()?,
+            None => BuckMutInsertionMap::new(),
+        };
 
         let starlark_path: StarlarkPath = starlark_path_from_build_context(eval)?;
         Ok(TransitiveSetDefinition::new(

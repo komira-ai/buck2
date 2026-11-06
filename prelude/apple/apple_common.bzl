@@ -195,6 +195,55 @@ def _uses_explicit_modules_arg():
         "uses_explicit_modules": attrs.bool(default = False),
     }
 
+def swift_dynamic_replacement_select(enabled, disabled):
+    """`enabled` or `disabled`, as the configuration decides Swift dynamic
+    replacement. The `swift_dynamic_replacement` constraint decides when it is
+    set, to `enabled` or `disabled`; the
+    `apple.swift_dynamic_replacement_override_enabled` buckconfig is only the
+    fallback for a configuration that leaves the constraint unspecified, so a
+    platform or a mode's modifier pins the decision and a buckconfig alone
+    cannot override a platform that pins `disabled`. It is the default of the
+    `swift_dynamic_replacement_enabled` attribute, which a target may set
+    itself; what follows the configuration alone, such as the runtime
+    `ios_binary` links, uses this select directly."""
+    return select({
+        "DEFAULT": select({
+            "DEFAULT": disabled,
+            "config//features/apple:swift_dynamic_replacement_override_enabled": enabled,
+        }),
+        "config//features/apple/constraints:swift_dynamic_replacement[disabled]": disabled,
+        "config//features/apple/constraints:swift_dynamic_replacement[enabled]": enabled,
+    })
+
+def apple_hot_code_reload_enabled_select(enabled, disabled):
+    """`enabled` or `disabled`, as the configuration decides hot code reload:
+    what an app build does for it as a whole, such as linking the SwiftUI
+    reload runtime and recording the decision in `BuildInfo.json`. Decided by
+    the `apple.hot_code_reload_enabled` buckconfig (`@fbsource//fbobjc/mode/hot-code-reload`),
+    independently of whether modules are compiled for Swift dynamic
+    replacement, which `swift_dynamic_replacement_select` decides."""
+    return select({
+        "DEFAULT": disabled,
+        "config//features/apple:hot_code_reload_enabled": enabled,
+    })
+
+def get_swift_dynamic_replacement_enabled():
+    """Whether Swift is compiled for dynamic replacement: by default as
+    `swift_dynamic_replacement_select` decides, and a target may set it."""
+    return attrs.bool(default = swift_dynamic_replacement_select(True, False))
+
+def _swift_dynamic_replacement_enabled_arg():
+    """Compiles a Swift module so that every function, initializer, computed
+    property and subscript can be replaced at run time with
+    `@_dynamicReplacement`, and lets the library produce such replacements.
+    Every call pays an indirection, so this is for development builds only. Unset, it follows the
+    `swift_dynamic_replacement` constraint, and when that is unspecified the
+    `apple.swift_dynamic_replacement_override_enabled` buckconfig; a target
+    that sets it decides for itself, whatever the configuration says."""
+    return {
+        "swift_dynamic_replacement_enabled": get_swift_dynamic_replacement_enabled(),
+    }
+
 def _meta_apple_library_validation_enabled_default_value():
     if not is_full_meta_repo():
         return False
@@ -275,7 +324,7 @@ def _executable_name_arg():
 
 def _apple_toolchain_arg():
     return {
-        "_apple_toolchain": attrs.toolchain_dep(default = "toolchains//:apple-default", providers = [AppleToolchainInfo]),
+        "_apple_toolchain": attrs.toolchain_dep(default = "toolchains//:apple-default", providers = [AppleToolchainInfo], exec_group = DefaultExecGroup),
     }
 
 def _asset_catalogs_compilation_options_arg():
@@ -469,6 +518,7 @@ apple_common = struct(
     privacy_manifest_arg = _privacy_manifest_arg,
     serialize_debugging_options_arg = _serialize_debugging_options_arg,
     uses_explicit_modules_arg = _uses_explicit_modules_arg,
+    swift_dynamic_replacement_enabled_arg = _swift_dynamic_replacement_enabled_arg,
     meta_apple_library_validation_enabled_arg = _meta_apple_library_validation_enabled_arg,
     skip_universal_resource_dedupe_arg = _skip_universal_resource_dedupe_arg,
     apple_sanitizer_compatibility_arg = _apple_sanitizer_compatibility_arg,

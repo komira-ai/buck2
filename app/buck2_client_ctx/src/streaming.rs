@@ -13,10 +13,8 @@ use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use buck2_agent_interactive::Advice;
-use buck2_agent_interactive::Decision;
 use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
-use buck2_common::init::DEFAULT_RETAINED_EVENT_LOGS;
 use buck2_common::invocation_paths::DEFAULT_ISOLATION_DIR;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_error::ErrorTag;
@@ -24,6 +22,7 @@ use buck2_error::ExitCode;
 use buck2_event_observer::span_tracker::EventTimestamp;
 use dupe::Dupe;
 
+use crate::client_ctx::AgentAdvice;
 use crate::client_ctx::BuckSubcommand;
 use crate::client_ctx::ClientCommandContext;
 use crate::common::BuckArgMatches;
@@ -73,12 +72,10 @@ fn update_events_ctx<T: StreamingCommand>(
     let log_size_counter_bytes = Some(Arc::new(AtomicU64::new(0)));
 
     let enable_health_checks = ctx
-        .immediate_config
-        .daemon_startup_config()
-        .map(|daemon_startup_config| {
-            daemon_startup_config
-                .health_check_config
-                .enable_health_checks
+        .buck_settings()
+        .and_then(|settings| {
+            let mut buckconfig = ctx.immediate_config.root_config()?;
+            settings.invocation.health_check.enabled(&mut buckconfig)
         })
         .unwrap_or(false)
         // Force-enable health checks when the test override is set.
@@ -250,7 +247,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
                     new_isolation_dir_advice: if ctx.paths()?.isolation.as_str()
                         == DEFAULT_ISOLATION_DIR
                     {
-                        Decision::Inactive
+                        AgentAdvice::not_applicable(Advice::NewIsolationDir)
                     } else {
                         ctx.agent_advice(Advice::NewIsolationDir)?
                     },
@@ -344,10 +341,9 @@ fn get_event_log_subscriber<T: StreamingCommand>(
         T::COMMAND_NAME.to_owned(),
         ctx.start_time,
         log_size_counter_bytes,
-        ctx.immediate_config
-            .daemon_startup_config()
-            .map(|daemon_startup_config| daemon_startup_config.retained_event_logs)
-            .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
+        ctx.buck_settings()
+            .map(|settings| settings.invocation.event_log.retained_logs())
+            .unwrap_or_else(|_| buck2_settings::EventLog::default().retained_logs()),
     );
     Box::new(log)
 }

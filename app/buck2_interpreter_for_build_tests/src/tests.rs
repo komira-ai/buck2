@@ -8,14 +8,17 @@
  * above-listed licenses.
  */
 
+use std::sync::Arc;
+
 use buck2_common::dice::cells::SetCellResolver;
 use buck2_common::dice::data::testing::SetTestingIoProvider;
 use buck2_common::file_ops::baseline::FileSystemBaseline;
 use buck2_common::file_ops::baseline::SetFileSystemBaseline;
 use buck2_common::file_ops::io::initialize_read_dir_cache;
+use buck2_common::ignores::ignore_set::IgnoreSet;
+use buck2_common::ignores::ignore_set::SetIgnoreSet;
 use buck2_common::legacy_configs::cells::ExternalBuckconfigData;
 use buck2_common::legacy_configs::dice::SetLegacyConfigs;
-use buck2_common::settings::PackageVisibilityDefaultIntersection;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
@@ -36,6 +39,9 @@ use buck2_interpreter_for_build::interpreter::configuror::BuildInterpreterConfig
 use buck2_interpreter_for_build::interpreter::context::SetInterpreterContext;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::package_visibility::HasPackageVisibilityDefaultIntersection;
+use buck2_settings::DiceBuckSettings;
+use buck2_settings::PackageVisibilityDefaultIntersection;
+use buck2_settings::dice::SetDiceBuckSettings;
 use dice::DetectCycles;
 use dice::Dice;
 use dice::DiceTransaction;
@@ -51,9 +57,18 @@ pub(crate) async fn calculation_with_package_visibility_mode(
     fs: &ProjectRootTemp,
     package_visibility_default_intersection: PackageVisibilityDefaultIntersection,
 ) -> DiceTransaction {
+    let resolver = CellResolver::testing_with_name_and_path(
+        CellName::testing_new("root"),
+        CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("".to_owned())),
+    );
+
     let mut dice = Dice::builder();
     dice.set(EventDispatcher::null());
     dice.set_testing_io_provider(fs);
+    dice.set_ignore_set(Arc::new(
+        IgnoreSet::testing_new_single_cell(resolver.dupe(), CellName::testing_new("root"), "")
+            .unwrap(),
+    ));
     let dice = dice.build(DetectCycles::Enabled);
     let root = dice.new_root().await;
 
@@ -65,12 +80,7 @@ pub(crate) async fn calculation_with_package_visibility_mode(
         .set_package_visibility_default_intersection(package_visibility_default_intersection);
     let mut ctx = dice.updater_with_data(root, per_transaction_data);
 
-    let resolver = CellResolver::testing_with_name_and_path(
-        CellName::testing_new("root"),
-        CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("".to_owned())),
-    );
-
-    ctx.set_cell_resolver(resolver.dupe()).unwrap();
+    ctx.set_cell_resolver(resolver).unwrap();
     ctx.set_file_system_baseline(FileSystemBaseline::unique())
         .unwrap();
     ctx.set_interpreter_context(
@@ -88,6 +98,8 @@ pub(crate) async fn calculation_with_package_visibility_mode(
     )
     .unwrap();
     ctx.set_legacy_config_external_data(ExternalBuckconfigData::testing_default())
+        .unwrap();
+    ctx.set_dice_buck_settings(DiceBuckSettings::default())
         .unwrap();
     ctx.set_starlark_profiler_configuration(StarlarkProfilerConfiguration::default())
         .unwrap();

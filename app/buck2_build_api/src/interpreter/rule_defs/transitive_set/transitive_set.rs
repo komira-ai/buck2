@@ -30,6 +30,7 @@ use display_container::display_pair;
 use display_container::fmt_container;
 use display_container::iter_display_chain;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use serde::Serialize;
@@ -52,8 +53,6 @@ use starlark::values::ThinBoxSliceValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOf;
-use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTyped;
 use starlark::values::list::AllocList;
 use starlark::values::starlark_value;
@@ -170,7 +169,7 @@ pub struct TransitiveSet<'v> {
     pub(crate) node: Option<Node<'v>>,
 
     /// Pre-computed reductions. Those are arbitrary values based on the set's definition.
-    pub(crate) reductions: Box<[Value<'v>]>,
+    pub(crate) reductions: MiniBoxSlice<Value<'v>>,
 
     pub(crate) projection_path_resolution_may_require_artifact_value: ProjectionBitSet,
 
@@ -180,7 +179,7 @@ pub struct TransitiveSet<'v> {
     /// before.
     #[trace(static)]
     #[starlark_pagable(pagable)]
-    projection_hashes: Box<[StrongHash128]>,
+    projection_hashes: MiniBoxSlice<StrongHash128>,
 
     /// Read together on first access; `len()` does not read them.
     pub children: Deferred<ThinBoxSliceValue<'v>>,
@@ -193,7 +192,7 @@ pub struct Node<'v> {
     pub value: Value<'v>,
 
     /// Pre-computed projections.
-    pub projections: Box<[Value<'v>]>,
+    pub projections: MiniBoxSlice<Value<'v>>,
 }
 
 impl<'v> fmt::Display for TransitiveSet<'v> {
@@ -459,7 +458,7 @@ fn hash_projections<'fv>(
     definition: &FrozenTransitiveSetDefinition<'fv>,
     node: Option<&Node<'fv>>,
     children: &Deferred<ThinBoxSliceValue<'fv>>,
-) -> buck2_error::Result<Box<[StrongHash128]>> {
+) -> buck2_error::Result<MiniBoxSlice<StrongHash128>> {
     let children: Vec<&TransitiveSet<'fv>> = children
         .read()?
         .iter()
@@ -555,7 +554,7 @@ impl<'v> TransitiveSet<'v> {
                     .iter()
                     .map(|(name, spec)| {
                         let projected_value = eval
-                            .eval_function(spec.projection.get(), &[value], &[])
+                            .eval_function(spec.projection.to_value(), &[value], &[])
                             .map_err(|error| TransitiveSetError::ProjectionError {
                                 error: error.into(),
                                 name: name.clone(),
@@ -570,7 +569,7 @@ impl<'v> TransitiveSet<'v> {
                         }
                         buck2_error::Ok(projected_value)
                     })
-                    .collect::<Result<Box<[_]>, _>>()?;
+                    .collect::<Result<MiniBoxSlice<_>, _>>()?;
 
                 buck2_error::Ok(Node { value, projections })
             })
@@ -595,7 +594,7 @@ impl<'v> TransitiveSet<'v> {
                     let value = value.unwrap_or_else(Value::new_none);
 
                     let reduced = eval
-                        .eval_function(reduce.get(), &[children_values, value], &[])
+                        .eval_function(reduce.to_value(), &[children_values, value], &[])
                         .map_err(|error| TransitiveSetError::ReductionError {
                             error: error.into(),
                             name: name.clone(),
@@ -603,7 +602,7 @@ impl<'v> TransitiveSet<'v> {
 
                     buck2_error::Ok(reduced)
                 })
-                .collect::<Result<Box<[_]>, _>>()?;
+                .collect::<Result<MiniBoxSlice<_>, _>>()?;
 
         let target_platform =
             if let BaseDeferredKey::TargetLabel(configured_label) = key.holder_key().owner() {
@@ -776,46 +775,46 @@ impl<'v> TransitiveSet<'v> {
 #[starlark_module]
 fn transitive_set_methods(builder: &mut MethodsBuilder) {
     fn project_as_json<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         projection: &str,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetJsonProjection<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = def
             .operations()
             .get_index_of_projection(TransitiveSetProjectionKind::Json, projection)?;
 
         Ok(TransitiveSetJsonProjection {
-            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.value),
+            transitive_set: this,
             projection: index,
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     fn project_as_args<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         projection: &str,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetArgsProjection<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = def
             .operations()
             .get_index_of_projection(TransitiveSetProjectionKind::Args, projection)?;
 
         Ok(TransitiveSetArgsProjection {
-            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.value),
+            transitive_set: this,
             projection: index,
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     fn reduce<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         reduction: &str,
     ) -> starlark::Result<Value<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = match def.operations().reductions.get_index_of(reduction) {
             Some(index) => index,
@@ -836,7 +835,6 @@ fn transitive_set_methods(builder: &mut MethodsBuilder) {
         };
 
         Ok(this
-            .typed
             .reductions
             .get(index)
             .copied()
@@ -844,31 +842,31 @@ fn transitive_set_methods(builder: &mut MethodsBuilder) {
     }
 
     fn traverse<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetTraversal<'v>> {
         Ok(TransitiveSetTraversal {
-            inner: this.value,
+            inner: this.to_value(),
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     #[starlark(attribute)]
     fn definition<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
     ) -> starlark::Result<FrozenValueTyped<'v, FrozenTransitiveSetDefinition<'v>>> {
-        Ok(this.typed.definition())
+        Ok(this.definition())
     }
 
     #[starlark(attribute)]
-    fn value<'v>(this: ValueOf<'v, &'v TransitiveSet<'v>>) -> starlark::Result<Value<'v>> {
-        Ok(match this.typed.node.as_ref() {
+    fn value<'v>(this: ValueTyped<'v, TransitiveSet<'v>>) -> starlark::Result<Value<'v>> {
+        Ok(match this.node.as_ref() {
             Some(node) => node.value,
             None => Value::new_none(),
         })
     }
     #[starlark(attribute)]
-    fn children<'v>(this: ValueOf<'v, &'v TransitiveSet<'v>>) -> starlark::Result<Vec<Value<'v>>> {
-        Ok(this.typed.children.read()?.to_vec())
+    fn children<'v>(this: ValueTyped<'v, TransitiveSet<'v>>) -> starlark::Result<Vec<Value<'v>>> {
+        Ok(this.children.read()?.to_vec())
     }
 }

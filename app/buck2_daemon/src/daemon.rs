@@ -27,7 +27,7 @@ use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::memory;
 use buck2_core::buck2_env;
 use buck2_core::logging::LogConfigurationReloadHandle;
-use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
@@ -86,7 +86,7 @@ pub struct DaemonCommand {
     #[clap(long)]
     skip_macos_qos: bool,
     /// Early configs that the daemon needs at startup. Those are read by the client then passed to
-    /// the daemon. The client will restart the daemon if they mismatch.
+    /// the daemon. The client restarts it when startup options or daemon settings mismatch.
     #[clap(value_parser = buck_error_clap_parser(DaemonStartupConfig::deserialize))]
     daemon_startup_config: DaemonStartupConfig,
 
@@ -180,13 +180,12 @@ fn recorded_start_time() -> u64 {
     match process_start_time(None) {
         Some(start_time) => start_time,
         None => {
-            let _ignored = soft_error!(
+            soft_error_or_panic!(
                 "daemon_pid_start_time_unavailable",
                 buck2_error!(
                     ErrorTag::DaemonStartupFailed,
                     "Could not read this daemon's process start time; recording 0 in buckd.info"
                 ),
-                quiet: true,
                 task: false,
             );
             0
@@ -260,7 +259,7 @@ impl DaemonCommand {
 
         daemon_lower_priority(
             self.skip_macos_qos,
-            self.daemon_startup_config.macos_qos_class.as_deref(),
+            self.daemon_startup_config.startup_options.macos_qos_class,
         )?;
 
         // TODO(nga): this breaks relative paths in `--no-buckd`.
@@ -275,6 +274,7 @@ impl DaemonCommand {
             daemon_startup_config: self.daemon_startup_config,
             daemon_originating_cgroup: self.daemon_originating_cgroup,
             started_for_clean_stale: self.started_for_clean_stale,
+            in_process,
         };
 
         let span = tracing::info_span!("daemon_listener");
@@ -426,6 +426,7 @@ impl DaemonCommand {
 
         if let Some(num_tokio_workers) = server_init_ctx
             .daemon_startup_config
+            .startup_options
             .num_tokio_workers
             .or(buck2_env!("BUCK2_RUNTIME_THREADS", type=usize)?)
         {
@@ -516,7 +517,6 @@ impl DaemonCommand {
                 paths,
                 server_init_ctx,
                 process_info,
-                in_process,
                 prepped_cgroups,
                 daemon_constraints,
                 Box::pin(listener),
@@ -542,12 +542,11 @@ impl DaemonCommand {
 
             select! {
                 res = buckd_server => {
-                    tracing::warn!("server shutdown");
                     res
                 }
                 reason = shutdown_future => {
                     let reason = reason.as_deref().unwrap_or("no reason available");
-                    tracing::warn!("server forced shutdown: {}", reason);
+                    eprintln!("server forced shutdown: {}", reason);
                     Ok(())
                 },
             }
@@ -616,7 +615,7 @@ impl DaemonCommand {
                 );
                 let _ignored = buck2_client_ctx::eprintln!("{}", msg);
 
-                let _ignored = soft_error!(
+                soft_error_or_panic!(
                     "daemon_project_root_unavailable",
                     buck2_error!(
                         ErrorTag::MissingProjectRoot,
@@ -624,7 +623,6 @@ impl DaemonCommand {
                         project_root.display(),
                         e
                     ),
-                    quiet: true,
                     task: false,
                 );
 
@@ -738,11 +736,10 @@ impl DaemonCommand {
         ) {
             Ok(()) => tracing::info!("Exited BPFJailer jail"),
             Err(e) => {
-                let _ignored = soft_error!(
+                soft_error_or_panic!(
                     "failed_to_exit_bpfjailer",
                     buck2_error::internal_error!("Failed to exit BPFJailer jail: {}", e)
                 );
-                tracing::warn!("Failed to exit BPFJailer jail: {}", e)
             }
         }
     }
@@ -834,11 +831,11 @@ mod tests {
                 daemon_startup_config: DaemonStartupConfig::testing_empty(),
                 daemon_originating_cgroup: None,
                 started_for_clean_stale: false,
+                // In process: there is no daemon here, just the test binary's own process, and a
+                // watchdog would `_exit` it out from under the remaining tests.
+                in_process: true,
             },
             process_info.clone(),
-            // In process: there is no daemon here, just the test binary's own process, and a
-            // watchdog would `_exit` it out from under the remaining tests.
-            true,
             None,
             gen_daemon_constraints(&DaemonStartupConfig::testing_empty(), &daemon_id).unwrap(),
             Box::pin(listener),

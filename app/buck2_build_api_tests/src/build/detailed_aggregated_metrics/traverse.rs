@@ -40,6 +40,7 @@ mod tests {
     use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
     use buck2_hash::BuckFixedSortedMap;
     use buck2_hash::buck_mut_insertion_set;
+    use buck2_node::rule_type::RuleType;
     use dupe::Dupe;
     use dupe::IterDupedExt;
     use starlark::values::OwnedFrozen;
@@ -112,19 +113,24 @@ mod tests {
                 RecordedAnalysisValues::testing_new(holder_key.dupe(), tsets, recorded_actions);
             let holder = match &holder_key {
                 DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(..)) => {
-                    OwnedDeferredHolder::Analysis(AnalysisResult::new(
-                        analysis_values,
-                        None,
-                        BuckFixedSortedMap::default(),
-                        0,
-                        0,
-                        None,
-                        Vec::new(),
-                    ))
+                    OwnedDeferredHolder::Analysis(
+                        AnalysisResult::new(
+                            analysis_values,
+                            None,
+                            BuckFixedSortedMap::default(),
+                            0,
+                            0,
+                            None,
+                            Vec::new(),
+                            RuleType::Forward,
+                        )
+                        .expect("test analysis should have valid providers"),
+                    )
                 }
                 DeferredHolderKey::DynamicLambda(..) => {
                     OwnedDeferredHolder::DynamicLambda(Arc::new(DynamicLambdaResult {
                         analysis_values,
+                        rule_type: None,
                     }))
                 }
                 _ => unimplemented!(),

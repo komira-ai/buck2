@@ -14,9 +14,9 @@ use std::path::Path;
 
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::data::HasIoProvider;
+use buck2_common::dice::data::HasProjectRoot;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::instance::CellInstance;
@@ -50,10 +50,10 @@ impl<'v> UnpackValue<'v> for SourceArtifactUnpack {
     type Error = Infallible;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        let Some(v) = ValueAsInputArtifactLike::unpack_value_opt(value) else {
+        let Some(v) = StarlarkArtifactView::unpack_value_opt(value) else {
             return Ok(None);
         };
-        let Some(bound_artifact) = v.0.get_bound_artifact().ok() else {
+        let Some(bound_artifact) = v.as_input_artifact_like().get_bound_artifact().ok() else {
             return Ok(None);
         };
         let Some(artifact) = bound_artifact.get_source() else {
@@ -94,7 +94,7 @@ impl<'a> FileExpr<'a> {
                 match parse_cell_path_as_file_expr_literal(val, &cell_alias_resolver)? {
                     Some(cell_path) => Ok(cell_path),
                     None => {
-                        let fs = dice.global_data().get_io_provider().project_root().dupe();
+                        let fs = dice.get_project_root().await?.dupe();
                         let path = Path::new(val);
                         let rel = if path.is_absolute() {
                             Cow::Owned(fs.relativize_any(AbsPath::new(path)?)?)

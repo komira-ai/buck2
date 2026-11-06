@@ -13,9 +13,10 @@
 //! A write's content is a function of its command line, so a strong hash of that command line
 //! (`CommandLineBuilder::new_hashing`) keys an action cache entry whose one output is the
 //! content's digest. A hit declares the output as CAS content without rendering the command
-//! line; a miss renders it and declares the write as usual, in `populate` mode after uploading
-//! the content and recording the entry. `verify` renders every write and compares a hit's
-//! content against it, for trying the key out.
+//! line. A miss renders it, and where the write is one to record (`WriteCache::use_for`)
+//! uploads the content and records the entry; otherwise it is produced the way a run action's
+//! output is, locally or remotely (`declare_miss`). `verify` renders every write and compares a
+//! hit's content against it, for trying the key out.
 //!
 //! A write with `absolute` renders the project root, which is not the same between hosts, so
 //! it does not go through the cache at all (`WriteAction::execute`).
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_api::actions::ActionExecutionCtx;
+use buck2_build_api::actions::execute::action_executor::ActionExecutionKind;
 use buck2_build_api::actions::impls::run_action_knobs::WriteActionCacheMode;
 use buck2_build_api::actions::impls::write_action_cache_stats::WRITE_ACTION_CACHE_STATS;
 use buck2_build_api::actions::impls::write_action_cache_stats::WriteActionCacheStats;
@@ -38,7 +40,8 @@ use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::key::DeferredHolderKey;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
-use buck2_core::soft_error;
+use buck2_core::rollout_percentage::RolloutFraction;
+use buck2_core::soft_error_or_panic;
 use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -46,10 +49,11 @@ use buck2_execute::digest::CasDigestFromReExt;
 use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobsBuilder;
+use buck2_execute::execute::write_action_cache::PopulateOutcome;
+use buck2_execute::execute::write_action_cache::WriteActionCache;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::WriteRequest;
-use buck2_execute::re::client::ActionCacheWriteType;
 use buck2_execute::re::ttl::re_expiration_from_ttl;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutMap;
@@ -61,6 +65,8 @@ use starlark::values::UnpackValue;
 use starlark::values::Value;
 use strong_hash::StrongHash;
 
+use crate::actions::impls::produce;
+
 /// Bump when anything about how a `WriteCacheKey` is computed changes: an entry recorded under
 /// one scheme must not be found under another.
 const KEY_VERSION: u32 = 0;
@@ -69,13 +75,23 @@ const KEY_VERSION: u32 = 0;
 /// no entry's digest is one a real action could have, or the reverse.
 const ACTION_MARKER: &str = "buck2-write-action-cache";
 
-/// The one output's name in an entry. Two writes with the same content share an entry whatever
-/// their output paths, so the name says nothing about either.
-const OUTPUT_NAME: &str = "content";
-
 #[derive(Copy, Clone, Dupe)]
-pub(crate) struct WriteCache {
+pub(crate) struct WriteCache<'a> {
+    cache: &'a dyn WriteActionCache,
     mode: WriteActionCacheMode,
+    /// The keys whose misses are recorded; none where the executor publishes no local results.
+    populate: RolloutFraction,
+}
+
+/// What a write does with the cache.
+#[derive(Copy, Clone, Dupe, PartialEq, Eq)]
+pub(crate) enum CacheUse {
+    /// Nothing: the write is declared as it is without the cache.
+    None,
+    /// Served from the cache on a hit; a miss leaves no entry.
+    Lookup,
+    /// Served from the cache on a hit; a miss is recorded for later builds.
+    Populate,
 }
 
 /// Identifies a write's content without rendering it.
@@ -84,6 +100,10 @@ pub(crate) struct WriteCacheKey(blake3::Hash);
 impl WriteCacheKey {
     pub(crate) fn to_hex(&self) -> String {
         self.0.to_hex().to_string()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }
 
@@ -119,28 +139,45 @@ pub(crate) struct KeyInputs<'a> {
     pub(crate) artifact_path_mapping: Option<&'a BuckMutMap<&'a Artifact, ContentBasedPathHash>>,
 }
 
-impl WriteCache {
-    /// The cache this invocation's write actions go through, if any.
-    pub(crate) fn for_ctx(ctx: &dyn ActionExecutionCtx) -> Option<Self> {
+impl<'a> WriteCache<'a> {
+    /// The cache this action may go through; `None` where none of its writes would ask it.
+    pub(crate) fn for_ctx(ctx: &'a dyn ActionExecutionCtx) -> Option<Self> {
         if !ctx.may_probe_cas() {
             return None;
         }
-        match ctx.run_action_knobs().write_action_cache {
-            WriteActionCacheMode::Off => None,
-            mode @ (WriteActionCacheMode::Verify
-            | WriteActionCacheMode::Use
-            | WriteActionCacheMode::Populate) => Some(Self { mode }),
+        let cache = ctx.write_action_cache()?;
+        let knobs = ctx.run_action_knobs();
+        // An entry recorded is a local result published, so the share is read under the rule a
+        // run's result is published by.
+        let populate = if cache.populates() {
+            knobs.write_action_cache_populate
+        } else {
+            RolloutFraction::none()
+        };
+        if knobs.write_action_cache == WriteActionCacheMode::Off && populate.is_none() {
+            return None;
         }
-    }
-
-    /// Whether misses record their content for later invocations.
-    pub(crate) fn populates(self) -> bool {
-        matches!(self.mode, WriteActionCacheMode::Populate)
+        Some(Self {
+            cache,
+            mode: knobs.write_action_cache,
+            populate,
+        })
     }
 
     /// Whether writes are rendered regardless and hits only checked against them.
     pub(crate) fn verifies(self) -> bool {
         matches!(self.mode, WriteActionCacheMode::Verify)
+    }
+
+    /// What the write with `key` does with the cache.
+    pub(crate) fn use_for(self, key: &WriteCacheKey) -> CacheUse {
+        if self.populate.includes(key.as_bytes()) {
+            CacheUse::Populate
+        } else if self.mode == WriteActionCacheMode::Use {
+            CacheUse::Lookup
+        } else {
+            CacheUse::None
+        }
     }
 
     /// The content the cache holds for `key`. `None` is a miss, which a cache that could not
@@ -151,29 +188,24 @@ impl WriteCache {
         key: &WriteCacheKey,
     ) -> Option<CachedContent> {
         let action = action(key, ctx);
-        let use_case = ctx.invocation_re_use_case();
-        let response = match ctx
-            .re_client()
-            .with_use_case(use_case)
-            .action_cache(action.action.dupe(), ctx.re_platform())
-            .await
-        {
-            Ok(Some(response)) => response,
+        let use_case = self.cache.use_case();
+        let result = match self.cache.lookup(&action).await {
+            Ok(Some(result)) => result,
             Ok(None) => {
                 WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.misses);
                 return None;
             }
             Err(e) => {
                 WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.lookup_failures);
-                let _ignored = soft_error!(
+                soft_error_or_panic!(
                     "write_action_cache_lookup_failed",
-                    e.context("Action cache lookup for a write's content failed; producing it instead"),
-                    quiet: true
+                    e.context(
+                        "Action cache lookup for a write's content failed; producing it instead"
+                    )
                 );
                 return None;
             }
         };
-        let result = response.action_result;
         let digest = match (result.exit_code, result.output_files.as_slice()) {
             (0, [file]) => FileDigest::from_re(&file.digest.digest, ctx.digest_config())
                 .map(|digest| (digest, file.ttl))
@@ -188,14 +220,12 @@ impl WriteCache {
         let (digest, ttl) = match digest {
             Ok(digest) => digest,
             Err(e) => {
-                let _ignored = soft_error!(
+                soft_error_or_panic!(
                     "write_action_cache_bad_entry",
                     e.context(format!(
                         "Action cache entry `{}` for a write is malformed; producing the content instead",
                         action.action
-                    )),
-                    quiet: true
-                );
+                    )));
                 return None;
             }
         };
@@ -231,61 +261,35 @@ impl WriteCache {
         let digest =
             TrackedFileDigest::from_content(&request.content, digest_config.cas_digest_config());
         let action = action(key, ctx);
-        let use_case = ctx.invocation_re_use_case();
-        let client = ctx.re_client().with_use_case(use_case);
-
-        // The action cache reads an entry's action back from the CAS before accepting the
-        // entry, so the action's blobs go up with the content.
-        let mut blobs = action.blobs.to_inlined_blobs();
-        blobs.push(RE::InlinedBlobWithDigest {
-            blob: request.content.clone(),
-            digest: digest.to_re(),
-            ..Default::default()
-        });
-        client
-            .upload_files_and_directories(vec![], vec![], blobs)
-            .await
-            .buck_error_context("Uploading a write's content")?;
-
-        let mut result = RE::TActionResult2 {
-            output_files: vec![RE::TFile {
-                digest: RE::DigestWithStatus {
-                    digest: digest.to_re(),
-                    ..Default::default()
-                },
-                name: OUTPUT_NAME.to_owned(),
-                existed: false,
-                executable: request.is_executable,
-                ttl: 0,
-                ..Default::default()
-            }],
-            exit_code: 0,
-            ..Default::default()
-        };
-        let response = client
-            .write_action_result(
-                action.action.dupe(),
-                &mut result,
-                ctx.re_platform(),
-                ActionCacheWriteType::WriteAction,
+        match self
+            .cache
+            .populate(
+                &action,
+                &request.content,
+                &digest,
+                request.is_executable,
+                digest_config,
             )
-            .await
-            .buck_error_context("Recording a write's content in the action cache")?;
-        WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.populated);
-        // The entry does not outlive its outputs, so its TTL is a lower bound on the content's.
-        if response.ttl_seconds > 0 {
-            digest.update_expires(re_expiration_from_ttl(
-                Timestamp::now(),
-                response.ttl_seconds,
-                &action.action,
-            ));
+            .await?
+        {
+            PopulateOutcome::Populated => {}
+            PopulateOutcome::PermissionDenied { reason } => {
+                return Err(buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Not permitted to write the action cache: {reason}"
+                ));
+            }
         }
+        WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.populated);
 
         let value = ArtifactValue::file(FileMetadata {
             digest,
             is_executable: request.is_executable,
         });
-        Ok((value, Arc::new(CasDownloadInfo::new_uploaded(use_case))))
+        Ok((
+            value,
+            Arc::new(CasDownloadInfo::new_uploaded(self.cache.use_case())),
+        ))
     }
 }
 
@@ -329,6 +333,20 @@ pub(crate) async fn declare(
             }],
         )
         .await
+}
+
+/// Declares `request`, a write the cache missed, as the write's output: made here or uploaded,
+/// as `produce::produce_write` says. Returns the value with `Simple` for a write made here and
+/// `Deferred` for one declared from the CAS or found on disk.
+pub(crate) async fn declare_miss(
+    ctx: &dyn ActionExecutionCtx,
+    request: WriteRequest,
+) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
+    let (value, kind) = produce::produce_write(ctx, request).await?;
+    if matches!(kind, ActionExecutionKind::Simple) {
+        WriteActionCacheStats::bump(&WRITE_ACTION_CACHE_STATS.written);
+    }
+    Ok((value, kind))
 }
 
 /// The key for the content `WriteCommandLineOptions::render` would produce from `contents` and

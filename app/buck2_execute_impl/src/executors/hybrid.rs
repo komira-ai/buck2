@@ -19,12 +19,14 @@ use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessObserver;
 use buck2_common::liveliness_observer::LivelinessObserverExt;
 use buck2_core::execution_types::executor_config::HybridExecutionLevel;
+use buck2_core::warn_user_or_panic;
 use buck2_data::SchedulingMode;
 use buck2_error::BuckErrorOptionContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::execute::claim::Claim;
 use buck2_execute::execute::claim::ClaimManager;
 use buck2_execute::execute::claim::MutexClaimManager;
+use buck2_execute::execute::low_pass_filter::LowPassFilter;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::prepared::PreparedCommand;
@@ -44,7 +46,6 @@ use futures::future::Future;
 use host_sharing::HostSharingRequirements;
 
 use crate::executors::local::LocalExecutor;
-use crate::low_pass_filter::LowPassFilter;
 
 /// The [HybridExecutor] will accept requests and dispatch them to both a local and remote delegate
 /// executor, unless the CommandExecutionRequest expresses a preference. That will allow them to
@@ -594,9 +595,13 @@ impl FallbackTracker {
 
         if let Some(max) = max {
             if retried >= max {
-                tracing::warn!(
-                    "Not falling back to local because too many actions have fallen back already.  \
+                warn_user_or_panic!(
+                    "local_fallback_limit_reached",
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Environment,
+                        "Not falling back to local because too many actions have fallen back already.  \
                     If you would like to proceed anyway, pass `--prefer-local`."
+                    )
                 );
                 return false;
             }

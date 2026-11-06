@@ -9,11 +9,10 @@
  */
 
 use allocative::Allocative;
-use async_recursion::async_recursion;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_common::file_ops::dice::DiceFileComputations;
-use buck2_common::file_ops::metadata::PathMetadataOrRedirection;
+use buck2_common::file_ops::metadata::RawPathMetadata;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_common::package_listing::resolver::PackageListingResolver;
 use buck2_core::cells::cell_path::CellPath;
@@ -26,10 +25,10 @@ use buck2_core::package::package_relative_path::PackageRelativePath;
 use buck2_core::package::source_path::SourcePath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_node::nodes::unconfigured::TargetNode;
+use buck2_util::arc_str::PackedStr;
 use derivative::Derivative;
 use derive_more::Display;
 use dice::DiceComputations;
-use dupe::Dupe;
 use futures::FutureExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
@@ -136,15 +135,16 @@ impl<'v> BxlFilesystem<'v> {
     }
 }
 
-#[async_recursion]
+/// Whether something is at the path. A symlink is something; what is behind one is not looked
+/// at, so `exists("link/x")` is false whatever `link` points to.
 async fn try_exists(ctx: &mut DiceComputations<'_>, path: CellPath) -> buck2_error::Result<bool> {
-    match DiceFileComputations::read_path_metadata_if_exists(ctx, path).await? {
-        Some(path) => match PathMetadataOrRedirection::from(path) {
-            PathMetadataOrRedirection::PathMetadata(_) => Ok(true),
-            PathMetadataOrRedirection::Redirection(r, _) => try_exists(ctx, r).await,
+    Ok(
+        match DiceFileComputations::read_path_metadata_if_exists(ctx, path).await? {
+            None => false,
+            Some(RawPathMetadata::Symlink { at, .. }) => at == path,
+            Some(_) => true,
         },
-        None => Ok(false),
-    }
+    )
 }
 
 /// Provides some basic tracked filesystem access for bxl functions so that they can meaningfully
@@ -153,6 +153,8 @@ async fn try_exists(ctx: &mut DiceComputations<'_>, path: CellPath) -> buck2_err
 fn fs_operations(builder: &mut MethodsBuilder) {
     /// Check if a path exists on disk, taking advantage of Buck's cached filesystem.
     /// Takes in a literal, a source artifact (via `artifact`), or a `file_node`.
+    /// A symlink exists; what it points to is not consulted, so a path through a
+    /// symlink does not.
     ///
     /// Sample usage:
     /// ```python
@@ -208,7 +210,7 @@ fn fs_operations(builder: &mut MethodsBuilder) {
                                 DiceFileComputations::read_dir(dice, path).await?;
                             Ok(StarlarkReadDirSet {
                                 cell_path: path,
-                                included: read_dir_output.included.dupe(),
+                                included: read_dir_output.included,
                                 dirs_only,
                             })
                         }
@@ -312,7 +314,7 @@ fn fs_operations(builder: &mut MethodsBuilder) {
                         }
                         NoneOr::Other(target_hint) => {
                             let target_expr = TargetListExpr::<'v, TargetNode>::unpack(
-                                target_hint.typed,
+                                target_hint.try_unpack()?,
                                 &this.ctx,
                                 dice,
                             )
@@ -321,7 +323,7 @@ fn fs_operations(builder: &mut MethodsBuilder) {
                                 Ok(node.label().pkg())
                             } else {
                                 Err(BxlFilesystemError::MultipleTargetHintsNotSupported(
-                                    target_hint.value.to_repr(),
+                                    target_hint.to_value().to_repr(),
                                 )
                                 .into())
                             }
@@ -345,7 +347,10 @@ fn fs_operations(builder: &mut MethodsBuilder) {
 
                     let package_relative_path =
                         PackageRelativePath::new(forward_relative_path.as_path())?;
-                    Ok(SourcePath::new(package_label, package_relative_path.into()))
+                    Ok(SourcePath::new(
+                        package_label,
+                        PackedStr::new(package_relative_path),
+                    ))
                 }
                 .boxed_local()
             })

@@ -217,8 +217,6 @@ impl<'v, Node: NodeLike> StarlarkValue<'v> for StarlarkTargetSet<Node>
 where
     Self: HasTyVTable,
 {
-    type Canonical = Self;
-
     fn get_type_starlark_repr() -> Ty {
         Node::target_set_ty()
     }
@@ -466,6 +464,7 @@ starlark::__starlark_pagable_only! {
         use buck2_core::provider::label::ConfiguredProvidersLabel;
         use buck2_core::target::label::label::TargetLabel;
         use buck2_hash::BuckFixedSortedMap;
+        use buck2_node::rule_type::RuleType;
         use pagable::PagableDeserialize;
         use pagable::PagableSerialize;
         use starlark::values::FrozenHeapName;
@@ -567,7 +566,8 @@ starlark::__starlark_pagable_only! {
                 0,
                 None,
                 Vec::new(),
-            );
+                RuleType::Forward,
+            ).expect("test analysis should have valid providers");
             let node = ActionQueryNode::new_analysis(ConfiguredProvidersLabel::default_for(label), analysis);
             let owned: OwnedFrozen<Value<'static>> = OwnedFrozen::build(
                 FrozenHeapName::user("aquery_target_set_fails_page_out_without_panicking"),

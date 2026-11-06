@@ -14,18 +14,18 @@ use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use dice_core::BranchId;
+use dice_futures::oneshot::Sender;
 use dupe::Dupe;
 use futures::Future;
 use pagable::DataKey;
 use static_assertions::const_assert_eq;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::WeakUnboundedSender;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
-use tokio::sync::oneshot::Sender;
 
+use crate::api::invalidation_tracking::InvalidationSources;
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
+use crate::core::graph::BackedSnapshot;
 use crate::core::graph::introspection::VersionedGraphIntrospectable;
 use crate::core::graph::revision::EpsilonToken;
 use crate::core::graph::types::Candidate;
@@ -33,6 +33,7 @@ use crate::core::graph::types::VersionedGraphKey;
 use crate::core::graph::types::VersionedGraphResult;
 use crate::core::internals::ActorState;
 use crate::core::internals::PagableStatusRaw;
+use crate::core::processor::Replies;
 use crate::core::processor::StateProcessor;
 use crate::core::versions::IdleStatus;
 use crate::core::versions::introspection::VersionIntrospectable;
@@ -47,10 +48,10 @@ use crate::storage::PagingSetup;
 use crate::updater::ActiveTransactionGuard;
 use crate::updater::ChangeType;
 use crate::value::DiceValidValue;
+use crate::value::HydratedValue;
 use crate::value::MaybeResidentComputedValue;
 use crate::value::PageOutResult;
 use crate::value::ResidentComputedValue;
-use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
 
 /// Padded out to a full cache line so that two of these placed adjacent in a
@@ -85,8 +86,8 @@ impl QueueCounters {
         self.enqueued.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn record_retire(&self) {
-        self.retired.0.fetch_add(1, Ordering::Relaxed);
+    pub(super) fn record_retire(&self, count: usize) {
+        self.retired.0.fetch_add(count, Ordering::Relaxed);
     }
 
     fn approx_depth(&self) -> usize {
@@ -106,7 +107,7 @@ impl QueueCounters {
 #[derive(Clone)]
 pub(crate) struct CoreStateHandle {
     tx: UnboundedSender<StateRequest>,
-    /// Tracks in-flight `StateRequest`s (sent on `tx` but not yet dequeued by
+    /// Tracks in-flight `StateRequest`s (sent on `tx` but not yet processed by
     /// the `StateProcessor`). Used to surface an immediate snapshot of the
     /// queue depth to callers (the canonical metrics request itself runs
     /// through the queue and so could not measure it from inside).
@@ -154,13 +155,29 @@ impl CoreStateHandle {
         self.counters.retired_count()
     }
 
-    fn call<T>(
+    /// Sends the request made with the responder and returns its reply, for a requester that awaits
+    /// it. One that cannot await uses `call_blocking` instead.
+    fn call<T: Send + 'static, F: FnOnce(Responder<T>) -> StateRequest>(
         &self,
-        message: StateRequest,
-        recv: Receiver<T>,
-    ) -> impl Future<Output = T> + use<T> {
-        self.request(message);
-        futures::FutureExt::map(recv, |v| v.unwrap())
+        request: F,
+    ) -> impl Future<Output = T> + use<T, F> {
+        let (tx, rx) = dice_futures::oneshot::channel();
+        self.request(request(Responder::Awaited(tx)));
+        futures::FutureExt::map(rx, |v| v.unwrap())
+    }
+
+    /// `call` for a requester that cannot await and blocks its thread on the reply instead. The
+    /// actor sends such a reply itself, see `Responder`, and waits on nothing but its own queue,
+    /// so the reply comes once the (bounded) requests ahead of this one are processed.
+    fn call_blocking<T: Send + 'static>(
+        &self,
+        request: impl FnOnce(Responder<T>) -> StateRequest,
+    ) -> T {
+        let (tx, rx) = dice_futures::oneshot::channel();
+        self.request(request(Responder::Blocking(tx)));
+        // This typically runs inside a tokio task's poll, which is fine for this receiver: it takes
+        // no part in tokio's cooperative budget.
+        futures::executor::block_on(rx).unwrap()
     }
 
     /// Commits the changes at the branch's head. The new VersionNumber is returned
@@ -169,15 +186,11 @@ impl CoreStateHandle {
         branch: BranchId,
         changes: Vec<(DiceKey, ChangeType, InvalidationSourcePriority)>,
     ) -> impl Future<Output = VersionNumber> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::UpdateState {
-                branch,
-                changes,
-                resp,
-            },
-            recv,
-        )
+        self.call(move |resp| StateRequest::UpdateState {
+            branch,
+            changes,
+            resp,
+        })
     }
 
     /// Gets the branch's newest version
@@ -185,16 +198,14 @@ impl CoreStateHandle {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = VersionNumber> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::CurrentVersion { branch, resp }, recv)
+        self.call(move |resp| StateRequest::CurrentVersion { branch, resp })
     }
 
     /// Starts a new branch at `from`. Dropping the future before it yields the branch deletes
     /// it again.
     pub(crate) fn fork(&self, from: VersionNumber) -> impl Future<Output = BranchId> + use<> {
-        let (resp, recv) = oneshot::channel();
         futures::FutureExt::map(
-            self.call(StateRequest::Fork { from, resp }, recv),
+            self.call(move |resp| StateRequest::Fork { from, resp }),
             UnclaimedBranch::claim,
         )
     }
@@ -202,9 +213,8 @@ impl CoreStateHandle {
     /// Starts a new branch with no parent. Dropping the future before it yields the branch
     /// deletes it again.
     pub(crate) fn new_root(&self) -> impl Future<Output = BranchId> + use<> {
-        let (resp, recv) = oneshot::channel();
         futures::FutureExt::map(
-            self.call(StateRequest::NewRoot { resp }, recv),
+            self.call(move |resp| StateRequest::NewRoot { resp }),
             UnclaimedBranch::claim,
         )
     }
@@ -221,15 +231,11 @@ impl CoreStateHandle {
         version: VersionNumber,
         guard: ActiveTransactionGuard,
     ) -> impl Future<Output = (VersionState, ActiveTransactionGuard)> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::CtxAtVersion {
-                version,
-                guard,
-                resp,
-            },
-            recv,
-        )
+        self.call(move |resp| StateRequest::CtxAtVersion {
+            version,
+            guard,
+            resp,
+        })
     }
 
     /// Report that a computation context at a version has been dropped
@@ -242,18 +248,17 @@ impl CoreStateHandle {
         &self,
         key: VersionedGraphKey,
     ) -> impl Future<Output = VersionedGraphResult> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::LookupKey { key, resp }, recv)
+        self.call(move |resp| StateRequest::LookupKey { key, resp })
     }
 
-    /// Get the untracked-input revision for demand recovery, or `None` for an asserted key
-    /// whose value cannot be replaced by a computation. Only failed demand reads need this.
-    pub(crate) fn recovery_epsilon(
+    /// Get the untracked-input revision and the sources a recomputation starts from for demand
+    /// recovery, or `None` for an asserted key whose value cannot be replaced by a computation.
+    /// Only failed demand reads need this.
+    pub(crate) fn recovery_untracked(
         &self,
         key: VersionedGraphKey,
-    ) -> impl Future<Output = Option<EpsilonToken>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::RecoveryEpsilon { key, resp }, recv)
+    ) -> impl Future<Output = Option<(EpsilonToken, InvalidationSources)>> + use<> {
+        self.call(move |resp| StateRequest::RecoveryUntracked { key, resp })
     }
 
     /// Report that a value has been computed. `epsilon` is the revision of the key's
@@ -265,21 +270,39 @@ impl CoreStateHandle {
         value: DiceValidValue,
         deps: SeriesParallelDeps,
         epsilon: EpsilonToken,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> impl Future<Output = ResidentComputedValue> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::UpdateComputed {
-                key,
-                storage,
-                value,
-                deps,
-                epsilon,
-                invalidation_paths,
-                resp,
-            },
-            recv,
-        )
+        self.call(move |resp| StateRequest::UpdateComputed {
+            key,
+            storage,
+            value,
+            deps,
+            epsilon,
+            invalidation_sources,
+            resp,
+        })
+    }
+
+    /// `update_computed` for a caller that cannot await, which is how a projection is computed:
+    /// blocks the thread until the value is stored.
+    pub(crate) fn update_computed_blocking(
+        &self,
+        key: VersionedGraphKey,
+        storage: StorageType,
+        value: DiceValidValue,
+        deps: SeriesParallelDeps,
+        epsilon: EpsilonToken,
+        invalidation_sources: InvalidationSources,
+    ) -> ResidentComputedValue {
+        self.call_blocking(move |resp| StateRequest::UpdateComputed {
+            key,
+            storage,
+            value,
+            deps,
+            epsilon,
+            invalidation_sources,
+            resp,
+        })
     }
 
     /// Report that a candidate certificate has been verified to hold at the version: its
@@ -289,19 +312,15 @@ impl CoreStateHandle {
         key: VersionedGraphKey,
         storage: StorageType,
         candidate: Candidate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
     ) -> impl Future<Output = MaybeResidentComputedValue> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::Revalidate {
-                key,
-                storage,
-                candidate,
-                resp,
-                invalidation_paths,
-            },
-            recv,
-        )
+        self.call(move |resp| StateRequest::Revalidate {
+            key,
+            storage,
+            candidate,
+            resp,
+            invalidation_sources,
+        })
     }
 
     /// What stands between `branch`, or with `None` everything, and idleness
@@ -309,8 +328,7 @@ impl CoreStateHandle {
         &self,
         branch: Option<BranchId>,
     ) -> impl Future<Output = IdleStatus> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::IdleStatus { branch, resp }, recv)
+        self.call(move |resp| StateRequest::IdleStatus { branch, resp })
     }
 
     /// Every task that may still be running, whether its transaction is alive or gone, on
@@ -319,8 +337,7 @@ impl CoreStateHandle {
         &self,
         branch: Option<BranchId>,
     ) -> impl Future<Output = Vec<DiceTask>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::RunningTasks { branch, resp }, recv)
+        self.call(move |resp| StateRequest::RunningTasks { branch, resp })
     }
 
     /// Returns the list of `(DiceKey, DataKey)` pairs for paged-out graph nodes.
@@ -329,29 +346,25 @@ impl CoreStateHandle {
     pub(crate) fn paged_out_keys(
         &self,
     ) -> impl Future<Output = anyhow::Result<Vec<(DiceKey, DataKey)>>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::PagedOutKeys { resp }, recv)
+        self.call(move |resp| StateRequest::PagedOutKeys { resp })
     }
 
     /// Classify graph nodes as resident vs paged out.
     pub(crate) fn pagable_status(&self) -> impl Future<Output = PagableStatusRaw> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::PagableStatus { resp }, recv)
+        self.call(move |resp| StateRequest::PagableStatus { resp })
     }
 
     /// Resident, paged-out, and candidate node counts, read O(1) from the core-state
     /// tallies.
     pub(crate) fn pagable_node_counts(&self) -> impl Future<Output = PagableNodeCounts> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::PagableNodeCounts { resp }, recv)
+        self.call(move |resp| StateRequest::PagableNodeCounts { resp })
     }
 
     /// Returns nodes that need serialization before they can be paged out.
     pub(crate) fn keys_to_page_out(
         &self,
     ) -> impl Future<Output = Vec<(DiceKey, DiceValidValue)>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::KeysToPageOut { resp }, recv)
+        self.call(move |resp| StateRequest::KeysToPageOut { resp })
     }
 
     /// Record the rows of values that still match the serialized page-out snapshot, evicting
@@ -368,11 +381,18 @@ impl CoreStateHandle {
         })
     }
 
-    /// Evict the backed values of up to `limit` keys, returning how many values were evicted:
-    /// zero only once none is left.
-    pub(crate) fn evict_backed(&self, limit: usize) -> impl Future<Output = u64> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::EvictBacked { limit, resp }, recv)
+    /// The keys with a backed value now, and the residency cutoff of that moment.
+    pub(crate) fn backed_snapshot(&self) -> impl Future<Output = BackedSnapshot> + use<> {
+        self.call(|resp| StateRequest::BackedSnapshot { resp })
+    }
+
+    /// Evict the values of `keys` backed no later than `cutoff`, returning how many were evicted.
+    pub(crate) fn evict_backed(
+        &self,
+        keys: Vec<DiceKey>,
+        cutoff: u64,
+    ) -> impl Future<Output = u64> + use<> {
+        self.call(move |resp| StateRequest::EvictBacked { keys, cutoff, resp })
     }
 
     /// Mark nodes that page-out could not serialize so they are not offered as
@@ -384,33 +404,26 @@ impl CoreStateHandle {
     /// Replace the value paged out at `data_key` with `value`, its hydrated form.
     /// Fire-and-forget; any subsequent state requests for `key` are guaranteed to see the
     /// hydrated value because state requests are processed FIFO.
-    pub(crate) fn rehydrate(&self, key: DiceKey, data_key: DataKey, value: DiceValidValue) {
+    pub(crate) fn rehydrate(&self, key: DiceKey, data_key: DataKey, hydrated: HydratedValue) {
         self.request(StateRequest::Rehydrate {
             key,
             data_key,
-            value,
+            hydrated,
         })
     }
 
     /// Collect metrics
     pub(crate) fn metrics(&self) -> Metrics {
-        let (resp, recv) = oneshot::channel();
-        self.request(StateRequest::Metrics { resp });
-
-        // Modern dice can just run on a blocking runtime and block waiting for the channel.
-        // This is safe since the processing dice thread is dedicated, and never awaits any other tasks.
-        tokio::task::block_in_place(|| recv.blocking_recv().unwrap())
+        tokio::task::block_in_place(|| {
+            self.call_blocking(move |resp| StateRequest::Metrics { resp })
+        })
     }
 
     /// Collects the introspectable dice state
     pub(crate) fn introspection(&self) -> (VersionedGraphIntrospectable, VersionIntrospectable) {
-        let (resp, recv) = oneshot::channel();
-
-        self.request(StateRequest::Introspection { resp });
-
-        // Modern dice can just run on a blocking runtime and block waiting for the channel.
-        // This is safe since the processing dice thread is dedicated, and never awaits any other tasks.
-        tokio::task::block_in_place(|| recv.blocking_recv().unwrap())
+        tokio::task::block_in_place(|| {
+            self.call_blocking(move |resp| StateRequest::Introspection { resp })
+        })
     }
 }
 
@@ -418,10 +431,9 @@ impl Allocative for CoreStateHandle {
     fn visit<'a, 'b: 'a>(&self, visitor: &'a mut allocative::Visitor<'b>) {
         let mut visitor = visitor.enter_self_sized::<Self>();
 
-        let (resp, recv) = oneshot::channel();
-        self.request(StateRequest::MakeAvailableForAllocative { resp });
-
-        let (state, complete_tx) = tokio::task::block_in_place(|| recv.blocking_recv().unwrap());
+        let (state, complete_tx) = tokio::task::block_in_place(|| {
+            self.call_blocking(move |resp| StateRequest::MakeAvailableForAllocative { resp })
+        });
 
         // FIXME(JakobDegen): Ideally we'd correctly report the fact that this is shared, but there's
         // no easy identifier to use
@@ -489,6 +501,31 @@ impl Drop for UnclaimedBranch {
     }
 }
 
+/// The channel a request's reply goes out on, and how the actor sends it.
+pub(super) enum Responder<T> {
+    /// The requester awaits the reply, so it can be woken from a runtime worker along with the
+    /// rest of its batch: see `Replies`.
+    Awaited(Sender<T>),
+    /// The requester blocks a thread on the reply without driving the runtime meanwhile, so the
+    /// actor wakes it itself: the blocked thread may be a runtime worker, and once every worker
+    /// is blocked so, no reply would otherwise ever come.
+    Blocking(Sender<T>),
+}
+
+impl<T: Send + 'static> Responder<T> {
+    /// A requester that is gone does not get its reply, which is fine.
+    pub(super) fn send(self, value: T, replies: &mut Replies) {
+        match self {
+            Responder::Awaited(tx) => {
+                if let Ok(stored) = tx.store(value) {
+                    replies.push(stored);
+                }
+            }
+            Responder::Blocking(tx) => drop(tx.send(value)),
+        }
+    }
+}
+
 /// Core state is accessed via message passing to a single threaded processor
 pub(super) enum StateRequest {
     /// Commits the changes at the branch's head. The new VersionNumber that should be used is
@@ -496,38 +533,38 @@ pub(super) enum StateRequest {
     UpdateState {
         branch: BranchId,
         changes: Vec<(DiceKey, ChangeType, InvalidationSourcePriority)>,
-        resp: Sender<VersionNumber>,
+        resp: Responder<VersionNumber>,
     },
     /// Gets the branch's newest version
     CurrentVersion {
         branch: BranchId,
-        resp: Sender<VersionNumber>,
+        resp: Responder<VersionNumber>,
     },
     /// Starts a new branch at `from`
     Fork {
         from: VersionNumber,
-        resp: Sender<UnclaimedBranch>,
+        resp: Responder<UnclaimedBranch>,
     },
     /// Starts a new branch with no parent
-    NewRoot { resp: Sender<UnclaimedBranch> },
+    NewRoot { resp: Responder<UnclaimedBranch> },
     /// Deletes a branch
     DeleteBranch { branch: BranchId },
     /// Obtains the shared state ctx at the given version
     CtxAtVersion {
         version: VersionNumber,
         guard: ActiveTransactionGuard,
-        resp: Sender<(VersionState, ActiveTransactionGuard)>,
+        resp: Responder<(VersionState, ActiveTransactionGuard)>,
     },
     /// Report that a computation context at a version has been dropped
     DropCtxAtVersion { version: VersionNumber },
     /// Lookup the state of a key
     LookupKey {
         key: VersionedGraphKey,
-        resp: Sender<VersionedGraphResult>,
+        resp: Responder<VersionedGraphResult>,
     },
-    RecoveryEpsilon {
+    RecoveryUntracked {
         key: VersionedGraphKey,
-        resp: Sender<Option<EpsilonToken>>,
+        resp: Responder<Option<(EpsilonToken, InvalidationSources)>>,
     },
     /// Report that a value has been computed
     UpdateComputed {
@@ -540,10 +577,10 @@ pub(super) enum StateRequest {
         deps: SeriesParallelDeps,
         /// The revision of the key's untracked input the value was computed under
         epsilon: EpsilonToken,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
         /// Response of the new value to use. This could be a different instance that is `Eq` to the
         /// given computed value if the state already stores an instance of value that is equal.
-        resp: Sender<ResidentComputedValue>,
+        resp: Responder<ResidentComputedValue>,
     },
     /// Report that a candidate certificate has been verified to hold at the version
     Revalidate {
@@ -552,34 +589,34 @@ pub(super) enum StateRequest {
         storage: StorageType,
         /// The certificate that was verified
         candidate: Candidate,
-        invalidation_paths: TrackedInvalidationPaths,
+        invalidation_sources: InvalidationSources,
         /// Response of the new value to use. This could be a different instance that is `Eq` to the
         /// given computed value if the state already stores an instance of value that is equal.
-        resp: Sender<MaybeResidentComputedValue>,
+        resp: Responder<MaybeResidentComputedValue>,
     },
     /// What stands between `branch`, or with `None` everything, and idleness
     IdleStatus {
         branch: Option<BranchId>,
-        resp: Sender<IdleStatus>,
+        resp: Responder<IdleStatus>,
     },
     /// Every task that may still be running, whether its transaction is alive or gone, on
     /// `branch` or, with `None`, anywhere
     RunningTasks {
         branch: Option<BranchId>,
-        resp: Sender<Vec<DiceTask>>,
+        resp: Responder<Vec<DiceTask>>,
     },
     /// Collect the keys of all paged-out graph nodes.
     PagedOutKeys {
-        resp: Sender<anyhow::Result<Vec<(DiceKey, DataKey)>>>,
+        resp: Responder<anyhow::Result<Vec<(DiceKey, DataKey)>>>,
     },
     /// Classify graph nodes as resident vs paged out.
-    PagableStatus { resp: Sender<PagableStatusRaw> },
+    PagableStatus { resp: Responder<PagableStatusRaw> },
     /// Resident, paged-out, and candidate node counts, read O(1) from the core-state
     /// tallies.
-    PagableNodeCounts { resp: Sender<PagableNodeCounts> },
+    PagableNodeCounts { resp: Responder<PagableNodeCounts> },
     /// Collect nodes that need serialization before they can be paged out.
     KeysToPageOut {
-        resp: Sender<Vec<(DiceKey, DiceValidValue)>>,
+        resp: Responder<Vec<(DiceKey, DiceValidValue)>>,
     },
     /// Record the rows of unchanged page-out snapshots, dropping the in-memory values of those
     /// never paged out before.
@@ -587,8 +624,14 @@ pub(super) enum StateRequest {
         keys: Vec<(DiceKey, PageOutResult)>,
         eviction_policy: EvictionPolicy,
     },
-    /// Drop the backed values of up to `limit` keys, leaving their rows.
-    EvictBacked { limit: usize, resp: Sender<u64> },
+    /// The keys with a backed value now, and the residency cutoff of that moment.
+    BackedSnapshot { resp: Responder<BackedSnapshot> },
+    /// Drop the values of `keys` backed no later than `cutoff`, leaving their rows.
+    EvictBacked {
+        keys: Vec<DiceKey>,
+        cutoff: u64,
+        resp: Responder<u64>,
+    },
     /// Mark nodes that page-out could not serialize.
     MarkNonPageable {
         keys: Vec<(DiceKey, DiceValidValue)>,
@@ -597,13 +640,13 @@ pub(super) enum StateRequest {
     Rehydrate {
         key: DiceKey,
         data_key: DataKey,
-        value: DiceValidValue,
+        hydrated: HydratedValue,
     },
     /// Collect metrics
-    Metrics { resp: Sender<Metrics> },
+    Metrics { resp: Responder<Metrics> },
     /// Collects the introspectable dice state
     Introspection {
-        resp: Sender<(VersionedGraphIntrospectable, VersionIntrospectable)>,
+        resp: Responder<(VersionedGraphIntrospectable, VersionIntrospectable)>,
     },
     /// Makes the dice state available temporarily to be able to run allocative
     ///
@@ -612,6 +655,63 @@ pub(super) enum StateRequest {
     /// lifetime that starts when the response is sent, and ends when the provided sender is
     /// dropped. Failing to drop all references to the `Arc` by then will cause a panic.
     MakeAvailableForAllocative {
-        resp: Sender<(std::sync::Arc<ActorState>, Sender<std::convert::Infallible>)>,
+        resp: Responder<(std::sync::Arc<ActorState>, Sender<std::convert::Infallible>)>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::core::processor::DISPATCH_MIN;
+
+    /// A requester that blocks a thread is answered by the actor itself rather than through the
+    /// runtime, which may have no worker left to do so. Here it has none at all: nothing drives it.
+    #[test]
+    fn blocking_requests_are_answered_without_the_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = rt.block_on(async { init_state(None) });
+
+        // Hold the actor so that everything requested below lands in one batch.
+        let (tx, rx) = dice_futures::oneshot::channel();
+        handle.request(StateRequest::MakeAvailableForAllocative {
+            resp: Responder::Blocking(tx),
+        });
+        let (state, release) = futures::executor::block_on(rx).unwrap();
+        drop(state);
+
+        let awaited: Vec<_> = (0..2 * DISPATCH_MIN)
+            .map(|_| handle.idle_status(None))
+            .collect();
+        let (answered_tx, answered_rx) = mpsc::channel();
+        let blocking = std::thread::spawn({
+            let handle = handle.dupe();
+            move || {
+                handle.metrics();
+                answered_tx.send(()).unwrap();
+            }
+        });
+        // The held request, the awaited ones, and the blocking one.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.queue_depth() < 2 * DISPATCH_MIN + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the blocking request was not made"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(release);
+
+        assert!(
+            answered_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the blocking request was not answered"
+        );
+        blocking.join().unwrap();
+        drop(awaited);
+    }
 }

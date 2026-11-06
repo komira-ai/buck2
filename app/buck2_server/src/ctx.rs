@@ -20,6 +20,7 @@ use std::time::Instant;
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
+use buck2_build_api::actions::execute::dice_data::SetLowPassFilter;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
 use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
@@ -46,8 +47,12 @@ use buck2_cli_proto::client_context::HostPlatformOverride;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_cli_proto::common_build_options::ExecutionStrategy;
 use buck2_cli_proto::config_override::ConfigType;
+use buck2_common::dice::data::SetIsolationDir;
+use buck2_common::file_ops::baseline::FileSystemBaseline;
+use buck2_common::file_ops::baseline::SetFileSystemBaseline;
 use buck2_common::file_ops::io::initialize_read_dir_cache;
 use buck2_common::http::SetHttpClient;
+use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_common::io::trace::TracingIoProvider;
 use buck2_common::legacy_configs::agent_context::AgentContextSchema;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
@@ -55,6 +60,8 @@ use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
 use buck2_common::legacy_configs::file_ops::ConfigPath;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+use buck2_core::buck2_env;
+use buck2_core::cells::name::CellName;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::facebook_only;
@@ -65,8 +72,10 @@ use buck2_core::pattern::pattern::InferTargetNames;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern::ParsedPatternWithModifiers;
 use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
+use buck2_core::rollout_percentage::RolloutFraction;
 use buck2_core::rollout_percentage::RolloutPercentage;
 use buck2_core::soft_error;
+use buck2_core::warn_user;
 use buck2_directory::directory::dashmap_directory_interner::DashMapDirectoryInterner;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::with_dispatcher_async;
@@ -74,6 +83,7 @@ use buck2_events::metadata;
 use buck2_events::schedule_type::SandcastleScheduleType;
 use buck2_execute::dep_file_state::SetDepFileStore;
 use buck2_execute::execute::blocking::SetBlockingExecutor;
+use buck2_execute::execute::low_pass_filter::LowPassFilter;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::SetMaterializer;
@@ -86,10 +96,10 @@ use buck2_execute::re::manager::ReConnectionHandle;
 use buck2_execute::re::manager::ReConnectionObserver;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute_impl::executors::worker::WorkerPool;
-use buck2_execute_impl::low_pass_filter::LowPassFilter;
 use buck2_execute_impl::materializers::deferred::clean_stale::CleanStaleConfig;
 use buck2_file_watcher::dep_files::SetDepFileCache;
 use buck2_file_watcher::file_watcher::SyncOutcome;
+use buck2_file_watcher::mergebase::Mergebase;
 use buck2_file_watcher::mergebase::SetMergebase;
 use buck2_fs::async_fs_util::spawn_blocking;
 use buck2_fs::error::IoResultExt;
@@ -121,6 +131,10 @@ use buck2_server_ctx::stderr_output_guard::StderrOutputGuard;
 use buck2_server_ctx::stderr_output_guard::StderrOutputWriter;
 use buck2_server_starlark_debug::BuckStarlarkDebuggerHandle;
 use buck2_server_starlark_debug::create_debugger_handle;
+use buck2_settings::BuckSettings;
+use buck2_settings::DiceBuckSettings;
+use buck2_settings::InvocationBuckSettings;
+use buck2_settings::telemetry::observe_settings;
 use buck2_test::local_resource_registry::InitLocalResourceRegistry;
 use buck2_util::arc_str::ArcS;
 use buck2_util::early_command_timing::EarlyCommandTimingBuilder;
@@ -135,9 +149,10 @@ use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use host_sharing::HostSharingBroker;
 use host_sharing::HostSharingStrategy;
-use tracing::warn;
 
 use crate::active_commands::ActiveCommandDropGuard;
+use crate::agent_config_guard::check_agent_config_change;
+use crate::agent_config_guard::tag_agent_interactive_arm;
 use crate::agent_context_validation::validate_agent_context;
 use crate::agent_host_guard::check_agent_host_guard;
 use crate::daemon::common::CommandExecutorFactory;
@@ -224,6 +239,7 @@ impl BaseServerCommandContext {
 /// the implementation of DaemonApi endpoints (ex. targets, query, build).
 pub struct ServerCommandContext<'a> {
     pub base_context: BaseServerCommandContext,
+    buck_settings: BuckSettings,
 
     /// The working directory of the client. This is used for resolving things in the request in a
     /// working-dir relative way. For example, it's common to resolve target patterns relative to
@@ -243,6 +259,7 @@ pub struct ServerCommandContext<'a> {
     host_xcode_version_override: Option<String>,
 
     reuse_current_config: bool,
+    reuse_current_config_implicitly: bool,
     config_overrides: Vec<ConfigOverride>,
 
     // This ensures that there's only one RE connection during the lifetime of this context. It's possible
@@ -395,15 +412,25 @@ impl<'a> ServerCommandContext<'a> {
         // Read before `base_context` moves into the struct literal below.
         let buck_out_dir = base_context.repo().paths.buck_out_dir();
         let isolation_prefix = base_context.repo().paths.isolation().to_owned();
+        let buck_settings = BuckSettings::new(
+            base_context.daemon.daemon_buck_settings().dupe(),
+            InvocationBuckSettings::from_request(client_context.invocation_settings.as_deref())?,
+            DiceBuckSettings::from_request(client_context.dice_settings.as_deref())?,
+        );
+        if let Some(observed) = observe_settings(&buck_settings) {
+            base_context.events.instant_event(observed);
+        }
 
         Ok(ServerCommandContext {
             base_context,
+            buck_settings,
             working_dir: working_dir_project_relative,
             working_dir_abs: AbsWorkingDir::unchecked_new(working_dir.to_buf()),
             host_platform_override: client_context.host_platform(),
             host_arch_override: client_context.host_arch(),
             host_xcode_version_override: client_context.host_xcode_version.clone(),
             reuse_current_config: client_context.reuse_current_config,
+            reuse_current_config_implicitly: client_context.reuse_current_config_implicitly,
             config_overrides: client_context.config_overrides.clone(),
             oncall,
             client_id_from_client_metadata,
@@ -470,7 +497,9 @@ impl<'a> ServerCommandContext<'a> {
             default_allow_cache_upload: false,
             action_paths_interner: None,
             write_cas_probe: false,
+            defer_write_actions: false,
             write_action_cache: WriteActionCacheMode::Off,
+            write_action_cache_populate: RolloutFraction::none(),
         };
 
         let concurrency = self
@@ -563,15 +592,14 @@ impl<'a> ServerCommandContext<'a> {
             if elapsed > SLOW_DEP_FILE_FLUSH
                 && !SLOW_DEP_FILE_FLUSH_REPORTED.swap(true, Ordering::Relaxed)
             {
-                let _unused = soft_error!(
+                soft_error!(
                     "slow_dep_file_flush",
                     buck2_error::buck2_error!(
                         buck2_error::ErrorTag::Tier0,
                         "Draining {} queued dep-file cache writes at command end took {:?}",
                         queued,
                         elapsed
-                    ),
-                    quiet: true
+                    )
                 );
             }
         }
@@ -585,7 +613,7 @@ impl<'a> ServerCommandContext<'a> {
         let command_end_snapshot = self.heartbeat_guard_handle.take().unwrap().finalize().await;
 
         if let Err(e) = self.re_connection_handle.release_temporary_memory() {
-            tracing::warn!("Failed to release RE client temporary memory: {e}");
+            soft_error!("re_temporary_memory_release_failed", e);
         }
 
         // Emits this command's DICE paging telemetry and, if eligible, schedules an
@@ -623,6 +651,48 @@ impl<'a> ServerCommandContext<'a> {
     }
 }
 
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
+enum ProjectIgnoreError {
+    #[error(
+        "`project.ignore` cannot be set with `--config` (`{0}`): buck2 reads it from the `.buckconfig` files when the daemon starts"
+    )]
+    Override(String),
+    #[error(
+        "`project.ignore` of cell `{0}` differs from what the daemon read when it started, which is the only time buck2 reads it. Run `buck2 kill` to pick up a change to the `.buckconfig` files; `--config-file` cannot set it"
+    )]
+    Changed(CellName),
+}
+
+/// `project.ignore` is read when the daemon starts (`RepoState::ignore_set`). A command that
+/// would run with another one is refused, rather than run with the daemon's as if nothing were
+/// amiss. Only the root cell is checked, by parsing its `.buckconfig` as the daemon did when it
+/// started; the other cells' `project.ignore` is on its way into the root one.
+async fn check_project_ignore(
+    ignore_set: &IgnoreSet,
+    overrides: &[ConfigOverride],
+    configs: &BuckConfigBasedCells,
+    project_root: &ProjectRoot,
+) -> buck2_error::Result<()> {
+    for o in overrides {
+        if ConfigType::try_from(o.config_type) == Ok(ConfigType::Value)
+            && o.config_override
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "project.ignore")
+        {
+            return Err(ProjectIgnoreError::Override(o.config_override.clone()).into());
+        }
+    }
+    // `configs.root_config` is parsed without following `<file:...>` includes, which the
+    // `project.ignore` of some repos sits behind.
+    let root = configs.cell_resolver.root_cell();
+    let root_config = configs.parse_single_cell(root, project_root).await?;
+    if !ignore_set.built_from(root, &root_config, true)? {
+        return Err(ProjectIgnoreError::Changed(root).into());
+    }
+    Ok(())
+}
+
 impl ServerCommandContext<'_> {
     async fn load_new_configs(
         &self,
@@ -631,6 +701,13 @@ impl ServerCommandContext<'_> {
         let new_configs = BuckConfigBasedCells::parse_with_config_args(
             self.base_context.repo().paths.project_root(),
             &self.config_overrides,
+        )
+        .await?;
+        check_project_ignore(
+            &self.base_context.repo().ignore_set,
+            &self.config_overrides,
+            &new_configs,
+            self.base_context.repo().paths.project_root(),
         )
         .await?;
 
@@ -646,14 +723,22 @@ impl ServerCommandContext<'_> {
                         Ok(ConfigType::File) => "--config-file",
                         Err(_) => "",
                     };
-                    warn!(
-                        "Found config overrides while using --reuse-current-config flag. Ignoring overrides [{}] and using current config instead",
-                        truncate_container(
-                            self.config_overrides.iter().map(|o| {
-                                format!("{} {}", config_type_str(o.config_type), o.config_override)
-                            }),
-                            200
-                        ),
+                    warn_user!(
+                        "reuse_current_config_overrides_ignored",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Found config overrides while using --reuse-current-config flag. Ignoring overrides [{}] and using current config instead",
+                            truncate_container(
+                                self.config_overrides.iter().map(|o| {
+                                    format!(
+                                        "{} {}",
+                                        config_type_str(o.config_type),
+                                        o.config_override
+                                    )
+                                }),
+                                200
+                            )
+                        )
                     );
                 }
                 // If `--reuse-current-config` is set, use the external config data from the
@@ -668,9 +753,15 @@ impl ServerCommandContext<'_> {
             } else {
                 // If there is no previous command but the flag was set, then the flag is ignored,
                 // the command behaves as if there isn't the reuse config flag.
-                warn!(
-                    "--reuse-current-config flag was set, but there was no previous invocation detected. Ignoring --reuse-current-config flag"
-                );
+                if !self.reuse_current_config_implicitly {
+                    warn_user!(
+                        "reuse_current_config_without_previous_command",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "--reuse-current-config flag was set, but there was no previous invocation detected. Ignoring --reuse-current-config flag"
+                        )
+                    );
+                }
                 Ok(new_configs)
             }
         } else {
@@ -751,6 +842,24 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             self.cmd_ctx.isolation_prefix.as_str(),
         )?;
 
+        // Tag before the config change check, which can end the command with a block.
+        tag_agent_interactive_arm(
+            &self.cmd_ctx.buck_settings.invocation,
+            &self.cmd_ctx.agent_context,
+            self.cmd_ctx.events(),
+        );
+
+        // Check before setup_interpreter consumes the new configs. Returning an error
+        // here prevents the caller from committing the configuration change.
+        check_agent_config_change(
+            &mut existing_state.ctx(),
+            &cells_and_configs.external_data,
+            &self.cmd_ctx.buck_settings.invocation,
+            &self.cmd_ctx.agent_context,
+            self.cmd_ctx.events(),
+        )
+        .await?;
+
         existing_state
             .ctx()
             .maybe_enable_detailed_aggregated_metrics(&cells_and_configs.root_config)?;
@@ -782,6 +891,14 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
         )?;
 
         ctx.set_buck_out_path(Some(self.cmd_ctx.buck_out_dir.clone()))?;
+        ctx.set_isolation_dir(
+            self.cmd_ctx
+                .base_context
+                .repo()
+                .paths
+                .project_root()
+                .resolve(&self.cmd_ctx.buck_out_dir),
+        )?;
 
         let optional_validations = self
             .cmd_ctx
@@ -799,19 +916,24 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             cell_resolver,
             configuror,
             cells_and_configs.external_data,
+            self.cmd_ctx.buck_settings.dice_sections().dupe(),
             profiler_instrumentation_override.clone(),
             self.cmd_ctx.disable_starlark_types,
             self.cmd_ctx.unstable_typecheck,
         )?;
 
         early_timings.start_span(FILE_WATCHER_WAIT.to_owned());
-        let (ctx, mergebase, outcome) = self
-            .cmd_ctx
-            .base_context
-            .repo()
-            .file_watcher
-            .sync(ctx)
-            .await?;
+        let (ctx, mergebase, outcome) = match &self.cmd_ctx.base_context.repo().file_watcher {
+            Some(file_watcher) => file_watcher.sync(ctx).await?,
+            // No watcher (`--no-buckd`): this command is the daemon's only one, reading the tree
+            // as its own fresh snapshot. The unique baseline keeps file ops from reusing state
+            // across daemons, exactly as a watcher's first sync after startup would.
+            None => {
+                let mut ctx = ctx;
+                ctx.set_file_system_baseline(FileSystemBaseline::unique())?;
+                (ctx, Mergebase::default(), SyncOutcome::Incremental)
+            }
+        };
         early_timings.end_known_span();
 
         let mut user_data = self.make_user_computation_data(&cells_and_configs.root_config)?;
@@ -912,7 +1034,13 @@ impl DiceCommandUpdater<'_, '_> {
         // doesn't *have* to be the same as the concurrency we give the actual executor, it's a
         // reasonable pick, because if we send more tasks than our concurrency limit allows, we
         // would expect to start losing out to RE in terms of perf.
-        let low_pass_filter = LowPassFilter::new(concurrency);
+        let low_pass_filter_capacity = buck2_env!(
+            "BUCK2_TEST_LOW_PASS_FILTER_CAPACITY",
+            type = usize,
+            applicability = testing
+        )?
+        .unwrap_or(concurrency);
+        let low_pass_filter = Arc::new(LowPassFilter::new(low_pass_filter_capacity));
 
         let mut data = DiceData::new();
         data.set(self.cmd_ctx.events().dupe());
@@ -945,29 +1073,32 @@ impl DiceCommandUpdater<'_, '_> {
         }
 
         // A write whose content the CAS already has is declared as a CAS download, so its bytes
-        // then exist nowhere but the CAS, and a copy from a source file follows the same
-        // decision: the same question about content produced here, and its source stays where
-        // it is either way. Under the deferred core that pays only when the content would not
-        // have gone to the output path right away (`defer_write_actions`); a hit trades a write
-        // for a download otherwise, and the knob decides. The disk-state core asks for the probe
-        // itself (`materializer_probes_writes`): it writes to the path at once, and most of a
-        // cold build's writes are never read from disk.
+        // then exist nowhere but the CAS. That pays only when the content would not have gone to
+        // the output path right away (`defer_write_actions`); a hit trades a write for a download
+        // otherwise, and the knob decides. A copy of a source file asks on the core's terms, not
+        // the knob's (`buck2_action_impl`'s `cas_probe::probes_copies`).
         let repo = self.cmd_ctx.base_context.repo();
-        run_action_knobs.write_cas_probe = repo.materializer_probes_writes
-            || (root_config
-                .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "write_cas_probe",
-                })?
-                .unwrap_or_else(RolloutPercentage::never)
-                .roll()
-                && repo.materializer_defers_writes);
+        run_action_knobs.defer_write_actions = repo.materializer_defers_writes;
+        run_action_knobs.write_cas_probe = root_config
+            .parse::<RolloutPercentage>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "write_cas_probe",
+            })?
+            .unwrap_or_else(RolloutPercentage::never)
+            .roll()
+            && repo.materializer_defers_writes;
         run_action_knobs.write_action_cache = root_config
             .parse::<WriteActionCacheMode>(BuckconfigKeyRef {
                 section: "buck2",
                 property: "write_action_cache",
             })?
             .unwrap_or_default();
+        run_action_knobs.write_action_cache_populate = root_config
+            .parse::<RolloutFraction>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "write_action_cache_populate",
+            })?
+            .unwrap_or_else(RolloutFraction::none);
 
         let output_trees_download_semaphore_size = root_config.parse::<u32>(BuckconfigKeyRef {
             section: "buck2",
@@ -1053,6 +1184,7 @@ impl DiceCommandUpdater<'_, '_> {
         if let Some(v) = &self.profile_event_listener {
             SetProfileEventListener::set(&mut data, v.clone());
         }
+        data.set_low_pass_filter(low_pass_filter.dupe());
         data.set_command_executor(Box::new(CommandExecutorFactory::new(
             self.re_connection.dupe(),
             host_sharing_broker,
@@ -1216,7 +1348,8 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
         }
     }
 
-    // TODO(pbergen): Remove this when we desupport client.id in config.
+    // FIXME(pbergen): Setting `client.id` through buckconfig should be rejected in favor of
+    // `--client-metadata id=`, since a `-c` value invalidates the DICE graph.
     add_config(
         &mut metadata,
         config,
@@ -1226,31 +1359,6 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
         },
         "client",
     );
-
-    // Soft error if client.id is set in buckconfig (deprecated, will become hard error)
-    if let Some(client_id) = config.get(BuckconfigKeyRef {
-        section: "client",
-        property: "id",
-    }) {
-        use buck2_core::soft_error;
-
-        soft_error!(
-            "client_id_in_buckconfig",
-            buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Input,
-                "Setting `client.id` via config (`-c|--config client.id={}`) is deprecated \
-                 because it invalidates the DICE graph which causes performance loss. \
-                 Please migrate to `--client-metadata=id={}` instead. \
-                 This will become a hard error in a future Buck2 release. \
-                 For more information, see: https://internalfb.com/intern/staticdocs/buck2/docs/rule_authors/client_metadata/",
-                client_id,
-                client_id
-            ),
-            quiet: false,
-            deprecation: true,
-            error_on_oss: true,
-        ).ok();
-    }
 
     if let Ok(schedule_type) = SandcastleScheduleType::new() {
         if let Some(schedule_type_str) = schedule_type.as_str() {
@@ -1270,6 +1378,10 @@ impl Drop for ServerCommandContext<'_> {
 
 #[async_trait]
 impl ServerCommandContextTrait for ServerCommandContext<'_> {
+    fn buck_settings(&self) -> &BuckSettings {
+        &self.buck_settings
+    }
+
     fn working_dir(&self) -> &ProjectRelativePath {
         &self.working_dir
     }
@@ -1374,7 +1486,13 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
             self.base_context.repo().io.name().to_owned(),
         );
 
-        metadata.insert("materializer".to_owned(), "deferred".to_owned());
+        metadata.insert(
+            "materializer".to_owned(),
+            self.base_context
+                .repo()
+                .materializer_implementation
+                .to_owned(),
+        );
 
         if let Some(originating_cgroup) = &self.base_context.daemon.daemon_originating_cgroup {
             metadata.insert(

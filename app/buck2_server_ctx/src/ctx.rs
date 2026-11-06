@@ -36,6 +36,7 @@ use buck2_execute::materialize::materializer::Materializer;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::working_dir::AbsWorkingDir;
 use buck2_hash::IntentionallyStdHashMap;
+use buck2_settings::BuckSettings;
 use buck2_util::early_command_timing::EarlyCommandTimingBuilder;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dice::DiceComputations;
@@ -190,6 +191,10 @@ impl CommandTransactionObserver for BuckconfigTelemetry<'_> {
 
 #[async_trait]
 pub trait ServerCommandContextTrait: Send + Sync {
+    /// Daemon-scoped startup sections combined with this request's invocation sections.
+    /// Reads are untracked; cached computations must track invocation values they depend on.
+    fn buck_settings(&self) -> &BuckSettings;
+
     fn working_dir(&self) -> &ProjectRelativePath;
 
     fn working_dir_abs(&self) -> &AbsWorkingDir;

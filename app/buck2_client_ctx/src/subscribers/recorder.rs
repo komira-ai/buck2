@@ -13,6 +13,7 @@ use std::cmp::min;
 use std::io::Write;
 use std::ops::Sub;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -27,6 +28,8 @@ use buck2_common::convert::ProstDurationExt;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_core::buck2_env;
 use buck2_core::soft_error;
+use buck2_core::soft_error_or_panic;
+use buck2_core::warn_user_or_panic;
 use buck2_data::ErrorReport;
 use buck2_data::FileWatcherProvider;
 use buck2_data::FileWatcherStart;
@@ -89,6 +92,7 @@ use crate::subscribers::subscriber::EventSubscriber;
 use crate::subscribers::system_warning::check_download_speed;
 use crate::subscribers::system_warning::check_memory_pressure;
 use crate::subscribers::system_warning::check_remaining_disk_space;
+use crate::subscribers::system_warning::is_disk_near_full;
 
 pub fn process_memory(snapshot: &buck2_data::Snapshot) -> Option<u64> {
     // buck2_rss is the resident set size observed by daemon (exluding subprocesses).
@@ -105,6 +109,14 @@ const MEMORY_PRESSURE_TAG: &str = "memory_pressure_warning";
 
 const SYSTEM_LOAD1_WINDOW: Duration = Duration::from_secs(60);
 const SYSTEM_LOAD5_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Soft errors the client itself reports, before or outside of any event stream. The daemon's
+/// arrive as events; these are added to the record when it is written.
+static CLIENT_SOFT_ERRORS: Mutex<Vec<SoftError>> = Mutex::new(Vec::new());
+
+pub fn note_client_soft_error(soft_error: SoftError) {
+    CLIENT_SOFT_ERRORS.lock().unwrap().push(soft_error);
+}
 
 pub struct InvocationRecorder {
     write_to_path: Option<AbsPathBuf>,
@@ -237,6 +249,7 @@ pub struct InvocationRecorder {
     /// Daemon started by this command.
     daemon_was_started: Option<buck2_data::DaemonWasStartedReason>,
     should_restart: bool,
+    settings_hash: Option<String>,
     client_metadata: Vec<buck2_data::ClientMetadata>,
     agent_invocation_info: AgentInvocationInfo,
     command_errors: Vec<ErrorReport>,
@@ -469,6 +482,7 @@ impl InvocationRecorder {
             re_exceeded_quotas: BuckMutSet::default(),
             daemon_connection_failure: false,
             daemon_was_started: None,
+            settings_hash: None,
             should_restart: false,
             client_metadata: Vec::new(),
             agent_invocation_info: AgentInvocationInfo::default(),
@@ -584,6 +598,13 @@ impl InvocationRecorder {
 
         self.agent_invocation_info = ctx.agent_invocation_info().clone();
 
+        // Outside a repository there are no settings to resolve; a settings
+        // file that fails to parse fails the command itself later.
+        self.settings_hash = ctx
+            .buck_settings()
+            .ok()
+            .map(|settings| settings.snapshot().hash);
+
         self.command_name = Some(command_name);
     }
 
@@ -623,7 +644,7 @@ impl InvocationRecorder {
         let build_count = paths.and_then(|p| match BuildCountManager::new(p.build_count_dir()) {
             Ok(manager) => Some(manager),
             Err(e) => {
-                let _unused = soft_error!("build_count_init_failed", e);
+                soft_error_or_panic!("build_count_init_failed", e);
                 None
             }
         });
@@ -710,12 +731,21 @@ impl InvocationRecorder {
 
     fn finalize_errors(&mut self) -> Vec<ProcessedErrorReport> {
         let mut errors = Vec::new();
+        let disk_near_full = match (
+            self.last_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.used_disk_space_bytes),
+            self.system_info.total_disk_space_bytes,
+        ) {
+            (Some(used), Some(total)) => is_disk_near_full(total.saturating_sub(used), total),
+            _ => false,
+        };
         for error in self.command_errors.drain(..) {
             // FIXME this error should be updated at the source if possible, and not only in the invocation record.
             let error: ErrorReport = if error.tags.contains(&(ErrorTag::ClientGrpc as i32)) {
                 let error: buck2_error::Error = error.into();
                 // Add stderr to GRPC connection errors if available
-                let error = classify_server_stderr(error, &self.server_stderr);
+                let error = classify_server_stderr(error, &self.server_stderr, disk_near_full);
                 let error = if self.server_stderr.is_empty() {
                     let error = error.context("buckd stderr is empty");
                     // Likely buckd received SIGKILL, may be due to memory pressure
@@ -749,6 +779,8 @@ impl InvocationRecorder {
     }
 
     fn create_record_event(&mut self) -> BuckEvent {
+        self.soft_error_categories
+            .extend(std::mem::take(&mut *CLIENT_SOFT_ERRORS.lock().unwrap()));
         let mut sink_success_count = None;
         let mut sink_failure_count = None;
         let mut sink_dropped_count = None;
@@ -1146,6 +1178,7 @@ impl InvocationRecorder {
                 .time_to_first_unknown_test_result
                 .and_then(duration_as_millis),
             system_total_memory_bytes: self.system_info.system_total_memory_bytes,
+            container_memory_limit_bytes: self.system_info.container_memory_limit_bytes,
             file_watcher_stats: self.file_watcher_stats.take(),
             file_watcher_duration_ms: self.file_watcher_duration.and_then(duration_as_millis),
             time_to_last_action_execution_end_ms: self
@@ -1198,6 +1231,7 @@ impl InvocationRecorder {
                 .and_then(|s| s.page_out_started),
             daemon_connection_failure: Some(self.daemon_connection_failure),
             daemon_was_started: self.daemon_was_started.map(|t| t as i32),
+            settings_hash: self.settings_hash.take(),
             should_restart: Some(self.should_restart),
             client_metadata: std::mem::take(&mut self.client_metadata),
             agent_direct_call: agent_context
@@ -1402,6 +1436,22 @@ impl InvocationRecorder {
                 .paging_summary
                 .as_ref()
                 .and_then(|s| s.paging_arc_cache_entries),
+            paging_evictions: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paging_evictions),
+            paging_evicted_count: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paging_evicted_count),
+            paging_evicted_bytes: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paging_evicted_bytes),
+            paging_evictable_bytes: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paging_evictable_bytes),
             starlark_partial_deser: self
                 .paging_summary
                 .as_ref()
@@ -1433,11 +1483,13 @@ impl InvocationRecorder {
                 buck2_error::Ok(())
             })();
 
-            if let Err(e) = &res {
-                tracing::warn!(
-                    "Failed to write InvocationRecord to `{}`: {:#}",
-                    path.as_path().display(),
-                    e
+            if let Err(e) = res {
+                warn_user_or_panic!(
+                    "invocation_record_write_failed",
+                    e.context(format!(
+                        "Failed to write InvocationRecord to `{}`",
+                        path.as_path().display()
+                    ))
                 );
             }
         }
@@ -1520,7 +1572,7 @@ impl InvocationRecorder {
                     Ok(Some(build_count)) => build_count,
                     Ok(None) => Default::default(),
                     Err(e) => {
-                        let _ignored = soft_error!("build_count_error", e);
+                        soft_error!("build_count_error", e);
                         Default::default()
                     }
                 }
