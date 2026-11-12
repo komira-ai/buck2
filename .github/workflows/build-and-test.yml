@@ -16,6 +16,29 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Pull requests run on Linux x86_64 only. The macOS and Windows legs run on
+  # pushes to main and on manual runs, as the beta stage after a merge.
+  platforms:
+    name: platforms
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.matrix.outputs.pr }}
+      all: ${{ steps.matrix.outputs.all }}
+    steps:
+    - id: matrix
+      env:
+        FACEBOOK: ${{ github.repository_owner == 'facebook' }}
+      run: |
+        if [ "$FACEBOOK" = true ]; then
+          linux=16-core-ubuntu; macos=macos-14-xlarge; windows=windows-8-core
+        else
+          linux=ubuntu-latest; macos=macos-14; windows=windows-latest
+        fi
+        l="{\"name\":\"linux\",\"runs-on\":\"$linux\"}"
+        m="{\"name\":\"macos\",\"runs-on\":\"$macos\"}"
+        w="{\"name\":\"windows\",\"runs-on\":\"$windows\"}"
+        echo "pr=[$l]" >> "$GITHUB_OUTPUT"
+        echo "all=[$l,$m,$w]" >> "$GITHUB_OUTPUT"
   # Clippy and rustdoc check the crates; the tests build them. The two share no
   # artifacts, so they run as separate jobs for wall time.
   #
@@ -28,13 +51,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux
-            runs-on: ${{ github.repository_owner == 'facebook' && '16-core-ubuntu' || 'ubuntu-latest' }}
-          - name: macos
-            runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14-xlarge' || 'macos-14' }}
-          - name: windows
-            runs-on: ${{ github.repository_owner == 'facebook' && 'windows-8-core' || 'windows-latest' }}
+        include: ${{ fromJSON(github.event_name == 'pull_request' && needs.platforms.outputs.pr || needs.platforms.outputs.all) }}
+    needs: platforms
     runs-on: ${{ matrix.runs-on }}
     steps:
     - uses: actions/checkout@v6
@@ -57,13 +75,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux
-            runs-on: ${{ github.repository_owner == 'facebook' && '16-core-ubuntu' || 'ubuntu-latest' }}
-          - name: macos
-            runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14-xlarge' || 'macos-14' }}
-          - name: windows
-            runs-on: ${{ github.repository_owner == 'facebook' && 'windows-8-core' || 'windows-latest' }}
+        include: ${{ fromJSON(github.event_name == 'pull_request' && needs.platforms.outputs.pr || needs.platforms.outputs.all) }}
+    needs: platforms
     runs-on: ${{ matrix.runs-on }}
     steps:
     - uses: actions/checkout@v6
