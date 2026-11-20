@@ -10,3 +10,10 @@ remote_file(
     url = read_config("test", "url"),
     sha512 = read_config("test", "sha512"),
 )
+
+http_archive(
+    name = "http_archive",
+    urls = [read_config("test", "url")],
+    sha512 = read_config("test", "sha512"),
+    type = "tar",
+)

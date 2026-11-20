@@ -171,7 +171,7 @@ remote_file = prelude_rule(
                 default = None,
                 doc = """
                 Size in bytes of the downloaded artifact. Buck verifies this is correct and fails the fetch
-                 command if it doesn't match (when a SHA-1 hash or only a SHA-512 hash is used).
+                 command if it doesn't match, whichever checksum is given.
             """,
             ),
             "out": attrs.option(
